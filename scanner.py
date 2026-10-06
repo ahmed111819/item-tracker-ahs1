@@ -1506,6 +1506,20 @@ async def scan_yalla_page(
                 f"Item {i + 1}: {e}"
             )
 
+            error_text = str(e).lower()
+            if any(
+                marker in error_text
+                for marker in (
+                    "connection closed while reading from the driver",
+                    "pipe closed by peer",
+                    "target page, context or browser has been closed",
+                )
+            ):
+                # Do not count this as an ordinary bad product card. The
+                # browser driver is gone, so retry the whole page after the
+                # batch-level recovery recreates Chromium.
+                raise
+
     return {
         "cards": card_count,
         "parsed": parsed,
@@ -1988,6 +2002,34 @@ async def run_yalla_scan(
             # ------------------------------------------------
 
             if failed_pages:
+
+                # A dead Playwright driver makes every page retry fail on the
+                # same stale context. Recreate Chromium once before retrying
+                # those pages; run_worker will also restart the scan cycle if
+                # the batch still cannot recover.
+                fatal_browser_errors = (
+                    "Connection closed while reading from the driver",
+                    "pipe closed by peer",
+                    "Target page, context or browser has been closed",
+                )
+                failed_messages = [
+                    str(result.get("error", ""))
+                    for result in results
+                    if isinstance(result, dict)
+                    and not result.get("ok", False)
+                ] + [
+                    str(result)
+                    for result in results
+                    if isinstance(result, Exception)
+                ]
+                if any(
+                    marker.lower() in message.lower()
+                    for message in failed_messages
+                    for marker in fatal_browser_errors
+                ):
+                    print("♻️ Playwright driver disconnected; restarting Chromium before retrying the failed pages.")
+                    await close_yalla_browser()
+                    await start_yalla_browser()
 
                 print()
                 print(
