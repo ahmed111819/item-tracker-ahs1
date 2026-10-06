@@ -1539,7 +1539,8 @@ async def scan_page_with_retry(
     scan_max_price,
     worker_id,
     normal_scan_id=None,
-    current_normal_seen_asins=None
+    current_normal_seen_asins=None,
+    retry_empty=False
 ):
 
     last_error = None
@@ -1581,6 +1582,17 @@ async def scan_page_with_retry(
                     current_normal_seen_asins
                 )
             )
+
+            if (
+                retry_empty
+                and result.get("cards", 0) == 0
+                and attempt < PAGE_RETRY_COUNT
+            ):
+                print(
+                    f"⚠️ Page {page_number} returned 0 cards; "
+                    f"retrying empty page ({attempt + 1}/{PAGE_RETRY_COUNT})."
+                )
+                continue
 
             return {
                 "ok": True,
@@ -2122,7 +2134,7 @@ async def run_yalla_scan(
             # Keep empty pages pending until we know whether a later page
             # contains products. Empty pages at the end are normal pagination;
             # an empty page followed by products is a possible missed page and
-            # gets one full page retry before the scan moves on.
+            # gets up to PAGE_RETRY_COUNT attempts before the scan moves on.
             gap_retry_results = []
             for result in sorted(
                 [item for item in results if isinstance(item, dict) and item.get("ok", False)],
@@ -2141,7 +2153,8 @@ async def run_yalla_scan(
                 pending_empty_pages.clear()
                 print(
                     "🔎 Products appeared after empty page(s) "
-                    f"{pages_to_recheck}; rechecking those pages once."
+                    f"{pages_to_recheck}; rechecking those pages up to "
+                    f"{PAGE_RETRY_COUNT} times."
                 )
 
                 for empty_page in pages_to_recheck:
@@ -2151,6 +2164,7 @@ async def run_yalla_scan(
                         1,
                         normal_scan_id,
                         current_normal_seen_asins,
+                        retry_empty=True,
                     )
                     if not retry_result.get("ok", False):
                         raise RuntimeError(
@@ -2317,14 +2331,62 @@ async def run_yalla_scan(
                 break
 
             if empty_pages >= EMPTY_PAGE_STOP_COUNT:
-
-                print()
-                print(
-                    f"🛑 Stopping after {EMPTY_PAGE_STOP_COUNT} "
-                    "consecutive empty pages"
+                terminal_pages = list(
+                    dict.fromkeys(pending_empty_pages[-PAGE_WORKERS:])
                 )
+                earlier_empty_pages = pending_empty_pages[:-PAGE_WORKERS]
+                pending_empty_pages.clear()
+                terminal_recovered = []
 
-                break
+                if terminal_pages:
+                    print(
+                        f"🔎 Rechecking the last empty pages {terminal_pages} "
+                        f"up to {PAGE_RETRY_COUNT} times before stopping."
+                    )
+                    for empty_page in terminal_pages:
+                        retry_result = await scan_page_with_retry(
+                            empty_page,
+                            scan_max_price,
+                            1,
+                            normal_scan_id,
+                            current_normal_seen_asins,
+                            retry_empty=True,
+                        )
+                        if not retry_result.get("ok", False):
+                            raise RuntimeError(
+                                f"Could not verify terminal empty page {empty_page}; "
+                                "aborting this scan safely."
+                            )
+                        print_page_result(retry_result)
+                        if retry_result["cards"] > 0:
+                            terminal_recovered.append(retry_result)
+
+                if terminal_recovered:
+                    for result in terminal_recovered:
+                        total_cards += result["cards"]
+                        total_parsed += result["parsed"]
+                        total_processed += result["processed"]
+                        total_sent += result["sent"]
+                        if result["page"] == 1:
+                            first_page_had_cards = True
+                        if (
+                            result["lowest_price"] is not None
+                            and (
+                                batch_lowest_price is None
+                                or result["lowest_price"] < batch_lowest_price
+                            )
+                        ):
+                            batch_lowest_price = result["lowest_price"]
+                    print("✅ Empty-page retry recovered products; continuing the scan.")
+                    empty_pages = 0
+                    pending_empty_pages.extend(earlier_empty_pages)
+                else:
+                    print()
+                    print(
+                        f"🛑 Stopping after {EMPTY_PAGE_STOP_COUNT} "
+                        "consecutive empty pages after rechecking the final pages."
+                    )
+                    break
 
             next_page += PAGE_WORKERS
 
