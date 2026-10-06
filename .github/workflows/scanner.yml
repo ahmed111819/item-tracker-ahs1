@@ -28,5 +28,23 @@ jobs:
         name: Install dependencies
       - run: python -m playwright install --with-deps chromium
         name: Install Chromium
-      - run: python -u scanner.py
-        name: Run scanner
+      - name: Run scanner with automatic recovery
+        shell: bash
+        run: |
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            echo "Starting scanner worker attempt ${attempt}..."
+            if python -u scanner.py; then
+              echo "Scanner worker finished normally."
+              exit 0
+            else
+              status=$?
+              if [ "${attempt}" -ge 4 ]; then
+                echo "Scanner failed ${attempt} times; stopping this workflow run."
+                exit "${status}"
+              fi
+              echo "Scanner process exited with status ${status}; restarting in 60 seconds."
+              sleep 60
+            fi
+          done
