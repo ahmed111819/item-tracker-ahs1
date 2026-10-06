@@ -1672,12 +1672,29 @@ async def scan_page_worker(
     current_normal_seen_asins=None
 ):
 
-    return await scan_page_with_retry(
+    result = await scan_page_with_retry(
         page_number,
         scan_max_price,
         worker_id,
         normal_scan_id,
         current_normal_seen_asins
+    )
+
+    if result.get("ok", False):
+        print_page_result(result)
+
+    return result
+
+
+def print_page_result(result):
+    print(
+        f"📄 Page {result['page']}: "
+        f"{result['cards']} cards | "
+        f"{result['parsed']} parsed | "
+        f"{result['processed']} processed | "
+        f"📨 {result['sent']} sent | "
+        f"💾 {len(tracking['products'])} tracked",
+        flush=True,
     )
 
 
@@ -2029,6 +2046,8 @@ async def run_yalla_scan(
                         False
                     ):
 
+                        print_page_result(retry_result)
+
                         for index, original in enumerate(
                             results
                         ):
@@ -2176,17 +2195,6 @@ async def run_yalla_scan(
                     batch_lowest_price = (
                         lowest_price
                     )
-
-                print(
-                    f"📄 Page {page_number}: "
-                    f"{cards} cards | "
-                    f"{parsed} parsed | "
-                    f"{processed} processed | "
-                    f"📨 {sent} sent | "
-                    f"💾 "
-                    f"{len(tracking['products'])} "
-                    f"tracked"
-                )
 
             if batch_failed:
 
