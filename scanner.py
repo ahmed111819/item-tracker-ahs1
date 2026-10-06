@@ -272,6 +272,7 @@ YALLA_SCAN_URL = (
 )
 
 PAGE_WORKERS = 4
+EMPTY_PAGE_STOP_COUNT = PAGE_WORKERS * 3
 
 PAGE_RETRY_COUNT = 4
 PAGE_RETRY_DELAY = 1.5
@@ -1889,6 +1890,7 @@ async def run_yalla_scan(
         pages_completed = 0
         first_page_had_cards = False
         failed_batch_streak = 0
+        pending_empty_pages = []
 
         # ----------------------------------------------------
         # Availability tracking is ONLY performed for NORMAL.
@@ -2117,6 +2119,50 @@ async def run_yalla_scan(
 
                         continue
 
+            # Keep empty pages pending until we know whether a later page
+            # contains products. Empty pages at the end are normal pagination;
+            # an empty page followed by products is a possible missed page and
+            # gets one full page retry before the scan moves on.
+            gap_retry_results = []
+            for result in sorted(
+                [item for item in results if isinstance(item, dict) and item.get("ok", False)],
+                key=lambda item: item["page"],
+            ):
+                if result["cards"] == 0:
+                    pending_empty_pages.append(result["page"])
+                    continue
+
+                if not pending_empty_pages:
+                    continue
+
+                pages_to_recheck = list(
+                    dict.fromkeys(pending_empty_pages[-PAGE_WORKERS:])
+                )
+                pending_empty_pages.clear()
+                print(
+                    "🔎 Products appeared after empty page(s) "
+                    f"{pages_to_recheck}; rechecking those pages once."
+                )
+
+                for empty_page in pages_to_recheck:
+                    retry_result = await scan_page_with_retry(
+                        empty_page,
+                        scan_max_price,
+                        1,
+                        normal_scan_id,
+                        current_normal_seen_asins,
+                    )
+                    if not retry_result.get("ok", False):
+                        raise RuntimeError(
+                            f"Could not confirm empty page {empty_page} after retries; "
+                            "aborting this scan safely."
+                        )
+                    print_page_result(retry_result)
+                    if retry_result["cards"] > 0:
+                        gap_retry_results.append(retry_result)
+                        if empty_page == 1:
+                            first_page_had_cards = True
+
             # ------------------------------------------------
             # Process batch
             # ------------------------------------------------
@@ -2208,6 +2254,24 @@ async def run_yalla_scan(
                         lowest_price
                     )
 
+            # Include products recovered from earlier empty pages in scan
+            # totals and FAST smart-stop price checks. Page count remains unique.
+            for result in gap_retry_results:
+                total_cards += result["cards"]
+                total_parsed += result["parsed"]
+                total_processed += result["processed"]
+                total_sent += result["sent"]
+                if (
+                    result["lowest_price"] is not None
+                    and (
+                        batch_lowest_price is None
+                        or result["lowest_price"] < batch_lowest_price
+                    )
+                ):
+                    batch_lowest_price = result["lowest_price"]
+                if result["cards"] > 0:
+                    batch_had_cards = True
+
             if batch_failed:
 
                 print()
@@ -2252,12 +2316,12 @@ async def run_yalla_scan(
 
                 break
 
-            if empty_pages >= 4:
+            if empty_pages >= EMPTY_PAGE_STOP_COUNT:
 
                 print()
                 print(
-                    "🛑 Stopping after "
-                    "4 consecutive empty pages"
+                    f"🛑 Stopping after {EMPTY_PAGE_STOP_COUNT} "
+                    "consecutive empty pages"
                 )
 
                 break
