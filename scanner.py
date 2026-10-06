@@ -16,10 +16,11 @@ TELEGRAM_CHAT_ID = "-1004335063743"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_TOPIC_DISCOUNTS, TELEGRAM_TOPIC_NEW, TELEGRAM_TOPIC_MULTIPACK = 40, 2, 3
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SERVICE_ACCOUNT_JSON_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_FILE", "").strip()
 DRIVE_SESSION_FOLDER_ID = os.environ.get("DRIVE_SESSION_FOLDER_ID", "").strip()
 DRIVE_TRACKING_FOLDER_ID = os.environ.get("DRIVE_TRACKING_FOLDER_ID", "").strip()
-if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON Actions secret.")
+if not GOOGLE_SERVICE_ACCOUNT_JSON and not GOOGLE_SERVICE_ACCOUNT_JSON_FILE:
+    raise RuntimeError("Missing Google service-account JSON; set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_FILE.")
 if not DRIVE_SESSION_FOLDER_ID or not DRIVE_TRACKING_FOLDER_ID:
     raise RuntimeError("Missing Drive folder ID repository variables.")
 PROJECT_DIR = os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
@@ -33,7 +34,10 @@ _drive_write_lock = threading.Lock()
 def drive_service():
     global _drive
     if _drive is None:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        if GOOGLE_SERVICE_ACCOUNT_JSON:
+            info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        else:
+            info = json.loads(Path(GOOGLE_SERVICE_ACCOUNT_JSON_FILE).read_text(encoding="utf-8"))
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive"])
         _drive = build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -433,6 +437,16 @@ def normalize_tracking_record(old_data):
         False
     )
 
+    # Require repeated absence from complete NORMAL scans before treating
+    # search-result disappearance as an availability change.
+    record.setdefault(
+        "normal_missing_streak",
+        0
+    )
+
+    record.setdefault("discount_below_streak", 0)
+    record.setdefault("strong_discount_below_streak", 0)
+
     return record
 
 
@@ -495,13 +509,9 @@ def get_final_yalla_alerts(
     # Returning from unavailable is NOT a new product.
     # --------------------------------------------------------
 
-    was_unavailable = (
-        old_data.get(
-            "availability_state",
-            "available"
-        )
-        == "unavailable"
-    )
+    # Search-result absence does not establish that the product is out of
+    # stock. This scanner does not verify stock on the product page.
+    was_unavailable = False
 
     # --------------------------------------------------------
     # BACK IN STOCK + STRONG DISCOUNT
@@ -558,9 +568,19 @@ def get_final_yalla_alerts(
     if discount is not None:
         try:
             discount_value = float(discount)
-            if discount_value < DISCOUNT_ALERT_THRESHOLD:
-                old_data["last_discount_alert_percent"] = None
-            elif last_discount_alert is None or discount_value > float(last_discount_alert):
+            if discount_value >= DISCOUNT_ALERT_THRESHOLD:
+                old_data["discount_below_streak"] = 0
+            elif discount_value < (DISCOUNT_ALERT_THRESHOLD - 2.5):
+                old_data["discount_below_streak"] = int(old_data.get("discount_below_streak", 0) or 0) + 1
+                if old_data["discount_below_streak"] >= 2:
+                    old_data["last_discount_alert_percent"] = None
+                    last_discount_alert = None
+            else:
+                old_data["discount_below_streak"] = 0
+            if discount_value >= DISCOUNT_ALERT_THRESHOLD and (
+                last_discount_alert is None
+                or discount_value >= float(last_discount_alert) + 5.0
+            ):
                 alerts.append("discount_25")
         except (TypeError, ValueError):
             pass
@@ -572,7 +592,8 @@ def get_final_yalla_alerts(
     #
     # <50 -> 50       SEND
     # 50 -> 50        NO
-    # 50 -> 55        SEND
+    # 50 -> 55        SEND (at least 5 percentage points better)
+    # 55 -> 57        NO (small display fluctuation)
     # 55 -> 60        SEND
     # 60 -> 55        NO
     # 55 -> 50        NO
@@ -606,13 +627,16 @@ def get_final_yalla_alerts(
                 discount
             )
 
-            if discount < STRONG_DISCOUNT:
+            if discount < (STRONG_DISCOUNT - 5):
+                old_data["strong_discount_below_streak"] = int(old_data.get("strong_discount_below_streak", 0) or 0) + 1
+                if old_data["strong_discount_below_streak"] >= 2:
+                    old_data["last_strong_alert_discount"] = None
 
-                old_data[
-                    "last_strong_alert_discount"
-                ] = None
+            elif discount < STRONG_DISCOUNT:
+                old_data["strong_discount_below_streak"] = 0
 
             else:
+                old_data["strong_discount_below_streak"] = 0
 
                 # If this is a return-to-availability + strong-discount event,
                 # keep it as ONE combined Telegram alert.
@@ -624,7 +648,7 @@ def get_final_yalla_alerts(
                             "strong_deal"
                         )
 
-                    elif discount > last_strong_discount:
+                    elif discount >= last_strong_discount + 5.0:
 
                         alerts.append(
                             "strong_deal"
@@ -699,10 +723,7 @@ def get_final_yalla_alerts(
                                     last_drop_alert
                                 )
 
-                                if (
-                                    drop_percent
-                                    > last_drop_alert
-                                ):
+                                if drop_percent >= last_drop_alert + 5.0:
 
                                     alerts.append(
                                         "price_drop"
@@ -787,7 +808,12 @@ def build_final_tracking_record(
             current_discount = None
 
     old_last_discount_alert = (old_data.get("last_discount_alert_percent") if old_data else None)
-    if current_discount is not None and current_discount < DISCOUNT_ALERT_THRESHOLD:
+    if (
+        current_discount is not None
+        and current_discount < (DISCOUNT_ALERT_THRESHOLD - 2.5)
+        and old_data is not None
+        and int(old_data.get("discount_below_streak", 0) or 0) >= 2
+    ):
         new_last_discount_alert = None
     elif "discount_25" in alerts:
         new_last_discount_alert = current_discount
@@ -796,7 +822,9 @@ def build_final_tracking_record(
 
     if (
         current_discount is not None
-        and current_discount < STRONG_DISCOUNT
+        and current_discount < (STRONG_DISCOUNT - 5)
+        and old_data is not None
+        and int(old_data.get("strong_discount_below_streak", 0) or 0) >= 2
     ):
 
         new_last_strong_discount = None
@@ -920,6 +948,12 @@ def build_final_tracking_record(
 
         "last_discount_alert_percent": new_last_discount_alert,
 
+        "discount_below_streak": (
+            int(old_data.get("discount_below_streak", 0) or 0)
+            if old_data
+            else 0
+        ),
+
         "multi_pack": current_multi,
 
         "new_alert_sent": (
@@ -948,6 +982,12 @@ def build_final_tracking_record(
 
         "last_strong_alert_discount": (
             new_last_strong_discount
+        ),
+
+        "strong_discount_below_streak": (
+            int(old_data.get("strong_discount_below_streak", 0) or 0)
+            if old_data
+            else 0
         ),
 
         "price_drop_alert_sent": (
@@ -1275,90 +1315,19 @@ async def mark_missing_normal_products(
     current_normal_seen_asins
 ):
 
-    changed = 0
-
     async with ASIN_LOCK:
-
-        for asin, old_record in list(
-            tracking["products"].items()
-        ):
-
-            old_record = (
-                normalize_tracking_record(
-                    old_record
-                )
-            )
-
-            # ------------------------------------------------
-            # Only products that have previously appeared
-            # in a NORMAL scan are eligible.
-            #
-            # This prevents FAST-only products from being
-            # incorrectly marked unavailable.
-            # ------------------------------------------------
-
-            if not old_record.get(
-                "normal_seen",
-                False
-            ):
-
-                tracking[
-                    "products"
-                ][asin] = old_record
-
+        # Search result pagination/ranking is not a stock-status signal.
+        # Reset the seen products' miss counter, but never mark unseen items
+        # unavailable; the scanner does not verify availability on product pages.
+        for asin in current_normal_seen_asins:
+            old_record = tracking["products"].get(asin)
+            if old_record is None:
                 continue
+            old_record = normalize_tracking_record(old_record)
+            old_record["normal_missing_streak"] = 0
+            tracking["products"][asin] = old_record
 
-            # ------------------------------------------------
-            # Already seen in current NORMAL scan
-            # ------------------------------------------------
-
-            if asin in current_normal_seen_asins:
-
-                continue
-
-            # ------------------------------------------------
-            # Product disappeared from NORMAL results.
-            # ------------------------------------------------
-
-            if (
-                old_record.get(
-                    "availability_state",
-                    "available"
-                )
-                != "unavailable"
-            ):
-
-                old_record[
-                    "availability_state"
-                ] = "unavailable"
-
-                # Reset this flag so a future genuine
-                # return can create a new back-in-stock event.
-                old_record[
-                    "back_in_stock_alert_sent"
-                ] = False
-
-                old_record[
-                    "last_seen_before_unavailable"
-                ] = old_record.get(
-                    "last_seen"
-                )
-
-                old_record[
-                    "unavailable_at"
-                ] = datetime.now().isoformat()
-
-                tracking[
-                    "products"
-                ][asin] = old_record
-
-                changed += 1
-
-        if changed:
-
-            await save_tracking_immediately()
-
-    return changed
+    return 0
 
 
 # ============================================================
@@ -1497,6 +1466,7 @@ async def scan_yalla_page(
                         existing["last_normal_scan_id"] = (
                             normal_scan_id
                         )
+                        existing["normal_missing_streak"] = 0
 
                         tracking["products"][
                             product["asin"]
@@ -2387,7 +2357,7 @@ async def run_worker():
     deadline = time.monotonic() + WORKER_WINDOW_SECONDS
     await close_yalla_browser()
     await start_yalla_browser()
-    print("✅ GitHub worker started; Amazon session and tracking are read from Google Drive.")
+    print("✅ Scanner worker started; Amazon session and tracking are read from Google Drive.")
     cycle = 0
     try:
         while time.monotonic() + (2 * SCAN_TIMEOUT_SECONDS) + CYCLE_DELAY_SECONDS < deadline:
@@ -2410,7 +2380,7 @@ async def run_worker():
     finally:
         await save_tracking_immediately()
         await close_yalla_browser()
-    print("✅ Worker finished; the scheduled workflow will start the next worker.")
+    print("✅ Worker finished; the process supervisor can restart the scanner.")
 
 if __name__ == "__main__":
     asyncio.run(run_worker())
