@@ -1,10 +1,11 @@
 # GitHub Actions adapter: credentials and persistent files stay in Google Drive/GitHub Secrets.
-import asyncio, io, json, os, tempfile, threading, time
+import asyncio, io, json, os, socket, ssl, tempfile, threading, time
 from datetime import datetime
 from pathlib import Path
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from playwright.async_api import async_playwright
 
@@ -59,8 +60,29 @@ def download_drive_file(file_id):
     return stream.getvalue()
 
 def upload_drive_file(file_id, raw):
-    media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="application/json", resumable=False)
-    drive_service().files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+    # Replacing the same Drive file with the same bytes is safe to retry if
+    # the TLS connection closes after the request reaches Google.
+    transient_http_codes = {429, 500, 502, 503, 504}
+    for attempt in range(1, 6):
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="application/json", resumable=False)
+        try:
+            drive_service().files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute(num_retries=2)
+            print(f"✅ Drive tracking upload succeeded (attempt {attempt})")
+            return
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status not in transient_http_codes or attempt == 5:
+                raise
+            print(f"⚠️ Temporary Google Drive HTTP {status}; retry {attempt}/5")
+        except (ssl.SSLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            if attempt == 5:
+                raise
+            print(f"⚠️ Temporary Google Drive connection error ({type(exc).__name__}); retry {attempt}/5")
+        time.sleep(min(2 ** attempt, 16))
 
 def load_yalla_tracking():
     global _tracking_id
