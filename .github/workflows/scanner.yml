@@ -28,5 +28,5 @@ jobs:
         name: Install dependencies
       - run: python -m playwright install --with-deps chromium
         name: Install Chromium
-      - run: python scanner.py
+      - run: python -u scanner.py
         name: Run scanner
