@@ -1,15 +1,13 @@
 name: Amazon.sa deal scanners
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       continuous:
-        description: "Keep all three bots scanning for up to 3 hours"
+        description: "Automatically start a fresh run when this run finishes"
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -27,7 +25,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
-      CONTINUOUS_MODE: ${{ github.event_name == 'schedule' || inputs.continuous }}
+      CONTINUOUS_MODE: ${{ inputs.continuous }}
       WORKER_WINDOW_MINUTES: "165"
     steps:
       - uses: actions/checkout@v4
@@ -74,3 +72,16 @@ jobs:
           wait "$bot2_pid" || status=1
           wait "$bot3_pid" || status=1
           exit "$status"
+
+  start_next_run:
+    needs: scan
+    if: ${{ always() && inputs.continuous && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Queue the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run amazon-sa-bot3.yml --ref main -f continuous=true
