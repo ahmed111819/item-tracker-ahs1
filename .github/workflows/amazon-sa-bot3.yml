@@ -1,4 +1,4 @@
-name: Amazon.sa Bot 3 pilot
+name: Amazon.sa deal scanners
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       continuous:
-        description: "Keep scanning and wait 10 minutes after each completed scan"
+        description: "Keep all three bots scanning, waiting 10 minutes after each bot's scan"
         required: false
         type: boolean
         default: false
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: amazon-sa-bot3-pilot
+  group: amazon-sa-deal-scanners
   cancel-in-progress: false
 
 jobs:
@@ -38,6 +38,20 @@ jobs:
         run: python -m pip install --upgrade pip -r requirements.txt
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-      - name: Run Amazon.sa Bot 3
-        run: python -u scanner_amazon_sa_bot3.py
+      - name: Prepare shared Drive alert registry
+        run: python -u prepare_shared_registry.py
+      - name: Run all three bots concurrently
+        shell: bash
+        run: |
+          python -u scanner_amazon_sa_bot1.py &
+          bot1_pid=$!
+          python -u scanner_amazon_sa_bot2.py &
+          bot2_pid=$!
+          python -u scanner_amazon_sa_bot3.py &
+          bot3_pid=$!
 
+          status=0
+          wait "$bot1_pid" || status=1
+          wait "$bot2_pid" || status=1
+          wait "$bot3_pid" || status=1
+          exit "$status"
