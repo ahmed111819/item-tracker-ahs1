@@ -1,27 +1,14 @@
-# item-tracker-ahs1 — إعداد الماسح
+# item-tracker-ahs1 — ماسح Amazon.sa
 
-المستودع عام؛ الكود وسجلات Actions ظاهرة للعموم. لا تضع رمز تيليجرام أو جلسة أمازون أو ملف التتبع داخل المستودع.
+هذا المستودع عام؛ لا تضف إليه رموز تيليجرام أو مفاتيح Google أو ملفات التتبع. تم إيقاف سير عمل Amazon Yalla في GitHub لأن تشغيله مستضاف خارجيًا.
 
-## طريقة التشغيل
+## تجربة Bot 3
 
-- GitHub يشغّل عاملًا تلقائيًا كل 6 ساعات. العامل يشغّل FAST ثم NORMAL، وينتظر 5 دقائق بعد اكتمال الدورة قبل إعادتها.
-- ينتهي العامل قبل حد GitHub البالغ 6 ساعات ثم يبدأ العامل التالي تلقائيًا. قد تحصل فجوة قصيرة أو تأخير عند إعادة التشغيل.
-- `tracking_amazonyalla.json` و`state.json` يبقيان في Google Drive. يتوقف البرنامج إذا لم يجد ملف التتبع؛ لا ينشئ سجلًا جديدًا بصمت.
+راجع [دليل إعداد Bot 3](AMAZON_SA_BOT3_SETUP_AR.md) قبل التشغيل. الماسح يستخدم جلسة Amazon جديدة بلا تسجيل دخول، ويحفظ سجل Bot 3 وسجل التنبيهات في Google Drive.
 
-## ربط Drive
+- فحص واحد يدويًا: Actions → Amazon.sa Bot 3 pilot → Run workflow، واترك خيار continuous غير محدد.
+- تشغيل مستمر: اختر continuous يدويًا، أو اترك الجدولة تبدأ كل 6 ساعات. ينتظر الماسح 10 دقائق بعد انتهاء كل فحص مكتمل.
+- يحتاج الماسح إلى ملف التتبع الحالي `amazon_deals_tracking_bot3.json` في مجلد Drive المحدد.
+- لا يحتاج الماسح إلى `state.json` أو مجلد جلسة Amazon.
 
-1. في Google Cloud Console أنشئ مشروعًا، فعّل Google Drive API، وأنشئ Service Account ومفتاح JSON.
-2. لا ترفع ملف المفتاح إلى GitHub ولا ترسله في المحادثة. من الملف خذ قيمة `client_email` فقط.
-3. شارك مجلد Drive `amazon_session` مع بريد الخدمة بصلاحية Viewer، وشارك مجلد `Amazon_Scanner` بصلاحية Editor.
-4. انسخ معرّف كل مجلد من الرابط، وهو الجزء الذي يأتي بعد `/folders/`.
-5. في المستودع افتح Settings → Secrets and variables → Actions:
-   - Secret `GOOGLE_SERVICE_ACCOUNT_JSON`: محتوى ملف المفتاح JSON كاملًا.
-   - Secret `TELEGRAM_BOT_TOKEN`: رمز البوت الجديد.
-   - Variable `DRIVE_SESSION_FOLDER_ID`: معرّف مجلد `amazon_session`.
-   - Variable `DRIVE_TRACKING_FOLDER_ID`: معرّف مجلد `Amazon_Scanner`.
-
-يلزم وجود `state.json` داخل `amazon_session` و`tracking_amazonyalla.json` داخل `Amazon_Scanner`. لا تغيّر أسماء الملفات. حساب الخدمة يقرأ ملف الجلسة ويحدّث ملف التتبع.
-
-## أول تشغيل
-
-بعد إضافة ملفات المشروع وضبط القيم أعلاه، افتح Actions → Amazon Yalla scanner → Run workflow. تحقق من سجل التشغيل أن عدد المنتجات المحمّل يطابق سجل Drive القديم قبل ترك الجدولة تعمل. لا تضف تشغيلًا عند `pull_request`؛ الـworkflow يعمل بالجدول أو يدويًا فقط.
+لا تبدأ النسخة الجديدة ونسخة Bot 3 في Colab في الوقت نفسه؛ أوقف نسخة Colab أثناء النقل والتجربة لتجنب تحديث ملف التتبع من تشغيلين.
