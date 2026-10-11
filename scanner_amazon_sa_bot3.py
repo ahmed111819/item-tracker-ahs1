@@ -146,7 +146,7 @@ def upload_drive_json(name, local_path):
 tracking_raw = download_drive_json(TRACKING_NAME, required=True)
 Path(TRACKING_FILE).write_bytes(tracking_raw)
 registry_raw = download_drive_json(REGISTRY_NAME, required=False)
-if registry_raw is not None:
+if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
     Path(CENTRAL_ALERTS_FILE).write_bytes(registry_raw)
 
 
