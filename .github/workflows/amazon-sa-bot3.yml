@@ -50,8 +50,9 @@ jobs:
               echo "Starting $script (attempt $attempt/3)"
               if python -u "$script"; then
                 return 0
+              else
+                status=$?
               fi
-              status=$?
               echo "$script exited with status $status"
               if [ "$attempt" -eq 3 ]; then
                 return "$status"
