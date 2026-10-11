@@ -1577,6 +1577,7 @@ async def scan_one_search(context, search_url, search_index):
             "completed": False,
         }
         save_tracking()
+        await asyncio.sleep(1.5)
 
     else:
         tracking_data["scan_state"][search_url] = {
