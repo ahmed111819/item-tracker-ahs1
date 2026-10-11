@@ -2,11 +2,11 @@ name: Amazon.sa deal scanners
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       continuous:
-        description: "Keep all three bots scanning, waiting 10 minutes after each bot's scan"
+        description: "Keep all three bots scanning for up to 3 hours"
         required: false
         type: boolean
         default: false
@@ -21,14 +21,14 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 180
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
       CONTINUOUS_MODE: ${{ github.event_name == 'schedule' || inputs.continuous }}
-      WORKER_WINDOW_MINUTES: "345"
+      WORKER_WINDOW_MINUTES: "165"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,11 +43,29 @@ jobs:
       - name: Run all three bots concurrently
         shell: bash
         run: |
-          python -u scanner_amazon_sa_bot1.py &
+          run_bot() {
+            local script="$1"
+            local attempt=1
+            while [ "$attempt" -le 3 ]; do
+              echo "Starting $script (attempt $attempt/3)"
+              if python -u "$script"; then
+                return 0
+              fi
+              status=$?
+              echo "$script exited with status $status"
+              if [ "$attempt" -eq 3 ]; then
+                return "$status"
+              fi
+              attempt=$((attempt + 1))
+              sleep 20
+            done
+          }
+
+          run_bot scanner_amazon_sa_bot1.py &
           bot1_pid=$!
-          python -u scanner_amazon_sa_bot2.py &
+          run_bot scanner_amazon_sa_bot2.py &
           bot2_pid=$!
-          python -u scanner_amazon_sa_bot3.py &
+          run_bot scanner_amazon_sa_bot3.py &
           bot3_pid=$!
 
           status=0
