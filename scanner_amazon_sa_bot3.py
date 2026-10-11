@@ -1456,18 +1456,12 @@ async def scan_one_page(context, search_url, page_number, search_index):
         )
 
 # ------------------------------------------------------------
-# SCAN ALL PAGES FOR ONE SEARCH
+# SCAN PAGES FOR ONE SEARCH IN SMALL PARALLEL BATCHES
 # ------------------------------------------------------------
 
 async def scan_one_search(context, search_url, search_index):
-    """Scan pages sequentially so Amazon is not flooded with future-page requests.
-
-    A search is completed only when Amazon's Next button is disabled, a clear
-    no-results page is confirmed, or the configured safety cap is reached.
-    HTTP 503/CAPTCHA/unknown-empty pages stay resumable and never imply end.
-    """
+    """Scan each search in bounded page batches and checkpoint in page order."""
     state = tracking_data["scan_state"].get(search_url, {})
-
     if not state.get("completed", False) and state.get("next_page"):
         page_number = max(1, int(state["next_page"]))
         print(f"Resuming search {search_index} at page {page_number}...")
@@ -1481,81 +1475,107 @@ async def scan_one_search(context, search_url, search_index):
     reported_total_pages = None
 
     while page_number <= MAX_PAGES_PER_SEARCH:
-        result = await scan_one_page(
-            context,
-            search_url,
-            page_number,
-            search_index,
+        batch_end = min(
+            page_number + PAGE_WORKERS_PER_SEARCH - 1,
+            MAX_PAGES_PER_SEARCH,
+        )
+        batch_pages = list(range(page_number, batch_end + 1))
+        print(
+            f"Search {search_index}: scanning pages {page_number}-{batch_end} "
+            f"with up to {PAGE_WORKERS_PER_SEARCH} page workers."
+        )
+        batch_results = await asyncio.gather(
+            *[
+                scan_one_page(context, search_url, number, search_index)
+                for number in batch_pages
+            ],
+            return_exceptions=True,
         )
 
-        if not result.get("success"):
-            tracking_data["scan_state"][search_url] = {
-                "next_page": page_number,
-                "total_pages": reported_total_pages,
-                "completed": False,
-                "last_error_at": datetime.now().isoformat(),
-            }
-            save_tracking()
-            print(
-                f"Search {search_index}: page {page_number} was not confirmed. "
-                "Saved resume position; it will retry next run."
-            )
+        stop_search = False
+        for number, result in zip(batch_pages, batch_results):
+            if isinstance(result, Exception):
+                tracking_data["scan_state"][search_url] = {
+                    "next_page": number,
+                    "total_pages": reported_total_pages,
+                    "completed": False,
+                    "last_error_at": datetime.now().isoformat(),
+                }
+                save_tracking()
+                print(
+                    f"Search {search_index}: page {number} raised "
+                    f"{type(result).__name__}; saved it as the resume point."
+                )
+                stop_search = True
+                break
+
+            if not result.get("success"):
+                tracking_data["scan_state"][search_url] = {
+                    "next_page": number,
+                    "total_pages": reported_total_pages,
+                    "completed": False,
+                    "last_error_at": datetime.now().isoformat(),
+                }
+                save_tracking()
+                print(
+                    f"Search {search_index}: page {number} was not confirmed. "
+                    "Saved resume position; it will retry next run."
+                )
+                stop_search = True
+                break
+
+            pages_scanned += 1
+            products_saved += result.get("products_saved", 0)
+            alerts_sent += result.get("alerts_sent", 0)
+            if result.get("total_pages") is not None:
+                reported_total_pages = result["total_pages"]
+                print(
+                    f"Amazon result-count estimate: {reported_total_pages} page(s). "
+                    "Actual end detection uses the Next button / confirmed empty page."
+                )
+            seen_asins.update(result.get("asins", set()))
+
+            if result.get("end_confirmed"):
+                tracking_data["scan_state"][search_url] = {
+                    "next_page": None,
+                    "total_pages": number,
+                    "completed": True,
+                    "end_reason": "AMAZON_NEXT_DISABLED",
+                    "completed_at": datetime.now().isoformat(),
+                }
+                save_tracking()
+                print(
+                    f"🏁 Search {search_index}: Amazon's Next button is disabled "
+                    f"on page {number}. Search completed."
+                )
+                stop_search = True
+                break
+
+            if result.get("empty"):
+                tracking_data["scan_state"][search_url] = {
+                    "next_page": None,
+                    "total_pages": number - 1,
+                    "completed": True,
+                    "end_reason": "CONFIRMED_EMPTY_END_PAGE",
+                    "completed_at": datetime.now().isoformat(),
+                }
+                save_tracking()
+                print(
+                    f"🏁 Search {search_index}: confirmed end at page {number}."
+                )
+                stop_search = True
+                break
+
+        if stop_search:
             break
 
-        pages_scanned += 1
-        products_saved += result.get("products_saved", 0)
-        alerts_sent += result.get("alerts_sent", 0)
-
-        if result.get("total_pages") is not None:
-            reported_total_pages = result["total_pages"]
-            print(
-                f"Amazon result-count estimate: {reported_total_pages} page(s). "
-                "Actual end detection will use the Next button / confirmed empty page."
-            )
-
-        seen_asins.update(result.get("asins", set()))
-
-        # Clear end-of-results signal from a real results page.
-        if result.get("end_confirmed"):
-            tracking_data["scan_state"][search_url] = {
-                "next_page": None,
-                "total_pages": page_number,
-                "completed": True,
-                "end_reason": "AMAZON_NEXT_DISABLED",
-                "completed_at": datetime.now().isoformat(),
-            }
-            save_tracking()
-            print(
-                f"🏁 Search {search_index}: Amazon's Next button is disabled "
-                f"on page {page_number}. Search completed."
-            )
-            break
-
-        # Confirmed empty page is terminal only when the page scanner supplied
-        # end_confirmed=True. Unconfirmed empties are returned as failures.
-        if result.get("empty"):
-            tracking_data["scan_state"][search_url] = {
-                "next_page": None,
-                "total_pages": page_number - 1,
-                "completed": True,
-                "end_reason": "CONFIRMED_EMPTY_END_PAGE",
-                "completed_at": datetime.now().isoformat(),
-            }
-            save_tracking()
-            print(f"🏁 Search {search_index}: confirmed end at page {page_number}.")
-            break
-
-        next_page = page_number + 1
+        page_number = batch_end + 1
         tracking_data["scan_state"][search_url] = {
-            "next_page": next_page,
+            "next_page": page_number,
             "total_pages": reported_total_pages,
             "completed": False,
         }
         save_tracking()
-
-        page_number = next_page
-        # A small gap between sequential pages reduces transient 503 responses.
-        await asyncio.sleep(1.5)
 
     else:
         tracking_data["scan_state"][search_url] = {
