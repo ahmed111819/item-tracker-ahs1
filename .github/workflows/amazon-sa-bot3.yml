@@ -85,4 +85,4 @@ jobs:
       - name: Queue the next run
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run amazon-sa-bot3.yml --ref main -f continuous=true
+        run: gh workflow run amazon-sa-bot3.yml --repo ahmed111819/item-tracker-ahs1 --ref main -f continuous=true
