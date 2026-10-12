@@ -44,6 +44,19 @@ SEARCH_URLS = [
     "https://www.amazon.sa/s?i=beauty&rh=n%3A12462991031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791579496&rnid=16641874031&ref=sr_st_price-asc-rank&ds=v1%3AAQzsduinyKOpc9N50F5mbS%2F5cdCfg%2BlxqG4RRdOs2zc",
     # Link 14
     "https://www.amazon.sa/s?i=arts-crafts&rh=n%3A16636732031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580152&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3A1%2BpXOe7vqIe2DOW6BJUHdS5696zuY16DvrOncJgYEs0",
+# Electronics and accessories
+    "https://www.amazon.sa/s?k=earphones&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=computer+mouse&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=bluetooth&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=keyboard&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=phone+charger&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=power+bank&low-price=&high-price=155",
+    "https://www.amazon.sa/s?k=%D8%B3%D9%85%D8%A7%D8%B9%D9%87+%D8%A7%D8%B0%D9%86&rh=p_36%3A-14500%2Cp_98%3A16895730031%2Cp_n_fulfilled_by_amazon%3A16895730031&dc&crid=3NYABD3ONAL73&qid=1788881287&rnid=16895729031&ref=sr_nr_p_n_fulfilled_by_amazon_1&ds=v1%3AP9hvA63GBQOWAOb%2Bco6oxkuBc6weIkk9jRcfd3vPSik",
+    "https://www.amazon.sa/s?k=%D8%B3%D9%84%D9%83+%D8%B4%D8%A7%D8%AD%D9%86&rh=p_98%3A16895730031%2Cp_n_deal_type%3A210770220031&dc&crid=2RH8PQJ145LBJ&qid=1788732731&rnid=26902955031&sprefix=%D8%B3%D9%84%D9%83+%D8%B4%D8%A7%D8%AD%D9%86%2Caps%2C242&ref=sr_nr_p_n_deal_type_4&ds=v1%3AclDDXn1TaOHlaLYxkoaIfh41TJrhSJl8PIoVjdpVeDk",
+    "https://www.amazon.sa/s?k=%D8%A8%D8%A7%D9%88%D8%B1+%D8%A8%D8%A7%D9%86%D9%83&rh=p_n_fulfilled_by_amazon%3A16895730031&dc&qid=1788881222&rnid=16895729031&ref=sr_nr_p_n_fulfilled_by_amazon_1&ds=v1%3ASvLV3FRiHqrkloCrY0QY%2B4ldnNi8nJYGzTXQw7NYcK0",
+    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_availability%3A16641825031&s=popularity-rank&dc&fs=true&qid=1785288705&rnid=16641824031&xpid=9tpH9A4x9_WgM&ref=sr_pg_1",
+
+    "https://www.amazon.sa/s?k=shampoo&rh=p_98%3A16895730031&low-price=&high-price=155",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]
