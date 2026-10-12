@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       continuous:
-        description: "Automatically start a fresh run when this run finishes"
+        description: "Repeat: run each bot once, rest 10 minutes, then start again"
         required: false
         type: boolean
         default: true
@@ -25,8 +25,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
-      CONTINUOUS_MODE: ${{ inputs.continuous }}
-      WORKER_WINDOW_MINUTES: "165"
+      CONTINUOUS_MODE: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
