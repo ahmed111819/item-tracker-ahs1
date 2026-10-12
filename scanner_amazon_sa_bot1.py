@@ -11,6 +11,7 @@ import json
 import os
 import re
 import requests
+import random
 
 from datetime import datetime
 from urllib.parse import urljoin
@@ -144,17 +145,39 @@ def download_drive_json(name, required=False):
     return None
 
 def upload_drive_json(name, local_path):
+    """Upload one Drive JSON file, retrying transient rate-limit/server errors."""
     raw = Path(local_path).read_bytes()
     with _drive_io_lock:
-        file_id = _drive_ids.get(name)
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="application/json", resumable=False)
-        if file_id:
-            drive_service().files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
-        else:
-            created = drive_service().files().create(
-                body={"name": name, "parents": [DRIVE_FOLDER_ID]},
-                media_body=media, fields="id", supportsAllDrives=True).execute()
-            _drive_ids[name] = created["id"]
+        for attempt, delay in enumerate([0, 4, 10, 25], start=1):
+            try:
+                file_id = _drive_ids.get(name)
+                media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="application/json", resumable=False)
+                if file_id:
+                    drive_service().files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+                else:
+                    created = drive_service().files().create(
+                        body={"name": name, "parents": [DRIVE_FOLDER_ID]},
+                        media_body=media, fields="id", supportsAllDrives=True).execute()
+                    _drive_ids[name] = created["id"]
+                return
+            except Exception as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                details = str(exc).lower()
+                retryable = (
+                    status in {429, 500, 502, 503, 504}
+                    or (status == 403 and any(
+                        marker in details
+                        for marker in ("userratelimitexceeded", "ratelimitexceeded", "rate limit")
+                    ))
+                )
+                if not retryable or attempt == 4:
+                    raise
+                pause = delay + random.uniform(0.2, 1.5)
+                print(
+                    f"⚠️ Drive upload for {name} hit a transient error "
+                    f"(attempt {attempt}/4); retrying in {pause:.1f}s."
+                )
+                time.sleep(pause)
 
 tracking_raw = download_drive_json(TRACKING_NAME, required=True)
 Path(TRACKING_FILE).write_bytes(tracking_raw)
@@ -225,8 +248,9 @@ RUN_COUPON_SIGNATURES = {}
 RUN_PRICE_DROP_SIGNATURES = {}
 
 
-def save_tracking():
-    """Overwrite the fixed tracking file in place."""
+def save_tracking(force=False):
+    """Persist locally on every checkpoint and sync Drive at most every 2 minutes."""
+    global _last_tracking_sync, _tracking_dirty
     tracking_data["last_updated"] = datetime.now().isoformat()
 
     # Avoid temp-file rename on the mounted Google Drive filesystem,
@@ -239,7 +263,22 @@ def save_tracking():
             separators=(",", ":"),
         )
         f.flush()
-    upload_drive_json(TRACKING_NAME, TRACKING_FILE)
+    _tracking_dirty = True
+
+    now = time.monotonic()
+    if not force and now - _last_tracking_sync < TRACKING_SYNC_INTERVAL_SECONDS:
+        return
+
+    try:
+        upload_drive_json(TRACKING_NAME, TRACKING_FILE)
+    except Exception as exc:
+        print(f"⚠️ Drive checkpoint sync deferred: {type(exc).__name__}: {exc}")
+        if force:
+            raise
+        return
+
+    _last_tracking_sync = time.monotonic()
+    _tracking_dirty = False
 
 
 # ------------------------------------------------------------
@@ -250,6 +289,10 @@ def save_tracking():
 # mounted Drive filesystem supports exclusive file creation.
 import time
 import uuid
+
+TRACKING_SYNC_INTERVAL_SECONDS = 120
+_last_tracking_sync = time.monotonic()
+_tracking_dirty = False
 
 LOCK_TIMEOUT_SECONDS = 90
 LOCK_STALE_SECONDS = 180
@@ -1777,7 +1820,13 @@ async def scan_all_searches():
             else:
                 print("Incomplete scan; preserving all previous alert history.")
 
+            # Final flush keeps the latest local checkpoint even if the scan failed partially.
+            save_tracking(force=True)
             print("Tracking file:", TRACKING_FILE)
+            if total_pages == 0:
+                raise RuntimeError(
+                    "No Amazon pages were successfully scanned; treating this run as failed."
+                )
             print("=" * 60)
 
         finally:
