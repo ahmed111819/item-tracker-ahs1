@@ -1464,12 +1464,9 @@ async def scan_one_page(context, search_url, page_number, search_index):
 
 async def scan_one_search(context, search_url, search_index):
     """Scan each search in bounded page batches and checkpoint in page order."""
-    state = tracking_data["scan_state"].get(search_url, {})
-    if not state.get("completed", False) and state.get("next_page"):
-        page_number = max(1, int(state["next_page"]))
-        print(f"Resuming search {search_index} at page {page_number}...")
-    else:
-        page_number = 1
+    # Start every new run from page 1 instead of resuming an old cursor.
+    page_number = 1
+    print(f"Starting search {search_index} at page 1 (fresh scan).")
 
     pages_scanned = 0
     products_saved = 0
