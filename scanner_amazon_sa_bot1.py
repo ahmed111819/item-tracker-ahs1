@@ -191,12 +191,13 @@ def upload_drive_json(name, local_path):
                 time.sleep(pause)
 
 def supabase_request(method, resource, **kwargs):
-    """Call Supabase Data API and retry transient network timeouts."""
+    """Call Supabase Data API and retry transient network/server failures."""
     headers = {
         "apikey": SUPABASE_SECRET_KEY,
         "Content-Type": "application/json",
         **kwargs.pop("headers", {}),
     }
+    retryable_statuses = {429, 500, 502, 503, 504, 520, 522, 524}
     for attempt in range(1, 4):
         try:
             response = requests.request(
@@ -206,7 +207,6 @@ def supabase_request(method, resource, **kwargs):
                 timeout=(15, 120),
                 **kwargs,
             )
-            break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             if attempt == 3:
                 raise
@@ -216,6 +216,17 @@ def supabase_request(method, resource, **kwargs):
                 f"(attempt {attempt}/3); retrying in {pause}s."
             )
             time.sleep(pause)
+            continue
+
+        if response.status_code in retryable_statuses and attempt < 3:
+            pause = 5 * attempt
+            print(
+                f"⚠️ Supabase returned HTTP {response.status_code} "
+                f"(attempt {attempt}/3); retrying in {pause}s."
+            )
+            time.sleep(pause)
+            continue
+        break
 
     if not response.ok:
         raise RuntimeError(
