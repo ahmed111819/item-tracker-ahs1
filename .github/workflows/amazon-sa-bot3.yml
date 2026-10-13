@@ -38,8 +38,6 @@ jobs:
         run: python -m pip install --upgrade pip -r requirements.txt
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-      - name: Prepare shared Drive alert registry
-        run: python -u prepare_shared_registry.py
       - name: Run all three bots concurrently
         shell: bash
         run: |
