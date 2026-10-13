@@ -38,8 +38,6 @@ if not TELEGRAM_READY:
 SEARCH_URLS = [
     # Link 1
     "https://www.amazon.sa/s?k=%D8%B9%D8%A7%D9%85&s=price-asc-rank&crid=KYEJZB6U9R34&qid=1791555435&sprefix=%252Caps%252C274&xpid=vA-56XcT-7YjF&ref=sr_st_price-asc-rank&ds=v1%253AOSs3cNcUkeJgw5Z%252FAYcLGD29XIr9o5n%252BvlZvtKnOMm8",
-    # Link 2
-    "https://www.amazon.sa/b/?ie=UTF8&node=26031445031&ref_=sv_gb_1",
     # Link 6
     "https://www.amazon.sa/s?i=amazon-devices&rh=n%3A12794852031&s=price-asc-rank&fs=true&qid=1791558197&ref=sr_st_price-asc-rank&ds=v1%3A8lN2JnN7E16hrKP6G73vIzygLtQ7auCCc%2B9ljKWfUBQ",
     # Link 7
@@ -108,8 +106,6 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_AMAZON_SA_FOLDER_ID", "").strip()
-if not GOOGLE_SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON secret or DRIVE_AMAZON_SA_FOLDER_ID variable.")
 
 BOT_ID = "bot1"
 DATA_DIR = os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
@@ -127,6 +123,11 @@ _drive_io_lock = threading.Lock()
 def drive_service():
     global _drive
     if _drive is None:
+        if not GOOGLE_SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
+            raise RuntimeError(
+                "This bot has no Supabase state yet; provide GOOGLE_SERVICE_ACCOUNT_JSON "
+                "and DRIVE_AMAZON_SA_FOLDER_ID once to import its existing Drive data."
+            )
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         credentials = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive"])
@@ -297,9 +298,18 @@ def load_tracking_from_backend():
 
 tracking_raw = load_tracking_from_backend()
 Path(TRACKING_FILE).write_bytes(tracking_raw)
-registry_raw = download_drive_json(REGISTRY_NAME, required=False)
-if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
-    Path(CENTRAL_ALERTS_FILE).write_bytes(registry_raw)
+
+if STORAGE_BACKEND == "supabase":
+    registry_migration = supabase_request(
+        "GET",
+        "registry_migrations?select=migration_key&migration_key=eq.drive_alert_registry_v1",
+    ).json()
+else:
+    registry_migration = None
+if not registry_migration:
+    registry_raw = download_drive_json(REGISTRY_NAME, required=False)
+    if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
+        Path(CENTRAL_ALERTS_FILE).write_bytes(registry_raw)
 
 
 if TELEGRAM_READY:
@@ -404,167 +414,120 @@ def save_tracking(force=False):
 
 
 # ------------------------------------------------------------
-# SHARED TELEGRAM ALERT REGISTRY (Google Drive only)
+# SHARED TELEGRAM ALERT REGISTRY (Supabase, atomic across bots)
 # ------------------------------------------------------------
-# Each Colab has its own tracking JSON, but all three share this registry.
-# A short-lived lock protects read/modify/write operations as far as the
-# mounted Drive filesystem supports exclusive file creation.
 import time
 import uuid
 
 TRACKING_SYNC_INTERVAL_SECONDS = 120
 _last_tracking_sync = time.monotonic()
 _tracking_dirty = False
+RESERVATION_TTL_SECONDS = 1800
+REGISTRY_MIGRATION_KEY = "drive_alert_registry_v1"
 
-LOCK_TIMEOUT_SECONDS = 90
-LOCK_STALE_SECONDS = 180
-RESERVATION_TTL_SECONDS = 1800  # 30 minutes
 
-def acquire_central_lock():
-    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            fd = os.open(CENTRAL_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
-                lock_file.write(json.dumps({
-                    "bot_id": BOT_ID,
-                    "created_at": datetime.now().isoformat()
-                }))
-            return
-        except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(CENTRAL_LOCK_FILE)
-                if age > LOCK_STALE_SECONDS:
-                    # Recover a lock left behind by a crashed Colab session.
-                    os.remove(CENTRAL_LOCK_FILE)
-                    continue
-            except FileNotFoundError:
-                continue
-            time.sleep(0.25)
-    raise TimeoutError(
-        "Could not acquire the shared Google Drive lock. "
-        "Do not send alerts without the shared lock."
-    )
+def supabase_import_legacy_registry():
+    marker = supabase_request(
+        "GET",
+        f"registry_migrations?select=migration_key&migration_key=eq.{REGISTRY_MIGRATION_KEY}",
+    ).json()
+    if marker:
+        print("✅ Shared Telegram alert registry is already in Supabase.")
+        return
 
-def release_central_lock():
-    try:
-        os.remove(CENTRAL_LOCK_FILE)
-    except FileNotFoundError:
-        pass
-
-def read_central_registry():
     if not os.path.exists(CENTRAL_ALERTS_FILE):
-        return {"alerts": {}, "updated_at": None}
+        raise RuntimeError("Shared Drive alert registry was not downloaded; refusing to scan.")
     with open(CENTRAL_ALERTS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or not isinstance(data.get("alerts", {}), dict):
-        raise RuntimeError("Central alert registry is invalid; refusing to send.")
-    data.setdefault("alerts", {})
-    return data
+        legacy = json.load(f)
+    if not isinstance(legacy, dict) or not isinstance(legacy.get("alerts"), dict):
+        raise RuntimeError("Shared Drive alert registry is invalid; refusing to scan.")
 
-def write_central_registry(data):
-    data["updated_at"] = datetime.now().isoformat()
-    # Direct write while holding the shared lock; do not write without the lock.
-    with open(CENTRAL_ALERTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        f.flush()
-    upload_drive_json(REGISTRY_NAME, CENTRAL_ALERTS_FILE)
+    rows = []
+    now = datetime.now().astimezone().isoformat()
+    for key, record in legacy["alerts"].items():
+        if not isinstance(record, dict):
+            continue
+        status = record.get("status")
+        if status not in {"sent", "reserved"}:
+            continue
+        old_bot = record.get("sent_by") or record.get("reserved_by") or "bot1"
+        bot_id = old_bot if old_bot in {"bot1", "bot2", "bot3"} else "bot1"
+        details = dict(record)
+        details.pop("status", None)
+        details.pop("sent_at", None)
+        details.pop("reserved_at", None)
+        details.pop("sent_by", None)
+        details.pop("reserved_by", None)
+        rows.append({
+            "alert_key": key,
+            "status": status,
+            "bot_id": bot_id,
+            "reserved_at": record.get("reserved_at") if status == "reserved" else None,
+            "sent_at": record.get("sent_at") if status == "sent" else None,
+            "details": details,
+            "updated_at": record.get("sent_at") or record.get("reserved_at") or now,
+        })
+
+    for offset in range(0, len(rows), 250):
+        supabase_request(
+            "POST",
+            "alert_registry?on_conflict=alert_key",
+            json=rows[offset:offset + 250],
+            headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        )
+
+    supabase_request(
+        "POST",
+        "registry_migrations?on_conflict=migration_key",
+        json={"migration_key": REGISTRY_MIGRATION_KEY, "completed_at": now},
+        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+    )
+    print(f"📦 Imported {len(rows):,} legacy shared alert records into Supabase.")
+
 
 def initialize_central_registry():
-    acquire_central_lock()
-    try:
-        if os.path.exists(CENTRAL_ALERTS_FILE):
-            # Validate it before scanning. Never silently reset a corrupt registry.
-            read_central_registry()
-            return
+    supabase_import_legacy_registry()
 
-        registry = {"alerts": {}, "updated_at": None}
-        # Seed the shared registry from the previous single-bot tracking file
-        # so old alerts are not immediately sent again after migration.
-        if os.path.exists(LEGACY_TRACKING_FILE):
-            try:
-                with open(LEGACY_TRACKING_FILE, "r", encoding="utf-8") as f:
-                    old_data = json.load(f)
-                for asin, record in old_data.get("products", {}).items():
-                    coupon_sig = record.get("last_alert_signature")
-                    if coupon_sig:
-                        key = f"{asin}|coupon|{coupon_sig}"
-                        registry["alerts"][key] = {
-                            "status": "sent",
-                            "sent_by": "legacy",
-                            "sent_at": record.get("last_alert_at") or datetime.now().isoformat()
-                        }
-                    price_sig = record.get("last_price_drop_80_signature")
-                    if price_sig:
-                        key = f"{asin}|price_drop_80|{price_sig}"
-                        registry["alerts"][key] = {
-                            "status": "sent",
-                            "sent_by": "legacy",
-                            "sent_at": record.get("last_price_drop_80_at") or datetime.now().isoformat()
-                        }
-            except Exception as e:
-                raise RuntimeError(
-                    "Could not migrate the old tracking history. "
-                    "Fix the old tracking file before starting the three bots."
-                ) from e
-        write_central_registry(registry)
-        print("✅ Shared Telegram alert registry initialized:", CENTRAL_ALERTS_FILE)
-    finally:
-        release_central_lock()
 
 def reserve_central_alert(alert_key):
-    """Atomically reserve an alert so another bot should not send it concurrently."""
+    """Atomically reserve an alert through a PostgreSQL function."""
     token = str(uuid.uuid4())
-    now = time.time()
-    acquire_central_lock()
-    try:
-        registry = read_central_registry()
-        record = registry["alerts"].get(alert_key)
-        if record:
-            status = record.get("status")
-            if status == "sent":
-                return None
-            if status == "reserved":
-                try:
-                    reserved_at = datetime.fromisoformat(record.get("reserved_at", "")).timestamp()
-                except Exception:
-                    reserved_at = 0
-                if now - reserved_at < RESERVATION_TTL_SECONDS:
-                    return None
-
-        registry["alerts"][alert_key] = {
-            "status": "reserved",
-            "reserved_by": BOT_ID,
-            "reservation_token": token,
-            "reserved_at": datetime.now().isoformat()
-        }
-        write_central_registry(registry)
+    response = supabase_request(
+        "POST",
+        "rpc/reserve_alert",
+        json={
+            "p_alert_key": alert_key,
+            "p_bot_id": BOT_ID,
+            "p_token": token,
+            "p_now": datetime.now().astimezone().isoformat(),
+            "p_ttl_seconds": RESERVATION_TTL_SECONDS,
+        },
+    )
+    reserved = response.json()
+    if isinstance(reserved, list):
+        reserved = bool(reserved and reserved[0])
+    if reserved:
         return token
-    finally:
-        release_central_lock()
+    return None
+
 
 def finish_central_alert(alert_key, token, success):
-    acquire_central_lock()
-    try:
-        registry = read_central_registry()
-        record = registry["alerts"].get(alert_key)
-        if not record or record.get("reservation_token") != token:
-            print("⚠️ Central reservation changed before finalizing:", alert_key)
-            return
-        if success:
-            record.update({
-                "status": "sent",
-                "sent_by": BOT_ID,
-                "sent_at": datetime.now().isoformat()
-            })
-            record.pop("reservation_token", None)
-            record.pop("reserved_at", None)
-        else:
-            # Allow another attempt after a definite send failure.
-            registry["alerts"].pop(alert_key, None)
-        write_central_registry(registry)
-    finally:
-        release_central_lock()
+    response = supabase_request(
+        "POST",
+        "rpc/finish_alert",
+        json={
+            "p_alert_key": alert_key,
+            "p_bot_id": BOT_ID,
+            "p_token": token,
+            "p_success": bool(success),
+            "p_now": datetime.now().astimezone().isoformat(),
+        },
+    )
+    finalized = response.json()
+    if isinstance(finalized, list):
+        finalized = bool(finalized and finalized[0])
+    if not finalized:
+        print("⚠️ Supabase reservation changed before finalizing:", alert_key)
 
 def send_telegram_alert_once(alert_key, title, asin, price, offer, image_url):
     token = reserve_central_alert(alert_key)
