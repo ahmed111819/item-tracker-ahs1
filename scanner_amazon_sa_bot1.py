@@ -6,6 +6,8 @@
 # ============================================================
 
 import asyncio
+import base64
+import gzip
 import html
 import json
 import os
@@ -236,13 +238,33 @@ def supabase_request(method, resource, **kwargs):
     return response
 
 
+def supabase_encode_payload(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=6)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    print(f"📦 Compressed Supabase state: {len(raw):,} → {len(encoded):,} bytes.")
+    return {"_encoding": "gzip+base64", "data": encoded}
+
+
+def supabase_decode_payload(payload):
+    if isinstance(payload, dict) and payload.get("_encoding") == "gzip+base64":
+        packed = base64.b64decode(payload["data"], validate=True)
+        decoded = json.loads(gzip.decompress(packed).decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Decoded Supabase bot_state payload is not a JSON object.")
+        return decoded
+    if not isinstance(payload, dict):
+        raise RuntimeError("Supabase bot_state payload is not a JSON object.")
+    return payload
+
+
 def supabase_upsert_bot_state(payload):
     return supabase_request(
         "POST",
         "bot_state?on_conflict=bot_id",
         json={
             "bot_id": BOT_ID,
-            "payload": payload,
+            "payload": supabase_encode_payload(payload),
             "updated_at": datetime.now().isoformat(),
         },
         headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -257,9 +279,7 @@ def load_tracking_from_backend():
         )
         rows = response.json()
         if rows:
-            payload = rows[0].get("payload")
-            if not isinstance(payload, dict):
-                raise RuntimeError("Supabase bot_state payload is not a JSON object.")
+            payload = supabase_decode_payload(rows[0].get("payload"))
             print("✅ Loaded Bot 1 tracking state from Supabase.")
             return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
