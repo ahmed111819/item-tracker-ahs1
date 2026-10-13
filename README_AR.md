@@ -13,11 +13,11 @@
 
 ## إعداد Supabase مرة واحدة
 
-1. ادمج التغيير الذي يضيف الملف SUPABASE_SHARED_REGISTRY_SETUP.sql.
-2. في Supabase افتح SQL Editor، الصق محتوى الملف وشغّل الاستعلام مرة واحدة. ينشئ دوالًا ذرية لحجز التنبيه وإنهائه، وجدولًا صغيرًا لتسجيل اكتمال نقل سجل التنبيهات.
-3. في GitHub → Settings → Secrets and variables → Actions، تأكد من وجود الأسرار SUPABASE_URL وSUPABASE_SECRET_KEY، إضافةً إلى أسرار تيليجرام الحالية.
-4. أبقِ GOOGLE_SERVICE_ACCOUNT_JSON وVariable باسم DRIVE_AMAZON_SA_FOLDER_ID أثناء أول تشغيل جماعي؛ تُقرأ ملفات تتبع Bot 2 وBot 3 وسجل التنبيهات القديم من Drive مرة واحدة إذا لم تكن موجودة في Supabase. بعدها يتجاوز التشغيل قراءة سجل التنبيهات من Drive. ملفات Bot 1 وملف التنبيهات نُقلت بالفعل خلال تجربة Bot 1.
-5. من Actions شغّل Amazon.sa deal scanners. اترك continuous مفعّلًا للاستمرار؛ ألغِ تفعيله إذا أردت دورة واحدة فقط.
+1. تأكد من تشغيل `SUPABASE_SHARED_REGISTRY_SETUP.sql` مرة واحدة في Supabase SQL Editor؛ فهو يجهز حجز التنبيهات المشترك.
+2. بعد دمج التعديل، شغّل `SUPABASE_STORAGE_SETUP.sql` مرة واحدة. ينشئ حاوية خاصة باسم `scanner-state` لحفظ ملفات التتبع المضغوطة؛ تبقى الملفات غير عامة.
+3. في GitHub → Settings → Secrets and variables → Actions، تأكد من وجود `SUPABASE_URL` و`SUPABASE_SECRET_KEY` إضافةً إلى أسرار تيليجرام الحالية.
+4. أبقِ `GOOGLE_SERVICE_ACCOUNT_JSON` وVariable باسم `DRIVE_AMAZON_SA_FOLDER_ID` مؤقتًا إلى أن تتأكد من اكتمال استيراد ملفات Bot 2 وBot 3 وسجل التنبيهات. الصفوف المضغوطة القديمة داخل قاعدة البيانات تُقرأ كما هي، ثم ينتقل حفظها تلقائيًا إلى الحاوية عند أول مزامنة ناجحة.
+5. من Actions شغّل `Amazon.sa deal scanners`. اترك `continuous` مفعّلًا للاستمرار؛ ألغِ تفعيله إذا أردت دورة واحدة فقط.
 
 ## تنبيهات
 
