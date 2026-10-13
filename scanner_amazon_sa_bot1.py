@@ -295,9 +295,18 @@ def load_tracking_from_backend():
 
 tracking_raw = load_tracking_from_backend()
 Path(TRACKING_FILE).write_bytes(tracking_raw)
-registry_raw = download_drive_json(REGISTRY_NAME, required=False)
-if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
-    Path(CENTRAL_ALERTS_FILE).write_bytes(registry_raw)
+
+if STORAGE_BACKEND == "supabase":
+    registry_migration = supabase_request(
+        "GET",
+        "registry_migrations?select=migration_key&migration_key=eq.drive_alert_registry_v1",
+    ).json()
+else:
+    registry_migration = None
+if not registry_migration:
+    registry_raw = download_drive_json(REGISTRY_NAME, required=False)
+    if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
+        Path(CENTRAL_ALERTS_FILE).write_bytes(registry_raw)
 
 
 if TELEGRAM_READY:
