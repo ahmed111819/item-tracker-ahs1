@@ -26,6 +26,9 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
       CONTINUOUS_MODE: "false"
+      STORAGE_BACKEND: supabase
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
