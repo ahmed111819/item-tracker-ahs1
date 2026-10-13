@@ -12,6 +12,7 @@ import os
 import re
 import requests
 import random
+import time
 
 from datetime import datetime
 from urllib.parse import urljoin
@@ -190,18 +191,32 @@ def upload_drive_json(name, local_path):
                 time.sleep(pause)
 
 def supabase_request(method, resource, **kwargs):
-    """Call Supabase Data API using the backend-only secret key."""
-    response = requests.request(
-        method,
-        f"{SUPABASE_URL}/rest/v1/{resource}",
-        headers={
-            "apikey": SUPABASE_SECRET_KEY,
-            "Content-Type": "application/json",
-            **kwargs.pop("headers", {}),
-        },
-        timeout=30,
-        **kwargs,
-    )
+    """Call Supabase Data API and retry transient network timeouts."""
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+        **kwargs.pop("headers", {}),
+    }
+    for attempt in range(1, 4):
+        try:
+            response = requests.request(
+                method,
+                f"{SUPABASE_URL}/rest/v1/{resource}",
+                headers=headers,
+                timeout=(15, 120),
+                **kwargs,
+            )
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt == 3:
+                raise
+            pause = 5 * attempt
+            print(
+                f"⚠️ Supabase request timed out or disconnected "
+                f"(attempt {attempt}/3); retrying in {pause}s."
+            )
+            time.sleep(pause)
+
     if not response.ok:
         raise RuntimeError(
             f"Supabase {method} {resource} failed with HTTP "
