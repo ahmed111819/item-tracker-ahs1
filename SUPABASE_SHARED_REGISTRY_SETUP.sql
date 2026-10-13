@@ -98,4 +98,6 @@ grant execute on function public.reserve_alert(text, text, text, timestamptz, in
 grant execute on function public.finish_alert(text, text, text, boolean, timestamptz)
     to service_role;
 
+notify pgrst, 'reload schema';
+
 commit;
