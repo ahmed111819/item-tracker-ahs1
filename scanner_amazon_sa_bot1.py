@@ -211,7 +211,7 @@ def supabase_request(method, resource, **kwargs):
 
 
 def supabase_upsert_bot_state(payload):
-    response = supabase_request(
+    return supabase_request(
         "POST",
         "bot_state?on_conflict=bot_id",
         json={
@@ -221,7 +221,6 @@ def supabase_upsert_bot_state(payload):
         },
         headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
     )
-    return response
 
 
 def load_tracking_from_backend():
