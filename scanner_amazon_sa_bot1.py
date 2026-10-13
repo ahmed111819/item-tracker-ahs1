@@ -92,6 +92,7 @@ BOT_ID = "bot1"
 STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "drive").strip().lower()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = "scanner-state"
 if STORAGE_BACKEND not in {"drive", "supabase"}:
     raise RuntimeError("STORAGE_BACKEND must be 'drive' or 'supabase'.")
 if STORAGE_BACKEND == "supabase" and (not SUPABASE_URL or not SUPABASE_SECRET_KEY):
@@ -239,6 +240,47 @@ def supabase_request(method, resource, **kwargs):
     return response
 
 
+def supabase_storage_request(method, object_key, **kwargs):
+    """Upload or download one private compressed state object."""
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        **kwargs.pop("headers", {}),
+    }
+    url = (
+        f"{SUPABASE_URL}/storage/v1/object/"
+        f"{SUPABASE_STORAGE_BUCKET}/{object_key}"
+    )
+    retryable_statuses = {429, 500, 502, 503, 504, 520, 522, 524}
+    for attempt in range(1, 4):
+        try:
+            response = requests.request(
+                method, url, headers=headers, timeout=(15, 180), **kwargs
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt == 3:
+                raise
+            pause = 5 * attempt
+            print(f"⚠️ Supabase Storage request failed (attempt {attempt}/3); retrying in {pause}s.")
+            time.sleep(pause)
+            continue
+        if response.status_code in retryable_statuses and attempt < 3:
+            pause = 5 * attempt
+            print(
+                f"⚠️ Supabase Storage returned HTTP {response.status_code} "
+                f"(attempt {attempt}/3); retrying in {pause}s."
+            )
+            time.sleep(pause)
+            continue
+        break
+    if not response.ok:
+        raise RuntimeError(
+            f"Supabase Storage {method} {object_key} failed with HTTP "
+            f"{response.status_code}: {response.text[:1000]}"
+        )
+    return response
+
+
 def supabase_encode_payload(payload):
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     compressed = gzip.compress(raw, compresslevel=6)
@@ -248,6 +290,18 @@ def supabase_encode_payload(payload):
 
 
 def supabase_decode_payload(payload):
+    if isinstance(payload, dict) and payload.get("_encoding") == "supabase-storage-gzip":
+        object_key = payload.get("object_key")
+        expected_key = f"{BOT_ID}.json.gz"
+        if object_key != expected_key:
+            raise RuntimeError("Supabase bot_state references an unexpected storage object.")
+        packed = supabase_storage_request("GET", object_key).content
+        decoded = json.loads(gzip.decompress(packed).decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Decoded Supabase Storage state is not a JSON object.")
+        return decoded
+
+    # Read legacy inline rows and migrate them to Storage on the next save.
     if isinstance(payload, dict) and payload.get("_encoding") == "gzip+base64":
         packed = base64.b64decode(payload["data"], validate=True)
         decoded = json.loads(gzip.decompress(packed).decode("utf-8"))
@@ -260,12 +314,25 @@ def supabase_decode_payload(payload):
 
 
 def supabase_upsert_bot_state(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=6)
+    object_key = f"{BOT_ID}.json.gz"
+    print(f"📦 Compressed state for Supabase Storage: {len(raw):,} → {len(compressed):,} bytes.")
+    supabase_storage_request(
+        "POST",
+        object_key,
+        data=compressed,
+        headers={"Content-Type": "application/gzip", "x-upsert": "true"},
+    )
     return supabase_request(
         "POST",
         "bot_state?on_conflict=bot_id",
         json={
             "bot_id": BOT_ID,
-            "payload": supabase_encode_payload(payload),
+            "payload": {
+                "_encoding": "supabase-storage-gzip",
+                "object_key": object_key,
+            },
             "updated_at": datetime.now().isoformat(),
         },
         headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -281,7 +348,7 @@ def load_tracking_from_backend():
         rows = response.json()
         if rows:
             payload = supabase_decode_payload(rows[0].get("payload"))
-            print("✅ Loaded Bot 1 tracking state from Supabase.")
+            print(f"✅ Loaded {BOT_ID} tracking state from Supabase.")
             return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         # One-time migration: seed the new table from the existing Drive file.
@@ -419,7 +486,7 @@ def save_tracking(force=False):
 import time
 import uuid
 
-TRACKING_SYNC_INTERVAL_SECONDS = 120
+TRACKING_SYNC_INTERVAL_SECONDS = 600
 _last_tracking_sync = time.monotonic()
 _tracking_dirty = False
 RESERVATION_TTL_SECONDS = 1800
