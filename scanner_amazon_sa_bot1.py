@@ -269,6 +269,9 @@ def save_tracking(force=False):
     if not force and now - _last_tracking_sync < TRACKING_SYNC_INTERVAL_SECONDS:
         return
 
+    # Record the attempt even when Drive rejects it, so a persistent 403
+    # cannot trigger another upload on every product/page checkpoint.
+    _last_tracking_sync = now
     try:
         upload_drive_json(TRACKING_NAME, TRACKING_FILE)
     except Exception as exc:
