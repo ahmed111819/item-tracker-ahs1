@@ -85,6 +85,16 @@ BOT_ID = "bot1"
 # ------------------------------------------------------------
 # GitHub Actions + Google Drive persistence (no Amazon login/session)
 # ------------------------------------------------------------
+# The pilot workflow can store Bot 1's tracking payload in Supabase.
+# The shared Telegram reservation registry remains on Drive during the pilot
+# so the other two Drive-based bots continue to deduplicate alerts safely.
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "drive").strip().lower()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+if STORAGE_BACKEND not in {"drive", "supabase"}:
+    raise RuntimeError("STORAGE_BACKEND must be 'drive' or 'supabase'.")
+if STORAGE_BACKEND == "supabase" and (not SUPABASE_URL or not SUPABASE_SECRET_KEY):
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SECRET_KEY in GitHub Actions secrets.")
 import io
 import tempfile
 import threading
@@ -179,7 +189,68 @@ def upload_drive_json(name, local_path):
                 )
                 time.sleep(pause)
 
-tracking_raw = download_drive_json(TRACKING_NAME, required=True)
+def supabase_request(method, resource, **kwargs):
+    """Call Supabase Data API using the backend-only secret key."""
+    response = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{resource}",
+        headers={
+            "apikey": SUPABASE_SECRET_KEY,
+            "Content-Type": "application/json",
+            **kwargs.pop("headers", {}),
+        },
+        timeout=30,
+        **kwargs,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Supabase {method} {resource} failed with HTTP "
+            f"{response.status_code}: {response.text[:1000]}"
+        )
+    return response
+
+
+def supabase_upsert_bot_state(payload):
+    response = supabase_request(
+        "POST",
+        "bot_state?on_conflict=bot_id",
+        json={
+            "bot_id": BOT_ID,
+            "payload": payload,
+            "updated_at": datetime.now().isoformat(),
+        },
+        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+    )
+    return response
+
+
+def load_tracking_from_backend():
+    if STORAGE_BACKEND == "supabase":
+        response = supabase_request(
+            "GET",
+            f"bot_state?select=payload&bot_id=eq.{BOT_ID}",
+        )
+        rows = response.json()
+        if rows:
+            payload = rows[0].get("payload")
+            if not isinstance(payload, dict):
+                raise RuntimeError("Supabase bot_state payload is not a JSON object.")
+            print("✅ Loaded Bot 1 tracking state from Supabase.")
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        # One-time migration: seed the new table from the existing Drive file.
+        legacy_raw = download_drive_json(TRACKING_NAME, required=True)
+        legacy_payload = json.loads(legacy_raw.decode("utf-8"))
+        if not isinstance(legacy_payload, dict):
+            raise RuntimeError("The existing Drive tracking file is not a JSON object.")
+        supabase_upsert_bot_state(legacy_payload)
+        print("📦 Imported Bot 1 tracking history from Drive into Supabase.")
+        return legacy_raw
+
+    return download_drive_json(TRACKING_NAME, required=True)
+
+
+tracking_raw = load_tracking_from_backend()
 Path(TRACKING_FILE).write_bytes(tracking_raw)
 registry_raw = download_drive_json(REGISTRY_NAME, required=False)
 if registry_raw is not None and not os.path.exists(CENTRAL_ALERTS_FILE):
@@ -273,9 +344,12 @@ def save_tracking(force=False):
     # cannot trigger another upload on every product/page checkpoint.
     _last_tracking_sync = now
     try:
-        upload_drive_json(TRACKING_NAME, TRACKING_FILE)
+        if STORAGE_BACKEND == "supabase":
+            supabase_upsert_bot_state(tracking_data)
+        else:
+            upload_drive_json(TRACKING_NAME, TRACKING_FILE)
     except Exception as exc:
-        print(f"⚠️ Drive checkpoint sync deferred: {type(exc).__name__}: {exc}")
+        print(f"⚠️ {STORAGE_BACKEND.title()} checkpoint sync deferred: {type(exc).__name__}: {exc}")
         if force:
             raise
         return
