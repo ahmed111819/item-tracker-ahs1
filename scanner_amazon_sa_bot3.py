@@ -95,8 +95,6 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_AMAZON_SA_FOLDER_ID", "").strip()
-if not GOOGLE_SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON secret or DRIVE_AMAZON_SA_FOLDER_ID variable.")
 
 BOT_ID = "bot3"
 DATA_DIR = os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
@@ -114,6 +112,11 @@ _drive_io_lock = threading.Lock()
 def drive_service():
     global _drive
     if _drive is None:
+        if not GOOGLE_SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
+            raise RuntimeError(
+                "This bot has no Supabase state yet; provide GOOGLE_SERVICE_ACCOUNT_JSON "
+                "and DRIVE_AMAZON_SA_FOLDER_ID once to import its existing Drive data."
+            )
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         credentials = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive"])
