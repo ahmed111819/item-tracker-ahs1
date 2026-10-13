@@ -1,0 +1,44 @@
+name: Bot 1 Supabase pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bot1-supabase-pilot
+  cancel-in-progress: false
+
+jobs:
+  scan-bot1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      STORAGE_BACKEND: supabase
+      CONTINUOUS_MODE: "false"
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run Bot 1 once using Supabase tracking
+        run: python scanner_amazon_sa_bot1.py
