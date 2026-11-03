@@ -1,4 +1,4 @@
-name: Amazon.sa coupon bot
+name: Amazon.sa deal scanners
 
 on:
   workflow_dispatch:
