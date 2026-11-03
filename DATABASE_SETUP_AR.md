@@ -1,19 +1,19 @@
-# تشغيل بوت الكوبونات الواحد على GitHub مع PostgreSQL
+# إعداد Amazon.sa deal scanners مع PostgreSQL
 
-هذه الحزمة تنقل تخزين Bot 1 إلى PostgreSQL على السيرفر. الفحص وإرسال Telegram يبقيان في GitHub Actions. لن تعمل تلقائيًا قبل إعداد الاتصال واستيراد الملفات القديمة.
+هذه الحزمة تحافظ على اسم Workflow **Amazon.sa deal scanners** وتشغّل البوتات الثلاثة بالتوازي على GitHub Actions. PostgreSQL على السيرفر للتخزين فقط، ولا يشغّل فحص Amazon.
 
-## محتويات الحزمة
+## الملفات
 
-- `postgres_schema.sql`: ينشئ جداول الحالة وسجل التنبيهات ودوال الحجز الذري.
-- `postgres_storage.py`: وظائف قراءة/حفظ الحالة وإدارة منع تكرار التنبيه.
-- `import_postgres.py`: استيراد أولي لملف تتبع البوت وملف التنبيهات.
-- `requirements-postgres.txt`: مكتبة PostgreSQL لأداة الاستيراد المحلية.
+- `postgres_schema.sql`: جداول حالة البوتات وسجل التنبيهات المشترك.
+- `postgres_storage.py`: وظائف قراءة/حفظ كل حالة وحجز التنبيه ذريًا.
+- `import_postgres.py`: استيراد أولي لملفات التتبع الثلاثة وسجل التنبيهات.
+- `requirements-postgres.txt`: مكتبة PostgreSQL لأداة الاستيراد.
 
-## إعداد قاعدة البيانات على السيرفر
+## إعداد قاعدة البيانات
 
-1. أنشئ قاعدة PostgreSQL ومستخدمًا مخصصًا باسم `coupon_bot` بكلمة مرور قوية.
+1. أنشئ قاعدة PostgreSQL على السيرفر ومستخدمًا مخصصًا باسم `coupon_bot` وكلمة مرور قوية.
 2. شغّل `postgres_schema.sql` مرة واحدة بحساب مالك قاعدة البيانات.
-3. امنح المستخدم `coupon_bot` الصلاحيات التالية، مع استبدال `YOUR_DATABASE` باسم القاعدة:
+3. امنح `coupon_bot` الصلاحيات التالية، مع استبدال `YOUR_DATABASE` باسم القاعدة:
 
    ```sql
    GRANT CONNECT ON DATABASE YOUR_DATABASE TO coupon_bot;
@@ -25,40 +25,41 @@
    GRANT EXECUTE ON FUNCTION public.finish_alert(text, text, text, boolean, timestamptz) TO coupon_bot;
    ```
 
-4. فعّل اتصال TLS، ولا تفتح منفذ PostgreSQL للإنترنت بلا قيود. GitHub Actions يحتاج مسارًا آمنًا للوصول للسيرفر؛ لا تضع كلمة المرور في الكود أو في المستودع العام.
+4. فعّل TLS ولا تفتح PostgreSQL للإنترنت بلا قيود. يجب أن يصل GitHub Actions للسيرفر عبر اتصال آمن. لا تضع كلمة المرور في الكود أو المستودع العام.
 
-## استيراد البيانات القديمة مرة واحدة
+## استيراد الحالة القديمة قبل التشغيل
 
-يحتاج البوت ملفين مختلفين:
+يلزم وجود أربعة ملفات:
 
-- `amazon_deals_tracking_bot1.json`: سجل المنتجات والأسعار وحالة الفحص.
-- `amazon_deals_sent_registry.json`: سجل إشعارات Telegram المرسلة.
+- `amazon_deals_tracking_bot1.json`
+- `amazon_deals_tracking_bot2.json`
+- `amazon_deals_tracking_bot3.json`
+- `amazon_deals_sent_registry.json`
 
-الملف المرفق حاليًا هو سجل الإشعارات. لا يحتوي سجل المنتجات؛ يلزم الحصول على `amazon_deals_tracking_bot1.json` من نسخة Bot 1 القديمة قبل التشغيل حتى لا يبدأ تاريخ الأسعار من الصفر.
+ملف JSON الذي أرسلته هو سجل التنبيهات فقط. لا يحتوي سجلات المنتجات والأسعار؛ نحتاج ملفات التتبع الثلاثة من مصدرها القديم. لا تشغّل البوت قبل استيرادها، لأن الحالة الفارغة قد تسبب تكرار التنبيهات أو فقدان تاريخ الأسعار. الكود يرفض التشغيل إذا غاب أي صف أو سجل التنبيهات.
 
-من جهاز موثوق يحتفظ بالملفين، شغّل:
+من جهاز موثوق يحتوي الملفات الأربعة:
 
 ```powershell
 $env:DATABASE_URL = 'postgresql://coupon_bot:YOUR_PASSWORD@YOUR_SERVER:5432/YOUR_DATABASE?sslmode=require'
 python -m pip install -r requirements-postgres.txt
-python import_postgres.py --tracking 'amazon_deals_tracking_bot1.json' --registry 'amazon_deals_sent_registry.json' --bot-id bot1
+python import_postgres.py --tracking "bot1=amazon_deals_tracking_bot1.json" --tracking "bot2=amazon_deals_tracking_bot2.json" --tracking "bot3=amazon_deals_tracking_bot3.json" --registry "amazon_deals_sent_registry.json"
 ```
 
-الاستيراد آمن لإعادة المحاولة: لا يستبدل صف حالة موجودًا ولا يكتب فوق مفاتيح تنبيه موجودة. لا ترفع ملفي JSON إلى المستودع العام.
+الاستيراد يمكن إعادة محاولته؛ لا يستبدل صف حالة موجودًا ولا يكتب فوق مفاتيح تنبيه موجودة. لا ترفع ملفات JSON إلى GitHub.
 
 ## GitHub Actions
 
-بعد اكتمال إعداد السيرفر والاستيراد:
+بعد إعداد السيرفر واستيراد الملفات:
 
-1. أضف Secret باسم `DATABASE_URL` في إعدادات مستودع GitHub. قيمة السر هي رابط PostgreSQL الكامل مع `sslmode=require`.
-2. تأكد من بقاء `TELEGRAM_BOT_TOKEN` و`TELEGRAM_CHAT_ID` كما هما.
-3. شغّل Workflow باسم **Amazon.sa coupon bot** مع خيار `continuous` مفعّل. البوت ينفذ فحصًا كاملًا، ينتظر 10 دقائق بعد انتهائه، ثم يبدأ دورة جديدة. أوقفه بإلغاء التشغيل الجاري.
+1. أضف GitHub Actions Secret باسم `DATABASE_URL`، مع رابط PostgreSQL و`sslmode=require`.
+2. أبقِ `TELEGRAM_BOT_TOKEN` و`TELEGRAM_CHAT_ID` في GitHub Secrets.
+3. شغّل Workflow **Amazon.sa deal scanners** مع تفعيل `continuous`. تبدأ البوتات الثلاثة معًا، وبعد انتهاء الثلاثة ينتظر Workflow 10 دقائق ثم يشغّل دورة جديدة.
+4. لإيقاف التكرار ألغِ التشغيل الجاري.
 
-التغييرات تستهدف بوتًا واحدًا فقط، ولا تشغّل Bot 2 أو Bot 3. لا تبدأ التشغيل قبل استيراد الحالتين؛ إذا غاب أحدهما يتوقف البوت برسالة خطأ بدل إنشاء سجل فارغ.
+## المساحة
 
-## التخزين والمساحة
+كل بوت له صف حالة مضغوط ثابت (`bot1` و`bot2` و`bot3`) يعاد تحديثه بدل إنشاء ملف جديد. أحجام الملفات المضغوطة السابقة كانت تقريبًا 8.5 MB لكل بوت؛ احجز حوالي 30 MB للحالة الحالية مع مساحة أكبر لـ PostgreSQL WAL والنسخ الاحتياطية والتنظيف التلقائي.
 
-تُخزّن حالة Bot 1 كـ JSON مضغوط في صف واحد اسمه `bot1`. كل حفظ يستبدل قيمة الصف نفسه بدل إنشاء ملف مؤرخ جديد. حجم نسخة Bot 1 المضغوطة في تشغيل سابق كان نحو 8.5 MB؛ اترك مساحة إضافية لـ WAL والنسخ الاحتياطية والتنظيف الدوري في PostgreSQL.
-
-كل checkpoint ما زال ينقل الحالة المضغوطة بين GitHub والسيرفر. هذا يوقف الاعتماد على حصة تخزين Supabase، لكنه لا يحول الحفظ إلى تحديثات صغيرة؛ تحسين النقل لاحقًا يتطلب تخزين المنتجات كسجلات محدثة تدريجيًا.
+كل checkpoint ما زال ينقل الحالة المضغوطة بين GitHub Actions والسيرفر. هذا يرفع حد التخزين عن Supabase، لكنه لا يلغي نقل الحالة. يمكن تقليل النقل لاحقًا بتحويل البيانات إلى تحديثات منتجات متفرقة بدل رفع ملف الحالة كاملًا.
 
