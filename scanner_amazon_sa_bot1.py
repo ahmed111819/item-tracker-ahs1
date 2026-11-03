@@ -91,11 +91,10 @@ RETRY_DELAYS_SECONDS = [4, 7, 12]
 BOT_ID = "bot1"
 
 # ------------------------------------------------------------
-# GitHub Actions + Google Drive persistence (no Amazon login/session)
+# GitHub Actions database persistence (no Amazon login/session).
 # ------------------------------------------------------------
-# The pilot workflow can store Bot 1's tracking payload in Supabase.
-# The shared Telegram reservation registry remains on Drive during the pilot
-# so the other two Drive-based bots continue to deduplicate alerts safely.
+# The production coupon workflow uses PostgreSQL for both tracking state and Telegram deduplication.
+# Drive and Supabase helpers below remain only for legacy workflows.
 STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "drive").strip().lower()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
@@ -459,7 +458,7 @@ RUN_PRICE_DROP_SIGNATURES = {}
 
 
 def save_tracking(force=False):
-    """Persist locally on every checkpoint and sync Drive at most every 2 minutes."""
+    """Persist locally at each checkpoint and sync the configured backend every 10 minutes."""
     global _last_tracking_sync, _tracking_dirty
     tracking_data["last_updated"] = datetime.now().isoformat()
 
@@ -501,7 +500,7 @@ def save_tracking(force=False):
 
 
 # ------------------------------------------------------------
-# SHARED TELEGRAM ALERT REGISTRY (Supabase, atomic across bots)
+# SHARED TELEGRAM ALERT REGISTRY (atomic database reservation)
 # ------------------------------------------------------------
 import time
 import uuid
