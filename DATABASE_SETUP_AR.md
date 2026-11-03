@@ -1,65 +1,66 @@
-# إعداد Amazon.sa deal scanners مع PostgreSQL
+# إعداد Amazon.sa deal scanners على PostgreSQL في Oracle
 
-هذه الحزمة تحافظ على اسم Workflow **Amazon.sa deal scanners** وتشغّل البوتات الثلاثة بالتوازي على GitHub Actions. PostgreSQL على السيرفر للتخزين فقط، ولا يشغّل فحص Amazon.
+هذا المستودع يشغّل البوتات الثلاثة بالتوازي في GitHub Actions. سيرفر Oracle يستخدم للتخزين فقط؛ لا يشغّل فحص Amazon. اتصال GitHub Actions بقاعدة البيانات يمر عبر نفق SSH مقيّد إلى PostgreSQL المحلي، لذلك لا نفتح المنفذ 5432 على الإنترنت.
 
-## الملفات
+## حالة الترحيل الحالية
 
-- `postgres_schema.sql`: جداول حالة البوتات وسجل التنبيهات المشترك.
-- `postgres_storage.py`: وظائف قراءة/حفظ كل حالة وحجز التنبيه ذريًا.
-- `import_postgres.py`: استيراد أولي لملفات التتبع الثلاثة وسجل التنبيهات.
-- `requirements-postgres.txt`: مكتبة PostgreSQL لأداة الاستيراد.
+تم استيراد الحالات الموجودة للبوتات الثلاثة وسجل التنبيهات المشترك إلى قاعدة `coupon_storage` على السيرفر:
 
-## إعداد قاعدة البيانات
+- ثلاث حالات بوتات: `bot1` و`bot2` و`bot3`.
+- 43 سجل تنبيه قديم.
+- علامة اكتمال الاستيراد موجودة، والماسحات ترفض البدء إذا غابت الحالة.
 
-1. أنشئ قاعدة PostgreSQL على السيرفر ومستخدمًا مخصصًا باسم `coupon_bot` وكلمة مرور قوية.
-2. شغّل `postgres_schema.sql` مرة واحدة بحساب مالك قاعدة البيانات.
-3. امنح `coupon_bot` الصلاحيات التالية، مع استبدال `YOUR_DATABASE` باسم القاعدة:
+ملفات JSON الأصلية لم تُرفع إلى GitHub. أزيلت نسخ الرفع المؤقتة من السيرفر بعد الاستيراد.
 
-   ```sql
-   GRANT CONNECT ON DATABASE YOUR_DATABASE TO coupon_bot;
-   GRANT USAGE ON SCHEMA public TO coupon_bot;
-   GRANT SELECT, INSERT, UPDATE ON public.bot_state TO coupon_bot;
-   GRANT SELECT, INSERT, UPDATE, DELETE ON public.alert_registry TO coupon_bot;
-   GRANT SELECT, INSERT ON public.storage_migrations TO coupon_bot;
-   GRANT EXECUTE ON FUNCTION public.reserve_alert(text, text, text, timestamptz, integer) TO coupon_bot;
-   GRANT EXECUTE ON FUNCTION public.finish_alert(text, text, text, boolean, timestamptz) TO coupon_bot;
-   ```
+## صلاحيات PostgreSQL
 
-4. فعّل TLS ولا تفتح PostgreSQL للإنترنت بلا قيود. يجب أن يصل GitHub Actions للسيرفر عبر اتصال آمن. لا تضع كلمة المرور في الكود أو المستودع العام.
+قاعدة البيانات `coupon_storage` والجداول موجودة على السيرفر. أنشئ مستخدم تشغيل محدودًا، ثم امنحه الصلاحيات التالية. عيّن كلمة مرور للمستخدم باستخدام `\\password coupon_bot` داخل `psql`؛ لا ترسل كلمة المرور في المحادثة ولا تحفظها في المستودع.
 
-## استيراد الحالة القديمة قبل التشغيل
-
-يلزم وجود أربعة ملفات:
-
-- `amazon_deals_tracking_bot1.json`
-- `amazon_deals_tracking_bot2.json`
-- `amazon_deals_tracking_bot3.json`
-- `amazon_deals_sent_registry.json`
-
-ملف JSON الذي أرسلته هو سجل التنبيهات فقط. لا يحتوي سجلات المنتجات والأسعار؛ نحتاج ملفات التتبع الثلاثة من مصدرها القديم. لا تشغّل البوت قبل استيرادها، لأن الحالة الفارغة قد تسبب تكرار التنبيهات أو فقدان تاريخ الأسعار. الكود يرفض التشغيل إذا غاب أي صف أو سجل التنبيهات.
-
-من جهاز موثوق يحتوي الملفات الأربعة:
-
-```powershell
-$env:DATABASE_URL = 'postgresql://coupon_bot:YOUR_PASSWORD@YOUR_SERVER:5432/YOUR_DATABASE?sslmode=require'
-python -m pip install -r requirements-postgres.txt
-python import_postgres.py --tracking "bot1=amazon_deals_tracking_bot1.json" --tracking "bot2=amazon_deals_tracking_bot2.json" --tracking "bot3=amazon_deals_tracking_bot3.json" --registry "amazon_deals_sent_registry.json"
+```sql
+CREATE ROLE coupon_bot LOGIN;
+GRANT CONNECT ON DATABASE coupon_storage TO coupon_bot;
+GRANT USAGE ON SCHEMA public TO coupon_bot;
+GRANT SELECT, INSERT, UPDATE ON public.bot_state TO coupon_bot;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.alert_registry TO coupon_bot;
+GRANT SELECT ON public.storage_migrations TO coupon_bot;
+GRANT EXECUTE ON FUNCTION public.reserve_alert(text, text, text, timestamptz, integer) TO coupon_bot;
+GRANT EXECUTE ON FUNCTION public.finish_alert(text, text, text, boolean, timestamptz) TO coupon_bot;
 ```
 
-الاستيراد يمكن إعادة محاولته؛ لا يستبدل صف حالة موجودًا ولا يكتب فوق مفاتيح تنبيه موجودة. لا ترفع ملفات JSON إلى GitHub.
+إذا كان الدور موجودًا مسبقًا، لا تكرر `CREATE ROLE`؛ عيّن كلمة المرور وطبّق أوامر `GRANT` فقط.
 
-## GitHub Actions
+## نفق SSH المقيّد
 
-بعد إعداد السيرفر واستيراد الملفات:
+يتوقع الـ workflow مستخدم SSH مخصصًا باسم `coupon-tunnel` ومفتاحًا منفصلًا عن مفتاح إدارة السيرفر. يجب تقييد المفتاح ليقبل تمرير منفذ قاعدة البيانات المحلي فقط، باستخدام خيارات `authorized_keys`:
 
-1. أضف GitHub Actions Secret باسم `DATABASE_URL`، مع رابط PostgreSQL و`sslmode=require`.
-2. أبقِ `TELEGRAM_BOT_TOKEN` و`TELEGRAM_CHAT_ID` في GitHub Secrets.
-3. شغّل Workflow **Amazon.sa deal scanners** مع تفعيل `continuous`. تبدأ البوتات الثلاثة معًا، وبعد انتهاء الثلاثة ينتظر Workflow 10 دقائق ثم يشغّل دورة جديدة.
-4. لإيقاف التكرار ألغِ التشغيل الجاري.
+```text
+restrict,port-forwarding,permitopen="127.0.0.1:5432" ssh-ed25519 YOUR_PUBLIC_KEY github-actions-coupon-db
+```
+
+لا تستخدم مفتاح `ubuntu` الإداري في GitHub Actions. المفتاح المخصص لا يحتاج shell أو صلاحيات sudo. يبقى PostgreSQL مربوطًا بـ `localhost` ويظل منفذ 5432 مغلقًا خارجيًا.
+
+## أسرار GitHub المطلوبة
+
+في المستودع `ahmed111819/item-tracker-ahs1` افتح **Settings → Secrets and variables → Actions → New repository secret** وأضف:
+
+1. `ORACLE_TUNNEL_PRIVATE_KEY`: المفتاح الخاص المطابق للمفتاح المقيّد أعلاه.
+2. `DATABASE_URL`: رابط قاعدة البيانات داخل النفق. استخدم كلمة المرور التي عيّنتها للدور، وتجنب الرموز التي تحتاج ترميزًا في الرابط:
+
+   ```text
+   postgresql://coupon_bot:YOUR_URL_SAFE_PASSWORD@127.0.0.1:5432/coupon_storage?sslmode=disable
+   ```
+
+اترك أسرار `TELEGRAM_BOT_TOKEN` و`TELEGRAM_CHAT_ID` الحالية كما هي. لا تضع أي مفتاح أو كلمة مرور في ملفات المستودع أو في رسالة المحادثة.
+
+## التشغيل
+
+بعد دمج تغيير النفق وإضافة الإعدادات أعلاه:
+
+1. افتح **Actions → Amazon.sa deal scanners → Run workflow**.
+2. تشغيل الماسحات يدويًا يكون مع `continuous=false` للفحص مرة واحدة.
+3. لتكرارها، فعّل `continuous=true`: تعمل البوتات الثلاثة بالتوازي، ثم يبدأ انتظار 10 دقائق بعد انتهاء الثلاثة، وبعدها تبدأ دورة جديدة.
+4. ألغِ التشغيل الجاري لإيقاف التكرار.
 
 ## المساحة
 
-كل بوت له صف حالة مضغوط ثابت (`bot1` و`bot2` و`bot3`) يعاد تحديثه بدل إنشاء ملف جديد. أحجام الملفات المضغوطة السابقة كانت تقريبًا 8.5 MB لكل بوت؛ احجز حوالي 30 MB للحالة الحالية مع مساحة أكبر لـ PostgreSQL WAL والنسخ الاحتياطية والتنظيف التلقائي.
-
-كل checkpoint ما زال ينقل الحالة المضغوطة بين GitHub Actions والسيرفر. هذا يرفع حد التخزين عن Supabase، لكنه لا يلغي نقل الحالة. يمكن تقليل النقل لاحقًا بتحويل البيانات إلى تحديثات منتجات متفرقة بدل رفع ملف الحالة كاملًا.
-
+تُحدّث الحالات الثلاث في صفوف ثابتة مضغوطة، ولا ينشأ ملف جديد لكل دورة. التخزين الحالي مضغوط بحوالي 20 MB إجمالًا، وتتوفر مساحة قرص تقارب 39 GB على السيرفر عند آخر تحقق.
