@@ -45,6 +45,8 @@ if not TELEGRAM_READY:
 SEARCH_URLS = [
     # Link 5
     "https://www.amazon.sa/s?i=home-improvement&rh=n%3A12463390031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1791557877&rnid=26902955031&ref=sr_nr_p_n_deal_type_2&ds=v1%3AFMMbLv7t3xAwdQgwK0XTtXFXx3UrCOR9dsaahq4wx7Q",
+     # Link 0
+    "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&rh=p_n_deal_type%3A26902956031&s=exact-aware-popularity-rank",
     # Link 8
     "https://www.amazon.sa/s?i=videogames&rh=n%3A12463675031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc=&fs=true&qid=1791558845&rnid=16641831031&ref=sr_nr_p_36_0_0&low-price=&high-price=180",
     # Link 12
