@@ -1,4 +1,4 @@
--- PostgreSQL storage for the single Amazon coupon scanner.
+-- PostgreSQL storage shared by the three Amazon.sa deal scanners.
 -- Run once using the database owner account. The scanner connects with a
 -- separate limited role; do not expose the database without TLS/password auth.
 
