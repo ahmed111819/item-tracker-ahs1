@@ -15,6 +15,13 @@ import re
 import requests
 import random
 import time
+from postgres_storage import (
+    assert_storage_ready,
+    finish_alert as postgres_finish_alert,
+    load_state as load_postgres_state,
+    reserve_alert as postgres_reserve_alert,
+    save_state as save_postgres_state,
+)
 
 from datetime import datetime
 from urllib.parse import urljoin
@@ -93,8 +100,10 @@ STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "drive").strip().lower()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
 SUPABASE_STORAGE_BUCKET = "scanner-state"
-if STORAGE_BACKEND not in {"drive", "supabase"}:
-    raise RuntimeError("STORAGE_BACKEND must be 'drive' or 'supabase'.")
+if STORAGE_BACKEND not in {"drive", "supabase", "postgres"}:
+    raise RuntimeError("STORAGE_BACKEND must be 'drive', 'supabase', or 'postgres'.")
+if STORAGE_BACKEND == "postgres" and not os.environ.get("DATABASE_URL", "").strip():
+    raise RuntimeError("Set DATABASE_URL in GitHub Actions secrets.")
 if STORAGE_BACKEND == "supabase" and (not SUPABASE_URL or not SUPABASE_SECRET_KEY):
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_SECRET_KEY in GitHub Actions secrets.")
 import io
@@ -340,6 +349,12 @@ def supabase_upsert_bot_state(payload):
 
 
 def load_tracking_from_backend():
+    if STORAGE_BACKEND == "postgres":
+        assert_storage_ready(BOT_ID)
+        payload = load_postgres_state(BOT_ID)
+        print(f"✅ Loaded {BOT_ID} tracking state from PostgreSQL.")
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
     if STORAGE_BACKEND == "supabase":
         response = supabase_request(
             "GET",
@@ -366,7 +381,9 @@ def load_tracking_from_backend():
 tracking_raw = load_tracking_from_backend()
 Path(TRACKING_FILE).write_bytes(tracking_raw)
 
-if STORAGE_BACKEND == "supabase":
+if STORAGE_BACKEND == "postgres":
+    registry_migration = [{"migration_key": "legacy_registry_imported"}]
+elif STORAGE_BACKEND == "supabase":
     registry_migration = supabase_request(
         "GET",
         "registry_migrations?select=migration_key&migration_key=eq.drive_alert_registry_v1",
@@ -466,7 +483,10 @@ def save_tracking(force=False):
     # cannot trigger another upload on every product/page checkpoint.
     _last_tracking_sync = now
     try:
-        if STORAGE_BACKEND == "supabase":
+        if STORAGE_BACKEND == "postgres":
+            compressed_size = save_postgres_state(BOT_ID, tracking_data)
+            print(f"📦 PostgreSQL state row updated: {compressed_size:,} compressed bytes.")
+        elif STORAGE_BACKEND == "supabase":
             supabase_upsert_bot_state(tracking_data)
         else:
             upload_drive_json(TRACKING_NAME, TRACKING_FILE)
@@ -553,11 +573,17 @@ def supabase_import_legacy_registry():
 
 
 def initialize_central_registry():
+    if STORAGE_BACKEND == "postgres":
+        assert_storage_ready(BOT_ID)
+        print("✅ PostgreSQL tracking state and imported Telegram registry are ready.")
+        return
     supabase_import_legacy_registry()
 
 
 def reserve_central_alert(alert_key):
-    """Atomically reserve an alert through a PostgreSQL function."""
+    """Atomically reserve an alert through the configured database backend."""
+    if STORAGE_BACKEND == "postgres":
+        return postgres_reserve_alert(alert_key, BOT_ID, ttl_seconds=RESERVATION_TTL_SECONDS)
     token = str(uuid.uuid4())
     response = supabase_request(
         "POST",
@@ -579,6 +605,10 @@ def reserve_central_alert(alert_key):
 
 
 def finish_central_alert(alert_key, token, success):
+    if STORAGE_BACKEND == "postgres":
+        if not postgres_finish_alert(alert_key, BOT_ID, token, success):
+            print("⚠️ PostgreSQL reservation changed before finalizing:", alert_key)
+        return
     response = supabase_request(
         "POST",
         "rpc/finish_alert",
