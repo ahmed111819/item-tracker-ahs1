@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       continuous:
-        description: "Repeat: run each bot once, rest 10 minutes, then start again"
+        description: "Repeat: run all three bots, rest 10 minutes after completion, then start again"
         required: false
         type: boolean
         default: true
@@ -19,16 +19,13 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 355
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-      DRIVE_AMAZON_SA_FOLDER_ID: ${{ vars.DRIVE_AMAZON_SA_FOLDER_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      STORAGE_BACKEND: postgres
       CONTINUOUS_MODE: "false"
-      STORAGE_BACKEND: supabase
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
