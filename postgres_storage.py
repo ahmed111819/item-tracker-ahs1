@@ -122,7 +122,7 @@ def import_registry_file(path: str | Path, bot_id: str = "bot1") -> int:
         if not isinstance(record, dict) or record.get("status") not in {"sent", "reserved"}:
             continue
         status = record["status"]
-        sent_at = record.get("sent_at") if status == "sent" else None
+        sent_at = (record.get("sent_at") or datetime.now(timezone.utc)) if status == "sent" else None
         reserved_at = record.get("reserved_at") if status == "reserved" else None
         details = {
             k: v for k, v in record.items()
