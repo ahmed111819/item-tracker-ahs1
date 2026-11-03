@@ -141,16 +141,17 @@ def import_registry_file(path: str | Path, bot_id: str = "bot1") -> int:
         ))
 
     with _connect() as conn:
-        for offset in range(0, len(rows), 500):
-            conn.executemany(
-                """
-                INSERT INTO public.alert_registry
-                    (alert_key, status, bot_id, reserved_at, sent_at, details, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
-                ON CONFLICT (alert_key) DO NOTHING
-                """,
-                rows[offset : offset + 500],
-            )
+        with conn.cursor() as cursor:
+            for offset in range(0, len(rows), 500):
+                cursor.executemany(
+                    """
+                    INSERT INTO public.alert_registry
+                        (alert_key, status, bot_id, reserved_at, sent_at, details, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                    ON CONFLICT (alert_key) DO NOTHING
+                    """,
+                    rows[offset : offset + 500],
+                )
         conn.execute(
             """
             INSERT INTO public.storage_migrations (migration_key)
