@@ -54,6 +54,7 @@ SEARCH_URLS = [
     # Link 14
     "https://www.amazon.sa/s?i=arts-crafts&rh=n%3A16636732031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580152&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3A1%2BpXOe7vqIe2DOW6BJUHdS5696zuY16DvrOncJgYEs0",
 # Electronics and accessories
+    "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&s=price-asc-rank&qid=1793719511&ref=sr_st_price-asc-rank&ds=v1%3A9EN%2FFcv2qgJdXNgHGfXDzTjE%2FrbJNBUxmiEtEfZVgzE",
     "https://www.amazon.sa/s?k=earphones&low-price=&high-price=155",
     "https://www.amazon.sa/s?k=computer+mouse&low-price=&high-price=155",
     "https://www.amazon.sa/s?k=bluetooth&low-price=&high-price=155",
