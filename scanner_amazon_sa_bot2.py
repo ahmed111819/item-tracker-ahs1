@@ -17,6 +17,10 @@ import random
 import time
 from postgres_storage import (
     assert_storage_ready,
+    alert_was_sent,
+    check_product_block,
+    finish_product_block_release,
+    load_product_blocks,
     finish_alert as postgres_finish_alert,
     load_state as load_postgres_state,
     reserve_alert as postgres_reserve_alert,
@@ -26,6 +30,7 @@ from postgres_storage import (
 from datetime import datetime
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
+from telegram_product_buttons import edit_product_keyboard, product_keyboard
 
 
 # ------------------------------------------------------------
@@ -443,6 +448,7 @@ def load_tracking():
 
 
 tracking_data = load_tracking()
+ACTIVE_PRODUCT_BLOCKS = load_product_blocks() if STORAGE_BACKEND == "postgres" else {}
 
 # Offers observed during this run. These sets are used to clear old alert
 # signatures only after every configured search has completed successfully.
@@ -1083,7 +1089,15 @@ async def extract_image_url(card):
 def build_telegram_caption(title, asin, price, offer):
     product_url = f"https://www.amazon.sa/dp/{asin}"
 
-    if offer.get("type") == "price_drop_80":
+    if offer.get("type") == "product_block_release":
+        caption = (
+            "📉 <b>انفك الحجب المؤقت: وصل السعر إلى حد الانخفاض</b>\n\n"
+            f"<b>{html.escape(title[:300])}</b>\n"
+            f"السعر وقت الحجب: SAR {offer['blocked_price']:.2f}\n"
+            f"حد فك الحجب: SAR {offer['resume_price']:.2f}\n"
+            f"السعر الحالي: SAR {price:.2f}\n\n"
+        )
+    elif offer.get("type") == "price_drop_80":
         caption = (
             "🚨🔥 <b>80%+ PRICE DROP — NOT A COUPON</b>\n\n"
             f"<b>{html.escape(title[:300])}</b>\n"
@@ -1162,6 +1176,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
                     "photo": image_url,
                     "caption": caption,
                     "parse_mode": "HTML",
+                    "reply_markup": product_keyboard(asin),
                 },
                 timeout=30,
             )
@@ -1183,6 +1198,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
                 "text": caption,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False,
+                "reply_markup": product_keyboard(asin),
             },
             timeout=30,
         )
@@ -1330,6 +1346,103 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
         "search_url": search_url,
         "appearances": appearances,
     }
+
+    # Evaluate the temporary block before either alert path. While a product is
+    # blocked, remember currently visible signatures so manual release never
+    # replays a notification that appeared during the block.
+    candidate_coupon_signature = None
+    if offer and offer.get("discount_percent") is not None:
+        offer_description_for_block = str(offer.get("description", "")).lower()
+        coupon_type_for_block = (
+            "coupon" in offer_description_for_block
+            or offer.get("type") in {"you_pay_coupon", "cash_coupon"}
+        )
+        threshold_for_block = (
+            MIN_DISCOUNT_PERCENT if coupon_type_for_block
+            else MIN_PROMOTION_DISCOUNT_PERCENT
+        )
+        if offer["discount_percent"] >= threshold_for_block:
+            candidate_coupon_signature = (
+                f"{current_price}|{offer['type']}|{offer.get('pay_price')}|"
+                f"{offer.get('saving')}|{offer.get('discount_percent')}|{offer.get('quantity')}"
+            )
+
+    candidate_price_drop_signature = None
+    if price_drop and price_drop.get("discount_percent") is not None:
+        if price_drop["discount_percent"] >= MIN_PRICE_DROP_PERCENT:
+            candidate_price_drop_signature = f"{price_drop['discount_percent']:.2f}%"
+
+    block_result = {"suppress_alert": False, "released": False}
+    if STORAGE_BACKEND == "postgres" and (
+        asin in ACTIVE_PRODUCT_BLOCKS
+        or candidate_coupon_signature is not None
+        or candidate_price_drop_signature is not None
+    ):
+        block_result = await asyncio.to_thread(
+            check_product_block, asin, current_price
+        )
+
+    if block_result.get("released"):
+        block = block_result["block"]
+        if candidate_coupon_signature:
+            RUN_COUPON_SIGNATURES.setdefault(asin, set()).add(candidate_coupon_signature)
+            record["last_alert_signature"] = candidate_coupon_signature
+        if candidate_price_drop_signature:
+            RUN_PRICE_DROP_SIGNATURES.setdefault(asin, set()).add(candidate_price_drop_signature)
+            record["last_price_drop_80_signature"] = candidate_price_drop_signature
+        tracking_data["products"][asin] = record
+        release_alert_key = (
+            f"{asin}|temporary_block_release|"
+            f"{block['created_at'].isoformat() if hasattr(block['created_at'], 'isoformat') else block['created_at']}"
+        )
+        release_offer = {
+            "type": "product_block_release",
+            "blocked_price": float(block["blocked_price"]),
+            "resume_price": float(block["resume_price"]),
+        }
+        try:
+            release_sent = await asyncio.to_thread(
+                send_telegram_alert_once,
+                release_alert_key,
+                title, asin, current_price or 0, release_offer, image_url,
+            )
+        except Exception as exc:
+            print(f"⚠️ Temporary block release alert failed ({type(exc).__name__}).")
+            release_sent = False
+
+        if not release_sent:
+            try:
+                release_sent = await asyncio.to_thread(alert_was_sent, release_alert_key)
+            except Exception:
+                release_sent = False
+
+        await asyncio.to_thread(
+            finish_product_block_release,
+            asin, block["created_at"], bool(release_sent),
+        )
+        if release_sent:
+            message_chat_id = block.get("message_chat_id")
+            message_id = block.get("message_id")
+            if message_chat_id and message_id:
+                await asyncio.to_thread(
+                    edit_product_keyboard,
+                    TELEGRAM_BOT_TOKEN, str(message_chat_id), int(message_id),
+                    asin, "open",
+                )
+            print(f"✅ Temporary block released for {asin} at SAR {current_price:.2f}.")
+        else:
+            print(f"⚠️ Temporary block remains active for {asin}; release alert will retry.")
+        return True, bool(release_sent)
+
+    if block_result.get("suppress_alert"):
+        if candidate_coupon_signature:
+            RUN_COUPON_SIGNATURES.setdefault(asin, set()).add(candidate_coupon_signature)
+            record["last_alert_signature"] = candidate_coupon_signature
+        if candidate_price_drop_signature:
+            RUN_PRICE_DROP_SIGNATURES.setdefault(asin, set()).add(candidate_price_drop_signature)
+            record["last_price_drop_80_signature"] = candidate_price_drop_signature
+        tracking_data["products"][asin] = record
+        return True, False
 
     coupon_alert_sent = False
     price_drop_alert_sent = False

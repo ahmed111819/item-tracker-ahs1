@@ -102,6 +102,222 @@ def finish_alert(alert_key: str, bot_id: str, token: str, success: bool) -> bool
     return bool(row and row["finished"])
 
 
+
+def assert_product_blocks_ready() -> None:
+    """Fail with an actionable message until the one-time block migration is applied."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT to_regclass('public.product_blocks') AS blocks, "
+            "to_regclass('public.telegram_callback_state') AS callbacks"
+        ).fetchone()
+    if not row or not row["blocks"] or not row["callbacks"]:
+        raise RuntimeError(
+            "Temporary product-block tables are missing. Run PRODUCT_BLOCKS_SETUP.sql "
+            "on coupon_storage as the database owner, then retry."
+        )
+
+
+def load_product_blocks() -> dict[str, dict[str, Any]]:
+    """Load active/releasing blocks once per scanner process."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT asin, mode, blocked_price, resume_price, created_at, status, "
+            "message_chat_id, message_id FROM public.product_blocks "
+            "WHERE status IN ('active', 'release_pending', 'released')"
+        ).fetchall()
+    return {str(row["asin"]): dict(row) for row in rows}
+
+
+def check_product_block(asin: str, current_price: float | None) -> dict[str, Any]:
+    """Suppress alerts while blocked and atomically claim a threshold release."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT asin, mode, blocked_price, resume_price, created_at, status, "
+            "message_chat_id, message_id FROM public.product_blocks "
+            "WHERE asin = %s FOR UPDATE",
+            (asin,),
+        ).fetchone()
+        if row is None:
+            return {"suppress_alert": False, "released": False}
+
+        block = dict(row)
+        if block["status"] != "active":
+            return {"suppress_alert": True, "released": False, "block": block}
+        if current_price is None:
+            return {"suppress_alert": True, "released": False, "block": block}
+
+        if float(current_price) <= float(block["resume_price"]):
+            claimed = conn.execute(
+                "UPDATE public.product_blocks SET status = 'release_pending', updated_at = now() "
+                "WHERE asin = %s AND status = 'active' RETURNING asin",
+                (asin,),
+            ).fetchone()
+            if claimed:
+                return {"suppress_alert": False, "released": True, "block": block}
+
+        return {"suppress_alert": True, "released": False, "block": block}
+
+
+def finish_product_block_release(
+    asin: str, created_at: Any, success: bool
+) -> None:
+    """Keep a released row until this scan ends so parallel bots suppress duplicates."""
+    with _connect() as conn:
+        if success:
+            conn.execute(
+                "UPDATE public.product_blocks SET status = 'released', updated_at = now() "
+                "WHERE asin = %s AND created_at = %s AND status = 'release_pending'",
+                (asin, created_at),
+            )
+        else:
+            conn.execute(
+                "UPDATE public.product_blocks SET status = 'active', updated_at = now() "
+                "WHERE asin = %s AND created_at = %s AND status = 'release_pending'",
+                (asin, created_at),
+            )
+
+
+def clear_released_product_blocks() -> int:
+    """Remove auto-released rows after all three scanner processes have finished."""
+    with _connect() as conn:
+        row = conn.execute(
+            "WITH removed AS (DELETE FROM public.product_blocks "
+            "WHERE status = 'released' RETURNING 1) SELECT count(*) AS count FROM removed"
+        ).fetchone()
+    return int(row["count"])
+
+
+
+def recover_pending_product_blocks() -> int:
+    """Re-arm release claims left behind by a cancelled previous workflow run."""
+    with _connect() as conn:
+        row = conn.execute(
+            "WITH recovered AS (UPDATE public.product_blocks "
+            "SET status = 'active', updated_at = now() "
+            "WHERE status = 'release_pending' RETURNING 1) "
+            "SELECT count(*) AS count FROM recovered"
+        ).fetchone()
+    return int(row["count"])
+
+
+def get_latest_known_product_price(asin: str) -> float | None:
+    """Read the newest stored observation from the three compressed bot snapshots."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT payload_gzip FROM public.bot_state "
+            "WHERE bot_id IN ('bot1', 'bot2', 'bot3')"
+        ).fetchall()
+
+    best_seen = ""
+    best_price: float | None = None
+    for row in rows:
+        try:
+            payload = json.loads(gzip.decompress(bytes(row["payload_gzip"])).decode("utf-8"))
+            record = payload.get("products", {}).get(asin, {})
+            value = record.get("current_price")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                continue
+            seen = str(record.get("last_seen") or "")
+            if best_price is None or seen >= best_seen:
+                best_seen, best_price = seen, float(value)
+        except Exception:
+            continue
+    return best_price
+
+
+def create_or_get_product_block(
+    asin: str,
+    blocked_price: float,
+    updated_by: str,
+    message_chat_id: str,
+    message_id: int,
+) -> dict[str, Any]:
+    """Create a 5% temporary block; clicking again never resets an active threshold."""
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO public.product_blocks
+                (asin, mode, blocked_price, resume_price, status, updated_by,
+                 message_chat_id, message_id, created_at, updated_at)
+            VALUES (%s, 'temporary', %s, %s, 'active', %s, %s, %s, now(), now())
+            ON CONFLICT (asin) DO UPDATE SET
+                blocked_price = CASE WHEN product_blocks.status = 'released'
+                                     THEN EXCLUDED.blocked_price
+                                     ELSE product_blocks.blocked_price END,
+                resume_price = CASE WHEN product_blocks.status = 'released'
+                                    THEN EXCLUDED.resume_price
+                                    ELSE product_blocks.resume_price END,
+                mode = 'temporary',
+                status = CASE WHEN product_blocks.status = 'released'
+                              THEN 'active' ELSE product_blocks.status END,
+                updated_by = EXCLUDED.updated_by,
+                message_chat_id = EXCLUDED.message_chat_id,
+                message_id = EXCLUDED.message_id,
+                created_at = CASE WHEN product_blocks.status = 'released'
+                                  THEN now() ELSE product_blocks.created_at END,
+                updated_at = now()
+            RETURNING asin, mode, blocked_price, resume_price, created_at, status,
+                      message_chat_id, message_id
+            """,
+            (asin, blocked_price, blocked_price * 0.95, updated_by, message_chat_id, message_id),
+        ).fetchone()
+    return dict(row)
+
+
+def get_product_block(asin: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT asin, mode, blocked_price, resume_price, created_at, status "
+            "FROM public.product_blocks WHERE asin = %s",
+            (asin,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def remove_product_block(asin: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "DELETE FROM public.product_blocks WHERE asin = %s RETURNING asin",
+            (asin,),
+        ).fetchone()
+    return bool(row)
+
+
+def get_telegram_update_offset() -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT next_update_id FROM public.telegram_callback_state "
+            "WHERE state_key = 'main'"
+        ).fetchone()
+    return int(row["next_update_id"]) if row else 0
+
+
+def save_telegram_update_offset(next_update_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO public.telegram_callback_state (state_key, next_update_id, updated_at)
+            VALUES ('main', %s, now())
+            ON CONFLICT (state_key) DO UPDATE
+               SET next_update_id = GREATEST(
+                       public.telegram_callback_state.next_update_id,
+                       EXCLUDED.next_update_id
+                   ),
+                   updated_at = now()
+            """,
+            (int(next_update_id),),
+        )
+
+
+def alert_was_sent(alert_key: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM public.alert_registry WHERE alert_key = %s AND status = 'sent'",
+            (alert_key,),
+        ).fetchone()
+    return bool(row)
+
+
 def import_registry_file(path: str | Path, bot_id: str = "bot1") -> int:
     """One-time import of the legacy amazon_deals_sent_registry.json file.
 
@@ -178,6 +394,7 @@ def assert_storage_ready(bot_id: str) -> None:
     if registry is None:
         raise RuntimeError(
             "The legacy Telegram registry has not been imported; refusing to scan.")
+    assert_product_blocks_ready()
 
 
 def import_tracking_file(path: str | Path, bot_id: str = "bot1") -> int:
