@@ -129,13 +129,87 @@ jobs:
     needs: scan
     if: ${{ always() && inputs.continuous && !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
+      contents: read
       actions: write
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
-      - name: Wait 10 minutes after the scan ends
-        run: sleep 600
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Open restricted SSH tunnel to Oracle PostgreSQL
+        env:
+          ORACLE_TUNNEL_PRIVATE_KEY: ${{ secrets.ORACLE_TUNNEL_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$ORACLE_TUNNEL_PRIVATE_KEY" > "$HOME/.ssh/oracle_pg_key"
+          chmod 600 "$HOME/.ssh/oracle_pg_key"
+          printf '%s %s %s\n' "84.13.143.171" "ssh-ed25519" "AAAAC3NzaC1lZDI1NTE5AAAAIJxRb/5/4wQhsBq5BS8lRPEQNsvS0cAqM52Y7f/fFW8S" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh -f -N -M -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" \
+            -L 127.0.0.1:5432:127.0.0.1:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=60 \
+            -o ServerAliveCountMax=3 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -i "$HOME/.ssh/oracle_pg_key" \
+            coupon-tunnel@84.13.143.171
+      - name: Install callback listener dependencies
+        run: python -m pip install "requests>=2.32,<3" "psycopg[binary]>=3.2,<4"
+      - name: Mark the start of the 10-minute rest
+        id: rest_start
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Listen for button presses during the 10-minute rest
+        shell: bash
+        run: |
+          python -u telegram_callbacks.py > "$RUNNER_TEMP/telegram_rest_callbacks.log" 2>&1 &
+          listener_pid=$!
+          cleanup() {
+            if kill -0 "$listener_pid" 2>/dev/null; then
+              kill "$listener_pid" 2>/dev/null || true
+            fi
+            wait "$listener_pid" 2>/dev/null || true
+            cat "$RUNNER_TEMP/telegram_rest_callbacks.log" || true
+          }
+          trap cleanup EXIT
+
+          sleep 2
+          if ! kill -0 "$listener_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/telegram_rest_callbacks.log"
+            exit 1
+          fi
+
+          end_epoch=$((${{ steps.rest_start.outputs.epoch }} + 600))
+          while true; do
+            now_epoch=$(date +%s)
+            remaining=$((end_epoch - now_epoch))
+            if [ "$remaining" -le 0 ]; then
+              break
+            fi
+            if ! kill -0 "$listener_pid" 2>/dev/null; then
+              echo "Telegram callback listener exited unexpectedly."
+              cat "$RUNNER_TEMP/telegram_rest_callbacks.log"
+              exit 1
+            fi
+            sleep "$remaining"
+          done
+
+          kill "$listener_pid" 2>/dev/null || true
+          wait "$listener_pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/telegram_rest_callbacks.log"
+          trap - EXIT
       - name: Queue the next run
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run amazon-sa-bot3.yml --repo ahmed111819/item-tracker-ahs1 --ref main -f continuous=true
+      - name: Close SSH tunnel and remove key
+        if: always()
+        run: |
+          ssh -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" -O exit coupon-tunnel@84.13.143.171 2>/dev/null || true
+          rm -f "$HOME/.ssh/oracle_pg_key" "$HOME/.ssh/known_hosts" "$RUNNER_TEMP/oracle_pg_tunnel.sock"
