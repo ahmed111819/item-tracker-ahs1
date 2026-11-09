@@ -1178,7 +1178,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
                     "photo": image_url,
                     "caption": caption,
                     "parse_mode": "HTML",
-                    "reply_markup": product_keyboard(asin),
+                    "reply_markup": product_keyboard(asin, price=price),
                 },
                 timeout=30,
             )
@@ -1200,7 +1200,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
                 "text": caption,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False,
-                "reply_markup": product_keyboard(asin),
+                "reply_markup": product_keyboard(asin, price=price),
             },
             timeout=30,
         )
@@ -1429,7 +1429,7 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                 await asyncio.to_thread(
                     edit_product_keyboard,
                     TELEGRAM_BOT_TOKEN, str(message_chat_id), int(message_id),
-                    asin, "open",
+                    asin, "open", current_price,
                 )
             print(f"✅ Temporary block released for {asin} at SAR {current_price:.2f}.")
         else:
