@@ -23,6 +23,7 @@ from postgres_storage import (
     get_product_block,
     get_telegram_update_offset,
     remove_product_block,
+    recover_pending_product_blocks,
     save_telegram_update_offset,
 )
 from telegram_product_buttons import edit_product_keyboard
@@ -171,6 +172,9 @@ def main() -> None:
         print(f"Cleared {removed} auto-released product block(s) after scanner completion.")
         return
 
+    recovered = recover_pending_product_blocks()
+    if recovered:
+        print(f"Recovered {recovered} unfinished automatic release(s).")
     signal.signal(signal.SIGTERM, stop_listener)
     signal.signal(signal.SIGINT, stop_listener)
     offset = get_telegram_update_offset()
