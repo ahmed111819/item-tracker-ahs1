@@ -56,6 +56,23 @@ jobs:
       - name: Run all three bots concurrently
         shell: bash
         run: |
+          python -u telegram_callbacks.py > "$RUNNER_TEMP/telegram_callbacks.log" 2>&1 &
+          callback_pid=$!
+          cleanup() {
+            if kill -0 "$callback_pid" 2>/dev/null; then
+              kill "$callback_pid" 2>/dev/null || true
+            fi
+            wait "$callback_pid" 2>/dev/null || true
+            cat "$RUNNER_TEMP/telegram_callbacks.log" || true
+          }
+          trap cleanup EXIT
+
+          sleep 2
+          if ! kill -0 "$callback_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/telegram_callbacks.log"
+            exit 1
+          fi
+
           run_bot() {
             local script="$1"
             local attempt=1
@@ -86,6 +103,14 @@ jobs:
           wait "$bot1_pid" || status=1
           wait "$bot2_pid" || status=1
           wait "$bot3_pid" || status=1
+
+          if kill -0 "$callback_pid" 2>/dev/null; then
+            kill "$callback_pid" 2>/dev/null || true
+          fi
+          wait "$callback_pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/telegram_callbacks.log"
+          python -u telegram_callbacks.py --cleanup-released || status=1
+          trap - EXIT
           exit "$status"
       - name: Close SSH tunnel and remove key
         if: always()
