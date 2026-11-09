@@ -34,6 +34,8 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 STOP = False
+ACKED_CALLBACKS: set[str] = set()
+NOTIFIED_FAILED_CALLBACKS: set[str] = set()
 
 
 def stop_listener(_signum: int, _frame: Any) -> None:
@@ -128,8 +130,11 @@ def handle_callback(callback: dict[str, Any]) -> None:
         answer(callback_id, "المنتج محجوب بالفعل.")
         return
 
-    # Close Telegram's spinner before database or network work.
-    answer(callback_id, "جارٍ تنفيذ طلبك…")
+    # Close Telegram's spinner once, before database or network work. A failed
+    # DB attempt is retried with the same update ID, so don't re-answer it.
+    if callback_id not in ACKED_CALLBACKS:
+        answer(callback_id, "جارٍ تنفيذ طلبك…")
+        ACKED_CALLBACKS.add(callback_id)
 
     if action == "block":
         # New alerts carry their observed price in the callback data, avoiding
@@ -245,14 +250,21 @@ def main() -> None:
                     # redeliver this update and the idempotent DB action retries.
                     save_telegram_update_offset(next_offset)
                     offset = next_offset
+                    if isinstance(callback, dict):
+                        callback_id = str(callback.get("id") or "")
+                        ACKED_CALLBACKS.discard(callback_id)
+                        NOTIFIED_FAILED_CALLBACKS.discard(callback_id)
                 except Exception as exc:
                     print(f"Could not apply Telegram callback/update ({type(exc).__name__}); keeping it queued for retry.")
                     callback = update.get("callback_query")
                     if isinstance(callback, dict):
-                        notify_chat(
-                            callback.get("message") or {},
-                            "تعذر الاتصال بقاعدة البيانات مؤقتًا؛ سأعيد محاولة الحجب تلقائيًا.",
-                        )
+                        callback_id = str(callback.get("id") or "")
+                        if callback_id and callback_id not in NOTIFIED_FAILED_CALLBACKS:
+                            notify_chat(
+                                callback.get("message") or {},
+                                "تعذر الاتصال بقاعدة البيانات مؤقتًا؛ سأعيد محاولة الحجب تلقائيًا.",
+                            )
+                            NOTIFIED_FAILED_CALLBACKS.add(callback_id)
                     time.sleep(3)
                     break
         except Exception as exc:
