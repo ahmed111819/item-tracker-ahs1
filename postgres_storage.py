@@ -187,6 +187,19 @@ def clear_released_product_blocks() -> int:
     return int(row["count"])
 
 
+
+def recover_pending_product_blocks() -> int:
+    """Re-arm release claims left behind by a cancelled previous workflow run."""
+    with _connect() as conn:
+        row = conn.execute(
+            "WITH recovered AS (UPDATE public.product_blocks "
+            "SET status = 'active', updated_at = now() "
+            "WHERE status = 'release_pending' RETURNING 1) "
+            "SELECT count(*) AS count FROM recovered"
+        ).fetchone()
+    return int(row["count"])
+
+
 def get_latest_known_product_price(asin: str) -> float | None:
     """Read the newest stored observation from the three compressed bot snapshots."""
     with _connect() as conn:
