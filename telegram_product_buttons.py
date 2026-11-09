@@ -47,7 +47,7 @@ def edit_product_keyboard(
             json={
                 "chat_id": chat_id,
                 "message_id": int(message_id),
-                "reply_markup": product_keyboard(asin, state),
+                "reply_markup": product_keyboard(asin, state, price),
             },
             timeout=20,
         )
