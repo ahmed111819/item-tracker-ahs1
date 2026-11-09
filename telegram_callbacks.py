@@ -66,6 +66,25 @@ def answer(callback_id: str, text: str, show_alert: bool = False) -> None:
         print(exc)
 
 
+def price_from_message(message: dict[str, Any]) -> float | None:
+    text = str(message.get("caption") or message.get("text") or "")
+    patterns = (
+        r"السعر الحالي\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
+        r"\bNow\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
+        r"\bListed price\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                price = float(match.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            if math.isfinite(price) and price > 0:
+                return price
+    return None
+
+
 def edit_markup(message: dict[str, Any], asin: str, state: str, price: float | None = None) -> bool:
     chat = message.get("chat") or {}
     message_id = message.get("message_id")
@@ -139,9 +158,9 @@ def handle_callback(callback: dict[str, Any]) -> None:
     if action == "block":
         # New alerts carry their observed price in the callback data, avoiding
         # decompression of all three large state snapshots on every tap.
-        price = payload_price
+        price = payload_price or price_from_message(message)
         if price is None:
-            # Backward compatibility for buttons on older Telegram messages.
+            # Final fallback for older messages that don't contain a parseable price.
             price = get_latest_known_product_price(asin)
         if price is None:
             notify_chat(message, "ما عندي سعر محفوظ لهذا التنبيه القديم. التنبيهات الجديدة تسجل السعر داخل الزر.")
