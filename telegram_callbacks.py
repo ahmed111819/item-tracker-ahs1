@@ -124,12 +124,12 @@ def handle_callback(callback: dict[str, Any]) -> None:
         answer(callback_id, "الإجراء غير صالح.", True)
         return
 
-    # Close Telegram's spinner before database or network work.
-    answer(callback_id, "جارٍ تنفيذ طلبك…")
-
     if action == "noop":
         answer(callback_id, "المنتج محجوب بالفعل.")
         return
+
+    # Close Telegram's spinner before database or network work.
+    answer(callback_id, "جارٍ تنفيذ طلبك…")
 
     if action == "block":
         # New alerts carry their observed price in the callback data, avoiding
