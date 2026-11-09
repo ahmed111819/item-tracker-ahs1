@@ -18,7 +18,7 @@ def product_keyboard(asin: str, state: str = "open") -> dict:
         ]]
     else:
         rows = [[
-            {"text": "⏳ حجب مؤقت", "callback_data": f"pb:block:{asin}"},
+            {"text": "⏳ حجب مؤقت", "style": "danger", "callback_data": f"pb:block:{asin}"},
         ]]
     return {"inline_keyboard": rows}
 

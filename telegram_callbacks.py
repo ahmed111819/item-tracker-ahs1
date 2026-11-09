@@ -62,14 +62,32 @@ def answer(callback_id: str, text: str, show_alert: bool = False) -> None:
         print(exc)
 
 
-def edit_markup(message: dict[str, Any], asin: str, state: str) -> None:
+def edit_markup(message: dict[str, Any], asin: str, state: str) -> bool:
     chat = message.get("chat") or {}
     message_id = message.get("message_id")
     if message_id is None or chat.get("id") is None:
-        return
+        return False
     ok = edit_product_keyboard(TOKEN, str(chat["id"]), int(message_id), asin, state)
     if not ok:
         print("Telegram button markup update failed for", asin)
+    return ok
+
+
+def notify_chat(message: dict[str, Any], text: str) -> None:
+    chat = message.get("chat") or {}
+    if chat.get("id") is None:
+        return
+    payload = {
+        "chat_id": str(chat["id"]),
+        "text": text,
+        "disable_notification": True,
+    }
+    if message.get("message_id") is not None:
+        payload["reply_to_message_id"] = int(message["message_id"])
+    try:
+        telegram_call("sendMessage", payload)
+    except Exception as exc:
+        print(f"Telegram confirmation message failed ({type(exc).__name__}).")
 
 
 def handle_callback(callback: dict[str, Any]) -> None:
@@ -93,10 +111,25 @@ def handle_callback(callback: dict[str, Any]) -> None:
         answer(callback_id, "الإجراء غير صالح.", True)
         return
 
+    if action == "noop":
+        block = get_product_block(asin)
+        if block and block["status"] == "active":
+            answer(
+                callback_id,
+                f"محجوب حتى يصل السعر إلى {float(block['resume_price']):.2f} ريال أو أقل.",
+            )
+        else:
+            answer(callback_id, "الحجب لم يعد نشطًا.", True)
+        return
+
+    # Acknowledge the tap before any database access. Loading the compressed
+    # bot snapshots can take long enough for Telegram's callback spinner to time out.
+    answer(callback_id, "جارٍ تنفيذ طلبك…")
+
     if action == "block":
         price = get_latest_known_product_price(asin)
         if price is None:
-            answer(callback_id, "ما عندي سعر محفوظ لهذا المنتج الآن. جرّب بعد دورة فحص.", True)
+            notify_chat(message, "لم أجد سعرًا محفوظًا لهذا المنتج. جرّب بعد دورة فحص.")
             return
         block = create_or_get_product_block(
             asin=asin,
@@ -106,37 +139,39 @@ def handle_callback(callback: dict[str, Any]) -> None:
             message_id=int(message["message_id"]),
         )
         if block["status"] == "active":
-            edit_markup(message, asin, "blocked")
-            answer(
-                callback_id,
-                f"تم الحجب حتى يصل السعر إلى {float(block['resume_price']):.2f} ريال أو أقل.",
+            updated = edit_markup(message, asin, "blocked")
+            notify_chat(
+                message,
+                f"تم الحجب عند {float(block['blocked_price']):.2f} ريال. "
+                f"ينفك تلقائيًا عند {float(block['resume_price']):.2f} ريال أو أقل."
+                + ("" if updated else " تعذر تحديث أزرار الرسالة؛ حاول الضغط على «حجب مؤقت» مرة أخرى."),
             )
             print(f"Temporary product block created/confirmed for {asin}.")
         else:
-            edit_markup(message, asin, "open")
-            answer(callback_id, "وصل السعر إلى حد فك الحجب؛ يجري إنهاء التنبيه.", True)
+            edit_markup(message, asin, "open" if block["status"] == "released" else "blocked")
+            notify_chat(message, "يجري فك الحجب تلقائيًا بعد بلوغ حد السعر.")
         return
 
     block = get_product_block(asin)
     if action == "edit":
         if block is None:
             edit_markup(message, asin, "open")
-            answer(callback_id, "هذا المنتج غير محجوب.", True)
+            notify_chat(message, "هذا المنتج غير محجوب.")
         elif block["status"] == "active":
             edit_markup(message, asin, "edit")
-            answer(callback_id, "تقدر تفك الحجب من الزر أدناه.")
+            notify_chat(message, "اختر «فك الحجب» لإلغاء الحجب يدويًا.")
         else:
             edit_markup(message, asin, "blocked")
-            answer(callback_id, "يجري فك الحجب تلقائيًا بعد بلوغ السعر الحد.", True)
+            notify_chat(message, "يجري فك الحجب تلقائيًا بعد بلوغ حد السعر.")
         return
 
     if action == "unblock":
         removed = remove_product_block(asin)
         edit_markup(message, asin, "open")
-        answer(
-            callback_id,
-            "تم فك الحجب. لن نرسل تنبيهًا قديمًا بأثر رجعي." if removed
-            else "هذا المنتج غير محجوب.",
+        notify_chat(
+            message,
+            "تم فك الحجب، ولن أرسل تنبيهًا قديمًا بأثر رجعي."
+            if removed else "هذا المنتج غير محجوب.",
         )
         if removed:
             print(f"Temporary product block manually removed for {asin}.")
@@ -144,17 +179,7 @@ def handle_callback(callback: dict[str, Any]) -> None:
 
     if action == "back":
         edit_markup(message, asin, "blocked" if block else "open")
-        answer(callback_id, "تم الرجوع.")
         return
-
-    if action == "noop":
-        if block and block["status"] == "active":
-            answer(
-                callback_id,
-                f"محجوب حتى يصل السعر إلى {float(block['resume_price']):.2f} ريال أو أقل.",
-            )
-        else:
-            answer(callback_id, "الحجب لم يعد نشطًا.", True)
 
 
 def main() -> None:
