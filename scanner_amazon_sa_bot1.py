@@ -48,11 +48,11 @@ SEARCH_URLS = [
     # Link 6
     "https://www.amazon.sa/s?i=amazon-devices&rh=n%3A12794852031&s=price-asc-rank&fs=true&qid=1791558197&ref=sr_st_price-asc-rank&ds=v1%3A8lN2JnN7E16hrKP6G73vIzygLtQ7auCCc%2B9ljKWfUBQ",
     # Link 7
-    "https://www.amazon.sa/s?i=fashion&rh=n%3A12463219031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc=&qid=1791558559&rnid=16641831031&ref=sr_nr_p_36_0_0&low-price=&high-price=105",
+    "https://www.amazon.sa/s?i=fashion&rh=n%3A16667011031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_36%3A-10500&s=price-asc-rank&dc&ds=v1%3AwaOOOCPP0jLocYCMakVTArnxT2OjzSY7l27op9sZ%2FRA&qid=1794215818&rnid=16641811031&ref=sr_nr_p_6_1",
     # Link 11
-    "https://www.amazon.sa/s?i=beauty&rh=n%3A12462991031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791579496&rnid=16641874031&ref=sr_st_price-asc-rank&ds=v1%3AAQzsduinyKOpc9N50F5mbS%2F5cdCfg%2BlxqG4RRdOs2zc",
+    "https://www.amazon.sa/s?i=beauty&rh=n%3A12462991031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794215473&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AULawr2SSqh8hJX%2FW9QxwA4XqzREUlPihyVdD6tXZc7s",
     # Link 14
-    "https://www.amazon.sa/s?i=arts-crafts&rh=n%3A16636732031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580152&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3A1%2BpXOe7vqIe2DOW6BJUHdS5696zuY16DvrOncJgYEs0",
+    "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&rh=p_98%3A16895730031%2Cp_n_deal_type%3A26902956031&s=price-asc-rank&dc&qid=1794216557&rnid=26902955031&ref=sr_nr_p_n_deal_type_1&ds=v1%3Av6dRtoip2ojvl7lxRP3h5i9ic%2FcxeR7sI%2B10%2FLIgxzw",
 # Electronics and accessories
     "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&s=price-asc-rank&qid=1793719511&ref=sr_st_price-asc-rank&ds=v1%3A9EN%2FFcv2qgJdXNgHGfXDzTjE%2FrbJNBUxmiEtEfZVgzE",
     "https://www.amazon.sa/s?k=earphones&low-price=&high-price=155",
