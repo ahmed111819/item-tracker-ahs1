@@ -52,11 +52,11 @@ SEARCH_URLS = [
     # Link 12
     "https://www.amazon.sa/s?i=sports&rh=n%3A12463561031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_deal_type%3A26902957031%2Cp_90%3A16641876031&s=price-asc-rank&dc&fs=true&qid=1791579919&rnid=28071520031&ref=sr_nr_p_n_condition-type_1&ds=v1%3A3Kcl%2BPfV9rzUm5u%2BhOoYYNqLrSpeJ8WO0gyPgIoQdZ0",
     # Link 13
-    "https://www.amazon.sa/s?i=industrial&rh=n%3A16636960031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580060&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3A6XXBuRtsAU8%2BvjHD6jaFoad8xXFtZoJA%2FR4DFF%2Biihw",
+    "https://www.amazon.sa/s?i=industrial&rh=n%3A16636960031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218046&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AoGW%2FAcfui9ChIIQIWtjIKJQeZS9ZYfVuHycbG%2BdnjU8",
     # Link 17
-    "https://www.amazon.sa/s?i=automotive&rh=n%3A12462877031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580504&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3AS305Dy2KSZQIsNPwwBUxnW37xUnZoYhStl9rI%2BLd4%2Bc",
+    "https://www.amazon.sa/s?i=automotive&rh=n%3A12462877031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218059&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AjbY%2F1Yae5LZzyCAdaBAQnBzv0Q%2FE%2Ffm4ynioljWOzGY",
     # Link 18
-    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580592&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3AZb8eEwhKYV0kadD2ymTDAG2aZjfY91qaTQ9qYg04vbo",
+    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218071&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3Aevnir%2BdBtWs%2FOfc4ljjF6zwZZE6dc%2F2aHXBuz3A1TWQ",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]
