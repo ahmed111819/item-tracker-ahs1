@@ -628,7 +628,7 @@ def send_telegram_alert_once(alert_key, title, asin, price, offer, image_url):
     token = reserve_central_alert(alert_key)
     if token is None:
         print("⏭️ Duplicate or already-reserved alert skipped:", asin)
-        return False
+        return None
     try:
         sent = send_telegram_alert(title, asin, price, offer, image_url)
     except Exception:
@@ -1500,6 +1500,8 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                         coupon_alert_sent = True
                         save_tracking()
                         print("✅ Coupon/offer alert sent:", product_url)
+                    elif sent is None:
+                        print("⏭️ Coupon/offer alert skipped because it was already sent or reserved.")
                     else:
                         print("⚠️ Coupon/offer alert could not be sent.")
                 else:
@@ -1527,6 +1529,8 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                 price_drop_alert_sent = True
                 save_tracking()
                 print("✅ 80%+ price-drop alert sent:", product_url)
+            elif sent is None:
+                print("⏭️ Price-drop alert skipped because it was already sent or reserved.")
             else:
                 print("⚠️ Price-drop alert could not be sent.")
         else:
