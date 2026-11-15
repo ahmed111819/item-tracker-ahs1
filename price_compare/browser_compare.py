@@ -118,8 +118,7 @@ def run(url, output, headed=False, search_provider='service'):
               'mode': 'chromium', 'search_provider': search_provider,
               'searches': [], 'browser_search_links': 0, 'discovered_store_links': 0}
     with sync_playwright() as pw:
-        # Noon failed at transport negotiation before receiving any page in CI.
-        browser = pw.chromium.launch(headless=not headed, args=['--disable-http2'])
+        browser = pw.chromium.launch(headless=not headed)
         context = browser.new_context(locale='en-US', viewport={'width': 1440, 'height': 1000})
         # Validate redirected and embedded network destinations too.
         def guard(route):
@@ -237,3 +236,4 @@ if __name__ == '__main__':
                 f.write(text)
         code = 2
     raise SystemExit(code)
+
