@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from compare import ComparisonError, fetch, main, match, parse_page, public_url, read_source, render, search
+from compare import ComparisonError, clean_brand, fetch, main, match, parse_page, public_url, read_source, render, same_named_product, search
 
 
 def product(**updates):
@@ -27,6 +27,54 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_brand_store_label_is_not_brand_name(self):
+        self.assertEqual(clean_brand("Visit the Apple Store"), "apple")
+        self.assertEqual(clean_brand({"name": "Brand: Cello"}), "cello")
+
+    def test_direct_search_link_preferred_over_google_wrapper(self):
+        with patch("compare.requests.get") as get:
+            get.return_value.status_code = 200
+            get.return_value.json.return_value = {"organic_results": [{"link": "https://www.google.com/goto?url=opaque", "redirect_link": "https://shop.example/item"}]}
+            self.assertEqual(search(parsed(), "fake"), ["https://shop.example/item"])
+
+    def test_name_match_price_is_pending_not_confirmed(self):
+        a = parsed(gtin13="", mpn="", name="Example iPhone Air MagSafe Battery")
+        b = parsed(gtin13="", mpn="", name="iPhone Air MagSafe Battery")
+        self.assertTrue(same_named_product(a, b))
+        self.assertFalse(match(a, b)[0])
+        b["title"] += " Case"
+        self.assertFalse(same_named_product(a, b))
+
+    def test_known_color_conflict_not_even_pending(self):
+        a = parsed(gtin13="", mpn="", name="Example iPhone Air MagSafe Battery", color="Black")
+        b = parsed(gtin13="", mpn="", name="Example iPhone Air MagSafe Battery", color="White")
+        self.assertFalse(same_named_product(a, b))
+
+    def test_hnak_primary_payload_reader(self):
+        p = {"type": "PRODUCT", "relative_url": "example-product", "name": "Example headphones",
+             "mpbrand": "Example", "stock_status": "IN_STOCK",
+             "price_range": {"minimum_price": {"final_price": {"value": 449, "currency": "SAR"}},
+                             "maximum_price": {"final_price": {"value": 449, "currency": "SAR"}}},
+             "additional_information": [{"attributes": [{"label": "Model Number", "value": "HP-100-B"},
+                                                          {"label": "Bar code", "value": "4006381333931"}]}]}
+        payload = "3f:" + json.dumps(["$", "$L40", None, {"productData": p}])
+        html = '<script>self.__next_f.push(' + json.dumps([1, payload]) + ')</script>'
+        result = parse_page(html, "https://www.hnak.com/en-sa/example-product")
+        self.assertEqual(result["offer"]["price"], "449")
+        self.assertEqual(result["model"], "hp-100-b")
+        self.assertEqual(result["gtins"], ["04006381333931"])
+        with self.assertRaises(ValueError):
+            parse_page(html, "https://www.hnak.com/en-sa/different-product")
+
+    def test_omitted_product_type_requires_product_metadata(self):
+        p = product()
+        del p["@type"]
+        p["url"] = "https://shop.example/item"
+        html = '<meta property="og:type" content="product">' + page(p)
+        self.assertEqual(parse_page(html, p["url"])["offer"]["price"], "120.50")
+        with self.assertRaises(ValueError):
+            parse_page(page(p), p["url"])
+
     def test_amazon_block_uses_api_and_checks_asin(self):
         with patch("compare.fetch", side_effect=ComparisonError("blocked")), patch("compare.requests.get") as get:
             get.return_value.status_code = 200
@@ -116,12 +164,18 @@ class MatchingTests(unittest.TestCase):
         self.assertFalse(match(parsed(), candidate)[0])
 
     def test_foreign_currency_stock_and_aggregate_rejected(self):
-        for update in ({"priceCurrency": "USD"}, {"availability": "https://schema.org/OutOfStock"},
+        for update in ({"priceCurrency": "USD"},
                        {"@type": "AggregateOffer"}, {"price": "NaN"}, {"price": "-1"},
-                       {"availability": ""}):
+                       ):
             with self.subTest(update=update):
                 offer = product()["offers"] | update
                 self.assertIsNone(parsed(offers=offer)["offer"])
+
+    def test_unknown_or_out_of_stock_never_confirmed(self):
+        for stock in ("", "https://schema.org/OutOfStock"):
+            candidate = parsed(offers=product()["offers"] | {"availability": stock})
+            self.assertIsNotNone(candidate["offer"])
+            self.assertFalse(match(parsed(), candidate)[0])
 
     def test_multiple_variants_not_cheapest(self):
         with self.assertRaises(ValueError):

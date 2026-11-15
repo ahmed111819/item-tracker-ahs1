@@ -24,7 +24,19 @@ class ComparisonError(ValueError):
 
 
 def norm(value):
-    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or "")).casefold()).strip()
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"\s+", " ", "".join(c for c in value if unicodedata.category(c) != "Cf")).strip()
+
+
+def clean_brand(value):
+    if isinstance(value, dict):
+        value = value.get("name", "")
+    value = norm(value)
+    for pattern in (r"^visit the (.+) store$", r"^brand:\s*(.+)$", r"^العلامة التجارية\s*:\s*(.+)$"):
+        found = re.match(pattern, value)
+        if found:
+            return found.group(1).strip()
+    return value
 
 
 def public_url(url):
@@ -44,7 +56,7 @@ def fetch(url):
     for _ in range(6):
         public_url(url)
         with requests.get(url, timeout=(10, 25), allow_redirects=False, stream=True,
-                          headers={"User-Agent": "PriceCompareExperiment/0.1", "Accept-Language": "en,ar;q=0.8"}) as r:
+                          headers={"User-Agent": "Mozilla/5.0 (compatible; PriceCompare/0.2)", "Accept-Language": "en,ar;q=0.8"}) as r:
             if r.is_redirect:
                 url = urljoin(url, r.headers["Location"])
                 continue
@@ -75,7 +87,7 @@ def walk(value):
 
 def typename(obj, name):
     t = obj.get("@type", [])
-    return name in (t if isinstance(t, list) else [t])
+    return any(str(v).rstrip("/").split("/")[-1] == name for v in (t if isinstance(t, list) else [t]))
 
 
 def gtins(obj):
@@ -138,6 +150,50 @@ def amazon_product(soup, url):
     return result
 
 
+def hnak_product(soup, url):
+    """Read HNAK's server-rendered primary product payload without executing JS."""
+    if (urlparse(url).hostname or "").lower() not in {"hnak.com", "www.hnak.com"}:
+        return None
+    for script in soup.find_all("script"):
+        text = script.get_text()
+        if "productData" not in text or not text.strip().startswith("self.__next_f.push("):
+            continue
+        try:
+            payload = json.loads(text[text.index("(") + 1:text.rindex(")")])
+            records = payload[1].splitlines()
+        except (ValueError, TypeError, IndexError):
+            continue
+        for record in records:
+            try:
+                decoded = json.loads(record.split(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            for node in walk(decoded):
+                p = node.get("productData")
+                if not isinstance(p, dict) or p.get("type") != "PRODUCT":
+                    continue
+                if not p.get("relative_url") or urlparse(url).path.rstrip("/").split("/")[-1] != p["relative_url"]:
+                    continue
+                result = {"@type": "Product", "name": p.get("name", ""), "brand": p.get("mpbrand", "")}
+                for attr in walk(p.get("additional_information", [])):
+                    value = attr.get("value")
+                    if not isinstance(value, str):
+                        continue
+                    label = norm(attr.get("label"))
+                    key = {"model number": "model", "bar code": "gtin", "color": "color"}.get(label)
+                    if key:
+                        result[key] = value
+                prices = p.get("price_range", {})
+                low = prices.get("minimum_price", {}).get("final_price", {})
+                high = prices.get("maximum_price", {}).get("final_price", {})
+                if low and low == high:
+                    result["offers"] = {"@type": "Offer", "price": low.get("value"),
+                                        "priceCurrency": low.get("currency"),
+                                        "availability": "InStock" if p.get("stock_status") == "IN_STOCK" else "OutOfStock"}
+                return result
+    return None
+
+
 def parse_page(html, url):
     soup = BeautifulSoup(html, "html.parser")
     nodes = []
@@ -147,6 +203,10 @@ def parse_page(html, url):
         except (ValueError, TypeError):
             continue
     products = [n for n in nodes if typename(n, "Product")]
+    # Some stores omit @type on the primary Product while marking og:type=product.
+    og_type = soup.find("meta", property="og:type")
+    if not products and og_type and og_type.get("content") == "product":
+        products = [n for n in nodes if not n.get("@type") and n.get("name") and n.get("offers") and n.get("url") == url]
     # Product-list pages and ambiguous variant groups must not choose the cheapest sibling.
     unique = {json.dumps(p, sort_keys=True, ensure_ascii=False): p for p in products}
     products = list(unique.values())
@@ -154,15 +214,13 @@ def parse_page(html, url):
         exact = [p for p in products if str(p.get("url", "")).rstrip("/") == url.rstrip("/")]
         products = exact if len(exact) == 1 else []
     if not products:
-        amazon = amazon_product(soup, url)
-        if amazon:
-            products = [amazon]
+        custom = amazon_product(soup, url) or hnak_product(soup, url)
+        if custom:
+            products = [custom]
         else:
             raise ValueError("لم أجد بيانات منتج واحد واضحة؛ قد تكون الصفحة محمية أو تحتاج JavaScript")
     p = products[0]
-    brand = p.get("brand", "")
-    if isinstance(brand, dict):
-        brand = brand.get("name", "")
+    brand = clean_brand(p.get("brand", ""))
     offers = p.get("offers", [])
     if isinstance(offers, dict):
         offers = [offers]
@@ -177,10 +235,7 @@ def parse_page(html, url):
             continue
         availability = str(o.get("availability", "")).split("/")[-1]
         condition = str(o.get("itemCondition", p.get("itemCondition", ""))).split("/")[-1]
-        # Unknown stock is not silently presented as purchasable.
-        if availability != "InStock":
-            continue
-        prices.append({"price": str(price), "condition": condition})
+        prices.append({"price": str(price), "condition": condition, "availability": availability})
     # Multiple different offer conditions/prices may be a variant aggregate.
     offer = prices[0] if prices and all(x == prices[0] for x in prices) else None
     attrs = {k: norm(p[k]) for k in ("color", "size", "material", "pattern") if p.get(k)}
@@ -224,6 +279,8 @@ def match(source, candidate):
     a, b = source["offer"], candidate["offer"]
     if not b:
         return False, "السعر بالريال أو التوفر أو العرض المحدد غير مؤكد"
+    if b.get("availability", "InStock") != "InStock":
+        return False, "التوفر في المتجر غير مؤكد أو المنتج نافد"
     if a and a["condition"] and a["condition"] != b["condition"]:
         return False, "حالة المنتج مختلفة أو غير محددة"
     if not b["condition"]:
@@ -311,16 +368,24 @@ def search_language(query, language, key):
         raise ComparisonError("تعذر الاتصال بخدمة البحث؛ حاول لاحقًا") from None
     if data.get("error"):
         raise ComparisonError("رفضت خدمة البحث الطلب؛ راجع المفتاح والرصيد")
-    return list(dict.fromkeys(x["link"] for x in data.get("organic_results", [])
-                             if isinstance(x.get("link"), str)))[:10]
+    links = []
+    for item in data.get("organic_results", []):
+        options = [item.get("link"), item.get("redirect_link")]
+        options = [urljoin("https://www.google.com", u) for u in options if isinstance(u, str)]
+        direct = [u for u in options if not (urlparse(u).hostname or "").endswith("google.com")]
+        if direct or options:
+            links.append((direct or options)[0])
+    return list(dict.fromkeys(links))[:10]
 
 
 def inspect(url):
+    final = url
     try:
         html, final = fetch(url)
         return {"product": parse_page(html, final)}
-    except (requests.RequestException, ValueError, OSError, KeyError):
-        return {"url": url, "reason": "تعذرت قراءة صفحة منتج واضحة"}
+    except (requests.RequestException, ValueError, OSError, KeyError) as error:
+        reason = str(error) if isinstance(error, ComparisonError) else "تعذرت قراءة بيانات منتج واحد من الصفحة"
+        return {"url": url, "final_url": final, "reason": reason}
 
 
 def read_source(url, key):
@@ -352,9 +417,7 @@ def read_source(url, key):
     if not p.get("title"):
         raise ComparisonError("مسار أمازون البديل لم يُرجع اسم المنتج؛ لم تبدأ المقارنة.")
     # Only map explicit identity fields. Do not treat ASIN or retailer SKU as a GTIN.
-    brand = p.get("brand", "")
-    if isinstance(brand, dict):
-        brand = brand.get("name", "")
+    brand = clean_brand(p.get("brand", ""))
     identity = {k: p[k] for k in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14") if p.get(k)}
     fields = {"model": p.get("model", ""), "mpn": p.get("mpn", "")}
     # Product details only; recommendations can contain unrelated identifiers.
@@ -379,6 +442,30 @@ def md(value):
     return re.sub(r"[\r\n|\[\]<>`*]", " ", str(value))[:300]
 
 
+def same_named_product(source, candidate):
+    """Expose readable prices separately; never promote a name match to exact SKU."""
+    if not source["brand"] or source["brand"] != candidate["brand"] or not candidate["offer"]:
+        return False
+    sa, ca = variant_specs(source), variant_specs(candidate)
+    if any(sa[k] != ca[k] for k in sa.keys() & ca.keys()):
+        return False
+    for field in ("model", "mpn"):
+        if source[field] and candidate[field] and model_key(source[field]) != model_key(candidate[field]):
+            return False
+    def name(p):
+        title = norm(p["title"])
+        title = re.sub(r"(?<!\w)" + re.escape(p["brand"]) + r"(?!\w)", " ", title)
+        for identifier in (p["model"], p["mpn"]):
+            if valid_model(identifier):
+                title = re.sub(r"(?<!\w)" + re.escape(norm(identifier)) + r"(?!\w)", " ", title)
+        color = norm(p["attributes"].get("color"))
+        if color:
+            title = re.sub(r"(?<!\w)" + re.escape(color) + r"(?!\w)", " ", title)
+        return re.findall(r"\w+", title)
+    a, b = name(source), name(candidate)
+    return len(a) >= 4 and a == b
+
+
 def render(report):
     lines = ["# مقارنة أسعار المنتج", "", md(report["source"]["title"]), "",
              f"وقت الفحص UTC: {report['checked_at']}", "",
@@ -392,7 +479,15 @@ def render(report):
         lines.append("لم أجد نتائج قدرت أثبت تطابقها وسعرها وحالتها وتوفرها. هذا لا يعني أنه لا يوجد سعر أرخص.")
         if not report["source"]["gtins"]:
             lines.extend(["", "لا يوجد باركود صالح بالمصدر؛ جرت محاولة المطابقة بالماركة ورقم الموديل الكامل ومواصفات النسخة. الاسم وحده لا يكفي."])
-    lines.extend(["", f"فُحصت {report['checked']} صفحة مرشحة. المستبعدة: {len(report['excluded'])}.",
+    pending = report.get("pending", [])
+    if pending:
+        lines.extend(["", "## أسعار قُرئت وتحتاج تأكيد النسخة", "",
+                      "تطابق الاسم الكامل والماركة، لكن بيانات الموديل أو الحالة أو التوفر غير كافية؛ ليست نتائج مطابقة مؤكدة.", "",
+                      "| المتجر | السعر بالريال | سبب عدم التأكيد | الرابط |", "|---|---:|---|---|"])
+        for p in pending:
+            url = p["url"].replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+            lines.append(f"| {md(p['store'])} | {p['offer']['price']} | {md(p['match_reason'])} | [فتح المنتج]({url}) |")
+    lines.extend(["", f"فُحصت {report['checked']} صفحة مرشحة. المستبعدة: {len(report['excluded'])}. تحتاج تأكيدًا: {len(pending)}.",
                   "", "المطابقة تعتمد على بيانات المتجر وقد تكون بياناته خاطئة؛ تحقق من الصفحة قبل الشراء."])
     return "\n".join(lines) + "\n"
 
@@ -417,7 +512,7 @@ def main():
         stage = "البحث عن المتاجر"
         urls = [u for u in search(source, key) if u.rstrip("/") != final.rstrip("/")]
         report = {"source": source, "checked_at": datetime.now(timezone.utc).isoformat(),
-                  "matches": [], "excluded": [], "checked": len(urls)}
+                  "matches": [], "pending": [], "excluded": [], "checked": len(urls)}
         seen = {final}
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             for result in pool.map(inspect, urls):
@@ -432,9 +527,15 @@ def main():
                 if ok:
                     candidate["match_reason"] = reason
                     report["matches"].append(candidate)
+                elif same_named_product(source, candidate):
+                    stock = candidate["offer"].get("availability", "")
+                    stock_note = "؛ نافد" if stock == "OutOfStock" else ("؛ التوفر غير محدد" if stock != "InStock" else "")
+                    candidate["match_reason"] = reason + stock_note
+                    report["pending"].append(candidate)
                 else:
                     report["excluded"].append({"url": candidate["url"], "reason": reason})
         report["matches"].sort(key=lambda p: Decimal(p["offer"]["price"]))
+        report["pending"].sort(key=lambda p: Decimal(p["offer"]["price"]))
         text = render(report)
         (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         (out / "report.md").write_text(text, encoding="utf-8")
