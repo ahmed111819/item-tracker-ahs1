@@ -1,5 +1,5 @@
 name: Verify live price comparison
-# Diagnose native store transport failures and security challenges without API keys.
+# Verify HTTP/1.1 compatibility after measured Noon HTTP/2 negotiation failure.
 on:
   push:
     branches: [main]
