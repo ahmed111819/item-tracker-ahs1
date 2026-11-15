@@ -23,6 +23,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: "13094"
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       STORAGE_BACKEND: postgres
       CONTINUOUS_MODE: "false"

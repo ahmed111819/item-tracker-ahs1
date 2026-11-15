@@ -25,7 +25,7 @@
     \\dt public.telegram_callback_state
 
 
-بعد تطبيق التهيئة، لا يلزم إضافة أسرار جديدة إلى GitHub؛ يستخدم المستمع TELEGRAM_BOT_TOKEN وTELEGRAM_CHAT_ID وDATABASE_URL الموجودة. إذا كان إعداد Telegram يستخدم webhook، يجب إزالته لأن الميزة تستقبل ضغطات الأزرار عبر getUpdates.
+بعد تطبيق التهيئة، لا يلزم إضافة أسرار جديدة إلى GitHub؛ يستخدم المستمع TELEGRAM_BOT_TOKEN وTELEGRAM_CHAT_ID وDATABASE_URL الموجودة. يجب أن يشير TELEGRAM_CHAT_ID إلى القروب الصحيح. تبقى استجابة الضغط المؤقتة فقط؛ ولا تُرسل رسائل جديدة عند نجاح الحجب أو فكّه أو عند أخطاء المعالجة. تُسجّل الأخطاء في سجل GitHub Actions. إذا كان إعداد Telegram يستخدم webhook، يجب إزالته لأن الميزة تستقبل ضغطات الأزرار عبر getUpdates.
 
 ## الملفات
 

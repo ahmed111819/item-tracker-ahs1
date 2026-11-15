@@ -15,7 +15,7 @@
 2. شغّل `postgres_schema.sql` مرة واحدة.
 3. استورد ملفات تتبع البوتات الثلاثة وسجل التنبيهات القديم باستخدام `import_postgres.py`.
 4. أضف GitHub Actions Secret باسم `DATABASE_URL` مع رابط PostgreSQL مشفر بـ TLS.
-5. أبقِ `TELEGRAM_BOT_TOKEN` و`TELEGRAM_CHAT_ID` في GitHub Secrets.
+5. أبقِ `TELEGRAM_BOT_TOKEN` في GitHub Secrets. حدّث سر `TELEGRAM_CHAT_ID` ليشير إلى القروب الذي يحتوي موضوع التنبيهات؛ يرسل الـworkflow إلى الموضوع ذي المعرّف `13094`.
 
 لا يبدأ أي بوت إذا كانت حالة تتبعه أو سجل التنبيهات المشترك غير مستوردين، لتجنب تاريخ فارغ أو تنبيهات مكررة. ملف سجل التنبيهات المرفق لا يحتوي ملفات تتبع المنتجات.
 
