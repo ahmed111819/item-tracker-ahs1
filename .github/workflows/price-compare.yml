@@ -1,0 +1,36 @@
+name: مقارنة أسعار منتج
+on:
+  workflow_dispatch:
+    inputs:
+      product_url:
+        description: رابط صفحة المنتج
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install comparison dependencies
+        run: python -m pip install -r price_compare/requirements.txt
+      - name: Test matching and extraction
+        run: python -m unittest discover -s price_compare -p 'test_*.py' -v
+      - name: Compare product prices
+        env:
+          PRODUCT_URL: ${{ inputs.product_url }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+        run: python price_compare/compare.py --output price_compare/reports
+      - name: Downloadable report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-comparison
+          path: price_compare/reports/
+          if-no-files-found: ignore
+          retention-days: 7
