@@ -1,4 +1,5 @@
 name: Verify live price comparison
+# Exercise direct storefront discovery as well as broad search.
 on:
   push:
     branches: [main]

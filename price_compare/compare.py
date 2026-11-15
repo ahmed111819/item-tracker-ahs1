@@ -368,6 +368,11 @@ def search(source, key):
             direct.extend(search_language(query + " " + shops, "en", key, engine="bing"))
         except ComparisonError:
             pass
+        for domain in ("apple.com/sa-en/shop/product" if source["brand"] == "apple" else "jarir.com", "hnak.com"):
+            try:
+                direct.extend(search_language(query + " site:" + domain, "en", key, engine="google_light"))
+            except ComparisonError as error:
+                print("Fallback search:", str(error))
     clean = [u for u in direct if not search_wrapper(u) and not social_link(u)]
     return list(dict.fromkeys(clean + links))[:30]
 
@@ -384,7 +389,7 @@ def social_link(url):
 
 def search_language(query, language, key, engine="google"):
     params = {"engine": engine, "q": query + " -site:facebook.com -site:instagram.com -site:youtube.com", "api_key": key}
-    params.update({"gl": "sa", "hl": language, "num": 10} if engine == "google" else {"mkt": language + "-SA"})
+    params.update({"gl": "sa", "hl": language, "num": 10} if engine in {"google", "google_light"} else {"mkt": language + "-SA"})
     try:
         r = requests.get("https://serpapi.com/search.json", timeout=35,
                          params=params)
@@ -399,6 +404,9 @@ def search_language(query, language, key, engine="google"):
     links = []
     for item in data.get("organic_results", []):
         options = [item.get("link"), item.get("redirect_link")]
+        displayed = item.get("displayed_link", "")
+        if isinstance(displayed, str) and displayed.startswith("https://") and not any(c in displayed for c in ("…", "...", "›", " ")):
+            options.append(displayed)
         options = [urljoin("https://www.google.com", u) for u in options if isinstance(u, str)]
         direct = [u for u in options if not (urlparse(u).hostname or "").endswith("google.com")]
         if direct or options:
