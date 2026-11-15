@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
 
 from compare import (ComparisonError, clean_brand, match, norm, parse_page, public_url,
-                     read_source, render, same_named_product, social_link, search, search_wrapper)
+                     read_source, render, same_named_product, social_link, search, search_wrapper, fetch)
 
 
 def blocked(page):
@@ -81,6 +81,35 @@ def discover_store_links(source, key):
                               if not search_wrapper(u) and not social_link(u)))[:20]
 
 
+def native_browser_search(page, source, output):
+    query = source['model'] or source['mpn'] or norm(source['title'])
+    stores = [('noon', 'https://www.noon.com/saudi-en/search/?' + urlencode({'q': query}), 'noon.com', '/p/'),
+              ('jarir', 'https://www.jarir.com/sa-en/catalogsearch/result/?' + urlencode({'q': query}), 'jarir.com', '.html')]
+    if clean_brand(source['brand']) == 'apple':
+        text = re.sub(r'^apple\s+', '', norm(source['title']))
+        stores.insert(0, ('apple', 'https://www.apple.com/sa-en/shop/search/' + text.replace(' ', '-'), 'apple.com', '/shop/product/'))
+    links, diagnostics = [], []
+    for name, url, domain, marker in stores:
+        entry = {'store': name, 'method': 'native_browser', 'query': query}
+        try:
+            visit(page, url)
+            found = []
+            soup = BeautifulSoup(page.content(), 'html.parser')
+            for a in soup.find_all('a', href=True):
+                target = urljoin(page.url, a['href'])
+                p = urlparse(target)
+                if (p.hostname == domain or p.hostname == 'www.' + domain) and marker in p.path:
+                    found.append(p._replace(query='', fragment='').geturl())
+            found = list(dict.fromkeys(found))[:5]
+            entry.update(status='read', links=len(found))
+            links.extend(found)
+        except Exception as error:
+            entry.update(status='unreadable', reason=str(error) if isinstance(error, ComparisonError) else type(error).__name__)
+        page.screenshot(path=str(output / f'search-{name}.png'), full_page=False)
+        diagnostics.append(entry)
+    return list(dict.fromkeys(links)), diagnostics
+
+
 def run(url, output, headed=False, search_provider='service'):
     output.mkdir(parents=True, exist_ok=True)
     report = {'checked_at': datetime.now(timezone.utc).isoformat(), 'source': {},
@@ -109,15 +138,24 @@ def run(url, output, headed=False, search_provider='service'):
             report['source_method'] = 'browser'
         except Exception as error:
             report['source_browser_error'] = type(error).__name__
-            key = os.environ.get('SERPAPI_API_KEY', '')
-            if not key:
-                raise ComparisonError('تعذرت قراءة المصدر بالمتصفح؛ راجع صورة source.png. المسار البديل اختياري ويتطلب مفتاح البحث') from None
-            source = read_source(url, key)
-            report['source_method'] = 'explicit_api_fallback'
+            if search_provider == 'native':
+                # This branch cannot use an API key, even if one exists in the environment.
+                canonical = re.sub(r'(https://www.amazon.sa/dp/[A-Z0-9]{10}).*', r'\1', url, flags=re.I)
+                html, final = fetch(canonical)
+                source = parse_page(html, final)
+                report['source_method'] = 'direct_http_no_api'
+            else:
+                key = os.environ.get('SERPAPI_API_KEY', '')
+                if not key:
+                    raise ComparisonError('تعذرت قراءة المصدر بالمتصفح؛ راجع صورة source.png. المسار البديل اختياري ويتطلب مفتاح البحث') from None
+                source = read_source(url, key)
+                report['source_method'] = 'explicit_api_fallback'
         finally:
             page.screenshot(path=str(output / 'source.png'), full_page=False)
         report['source'] = source
         links = []
+        if search_provider == 'native':
+            links, report['searches'] = native_browser_search(page, source, output)
         if search_provider == 'service':
             links = discover_store_links(source, os.environ.get('SERPAPI_API_KEY', ''))
             report['searches'].append({'method': 'service_and_native_store_search',
@@ -182,6 +220,18 @@ if __name__ == '__main__':
     parser.add_argument('--url', default=os.environ.get('PRODUCT_URL'), required=not bool(os.environ.get('PRODUCT_URL')))
     parser.add_argument('--output', type=Path, default=Path('reports'))
     parser.add_argument('--headed', action='store_true')
-    parser.add_argument('--search-provider', choices=['service', 'browser'], default='service')
+    parser.add_argument('--search-provider', choices=['service', 'browser', 'native'], default='native')
     args = parser.parse_args()
-    raise SystemExit(run(args.url, args.output, args.headed, args.search_provider))
+    try:
+        code = run(args.url, args.output, args.headed, args.search_provider)
+    except Exception as error:
+        args.output.mkdir(parents=True, exist_ok=True)
+        reason = str(error) if isinstance(error, ComparisonError) else type(error).__name__
+        text = '# تعذرت قراءة المصدر\n\n' + reason + '\n\nلم تُستخدم خدمة بحث مدفوعة في الوضع native. راجع source.png.\n'
+        (args.output / 'error.md').write_text(text, encoding='utf-8')
+        print(text)
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+                f.write(text)
+        code = 2
+    raise SystemExit(code)

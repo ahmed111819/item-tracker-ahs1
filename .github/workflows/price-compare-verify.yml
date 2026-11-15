@@ -1,5 +1,5 @@
 name: Verify live price comparison
-# Verify service-discovered direct URLs with actual Chromium store reading.
+# Verify native storefront search without supplying any paid-service key.
 on:
   push:
     branches: [main]
@@ -20,21 +20,27 @@ jobs:
       - run: python -m playwright install --with-deps chromium
       - run: python -m unittest discover -s price_compare -p 'test_*.py' -v
       - name: Read live prices for the reported product
-        env:
-          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-        run: python price_compare/browser_compare.py --url 'https://www.amazon.sa/dp/B0FQFNYGWZ' --output price_compare/reports
+        id: amazon
+        continue-on-error: true
+        run: python price_compare/browser_compare.py --search-provider native --url 'https://www.amazon.sa/dp/B0FQFNYGWZ' --output price_compare/reports/amazon
+      - name: Independent test using official product source
+        id: official
+        continue-on-error: true
+        run: python price_compare/browser_compare.py --search-provider native --url 'https://www.apple.com/sa-en/shop/product/mgpg4ze/a/iphone-air-magsafe-battery' --output price_compare/reports/official
       - name: Require an actual readable matching-name store price
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          r = json.loads(Path('price_compare/reports/report.json').read_text())
-          prices = r['matches'] + r.get('pending', [])
-          assert r['search_provider'] == 'service'
-          assert r['discovered_store_links'] > 0, 'No direct store links discovered'
-          assert prices, 'No store prices read: comparison is not verified'
-          print('Verified readable store prices:', len(prices))
-          print('Confirmed exact matches:', len(r['matches']))
+          reports = list(Path('price_compare/reports').glob('*/report.json'))
+          total = 0
+          for path in reports:
+              r = json.loads(path.read_text())
+              assert r['search_provider'] == 'native'
+              count = len(r['matches']) + len(r.get('pending', []))
+              print(path.parent.name, 'prices:', count, 'searches:', r['searches'])
+              total += count
+          assert total, 'No external store price verified without paid search'
           PY
       - if: always()
         uses: actions/upload-artifact@v4

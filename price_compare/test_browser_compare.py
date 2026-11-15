@@ -1,10 +1,20 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from browser_compare import blocked, discover_store_links, google_links, rendered_product
+from browser_compare import blocked, discover_store_links, google_links, native_browser_search, rendered_product
 
 
 class BrowserTests(unittest.TestCase):
+    def test_native_search_uses_store_results_without_api(self):
+        from pathlib import Path
+        import tempfile
+        page = Mock()
+        page.url = 'https://www.apple.com/sa-en/search/test'
+        page.content.return_value = '<a href="https://www.apple.com/sa-en/shop/product/actual/item">Item</a>'
+        with tempfile.TemporaryDirectory() as folder, patch('browser_compare.visit'), patch('browser_compare.search', side_effect=AssertionError('Paid API used')):
+            links, diagnostics = native_browser_search(page, {'title': 'Apple test product', 'brand': 'apple', 'model': '', 'mpn': ''}, Path(folder))
+            self.assertEqual(links, ['https://www.apple.com/sa-en/shop/product/actual/item'])
+            self.assertEqual(len(diagnostics), 3)
     def test_service_discovery_never_returns_google_wrappers_or_social(self):
         with patch('browser_compare.search', return_value=['https://www.google.com/goto?url=opaque',
                    'https://facebook.com/post', 'https://shop.example/product', 'https://shop.example/product']):

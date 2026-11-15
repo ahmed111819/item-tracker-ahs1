@@ -26,8 +26,7 @@ jobs:
       - name: Compare product prices
         env:
           PRODUCT_URL: ${{ inputs.product_url }}
-          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-        run: python price_compare/browser_compare.py --output price_compare/reports
+        run: python price_compare/browser_compare.py --search-provider native --output price_compare/reports
       - name: Downloadable report
         if: always()
         uses: actions/upload-artifact@v4
