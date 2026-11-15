@@ -2,7 +2,7 @@
 # CELL 2 — AMAZON SCANNER (BOT1)
 # RESULT-COUNT PAGE PLANNING + SHARED CONCURRENCY
 # 4 RETRIES PER PAGE
-# 40%+ COUPON ALERTS + 80%+ PRICE-DROP ALERTS
+# 40%+ COUPON/PROMOTION ALERTS + VERIFIED PRICE-DROP ALERTS
 # ============================================================
 
 import asyncio
@@ -31,6 +31,7 @@ from datetime import datetime
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from telegram_product_buttons import edit_product_keyboard, product_keyboard
+from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
 
 # ------------------------------------------------------------
@@ -714,108 +715,24 @@ async def extract_total_page_count(page):
 # ------------------------------------------------------------
 
 def parse_price(text):
-    if not text:
-        return None
-
-    match = re.search(r"([\d,]+(?:\.\d{1,2})?)", text)
-    if not match:
-        return None
-
-    try:
-        return float(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
+    return parse_deal_price(text)
 
 
-def extract_reference_price(card_text, current_price):
-    patterns = [
-        r"\bWas\s*:?\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
-        r"\bList\s+Price\s*:?\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, card_text, re.IGNORECASE)
-        if match:
-            old_price = parse_price(match.group(1))
-            if old_price and current_price and old_price > current_price:
-                return old_price
-
-    return current_price
+def extract_reference_price(card_text, current_price, explicit_reference=None):
+    return parse_reference_price(card_text, current_price, explicit_reference)
 
 
 def extract_amazon_displayed_discount(card_text):
-    patterns = [
-        (
-            r"\b(?:deal|discount|you save|save)\s*:?\s*"
-            r"(\d+(?:\.\d+)?)\s*%\s*(?:off)?\b"
-        ),
-        r"\b(\d+(?:\.\d+)?)\s*%\s*off\b",
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(
-            pattern,
-            card_text,
-            re.IGNORECASE,
-        ):
-            start = max(0, match.start() - 70)
-            end = min(len(card_text), match.end() + 70)
-            context = card_text[start:end].lower()
-
-            if "coupon" in context:
-                continue
-            if "on any" in context or "or more" in context:
-                continue
-
-            try:
-                percent = float(match.group(1))
-            except (ValueError, IndexError):
-                continue
-
-            if 0 < percent <= 100:
-                return percent
-
+    """Deprecated: displayed promo percentages are not product price drops."""
     return None
 
 
 def extract_price_drop(card_text, current_price, reference_price):
-    if not current_price or current_price <= 0:
-        return None
-
-    displayed_percent = extract_amazon_displayed_discount(card_text)
-
-    if reference_price and reference_price > current_price:
-        saving = reference_price - current_price
-
-        if displayed_percent is not None:
-            discount = displayed_percent
-            source = "Amazon displayed percentage"
-        else:
-            discount = saving / reference_price * 100
-            source = "calculated from Was/current price"
-
-        return {
-            "type": "price_drop",
-            "description": "Product price reduction",
-            "reference_price": round(reference_price, 2),
-            "current_price": round(current_price, 2),
-            "saving": round(saving, 2),
-            "discount_percent": round(discount, 2),
-            "source": source,
-        }
-
-    if displayed_percent is not None:
-        return {
-            "type": "price_drop",
-            "description": "Product price reduction",
-            "reference_price": None,
-            "current_price": round(current_price, 2),
-            "saving": None,
-            "discount_percent": round(displayed_percent, 2),
-            "source": "Amazon displayed percentage",
-        }
-
-    return None
+    return classify_deals(
+        current_price=current_price,
+        reference_price=reference_price,
+        card_text=card_text,
+    )["price_drop"]
 
 
 # ------------------------------------------------------------
@@ -823,171 +740,12 @@ def extract_price_drop(card_text, current_price, reference_price):
 # ------------------------------------------------------------
 
 def parse_offer(card_text, current_price, reference_price):
-    if not card_text:
-        return None
-
-    # "You pay SAR 36.80 with coupon"
-    match = re.search(
-        r"You\s+pay\s+SAR\s*([\d,]+(?:\.\d{1,2})?)"
-        r"\s+with\s+coupon",
-        card_text,
-        re.IGNORECASE,
+    deals = classify_deals(
+        current_price=current_price,
+        reference_price=reference_price,
+        card_text=card_text,
     )
-
-    if match and current_price and current_price > 0:
-        pay_price = parse_price(match.group(1))
-        saving = current_price - pay_price
-
-        if pay_price is not None and saving > 0:
-            return {
-                "type": "you_pay_coupon",
-                "description": "You pay with coupon",
-                "pay_price": round(pay_price, 2),
-                "saving": round(saving, 2),
-                "discount_percent": round(
-                    saving / current_price * 100, 2
-                ),
-                "quantity": 1,
-            }
-
-    # "SAR 12.90 off coupon applied"
-    match = re.search(
-        r"SAR\s*([\d,]+(?:\.\d{1,2})?)"
-        r"\s*off\s+coupon\s+applied",
-        card_text,
-        re.IGNORECASE,
-    )
-
-    if match and current_price and current_price > 0:
-        saving = parse_price(match.group(1))
-
-        if saving is not None and 0 < saving < current_price:
-            return {
-                "type": "cash_coupon",
-                "description": "Cash coupon",
-                "pay_price": round(current_price - saving, 2),
-                "saving": round(saving, 2),
-                "discount_percent": round(
-                    saving / current_price * 100, 2
-                ),
-                "quantity": 1,
-            }
-
-    # "Save 50% on any 1", "Apply 40% coupon", etc.
-    percent_patterns = [
-        (
-            r"\b(?:save|apply|clip)\s+"
-            r"(\d+(?:\.\d+)?)\s*%\s*"
-            r"(?:off\s*)?"
-            r"(?:with\s*)?"
-            r"(?:(?:coupon\b\s+)?on\s+any\s+(?P<quantity>\d+)"
-            r"(?:\s+or\s+more)?|coupon\b)?"
-        ),
-        r"\b(\d+(?:\.\d+)?)\s*%\s*off\s+coupon\b",
-    ]
-
-    for pattern in percent_patterns:
-        match = re.search(pattern, card_text, re.IGNORECASE)
-        if not match:
-            continue
-
-        matched_text = match.group(0).lower()
-        has_quantity_condition = "on any" in matched_text
-        has_coupon_word = "coupon" in matched_text
-
-        if not has_quantity_condition and not has_coupon_word:
-            continue
-
-        percent = float(match.group(1))
-        quantity_text = match.groupdict().get("quantity")
-        quantity = int(quantity_text) if quantity_text else 1
-
-        if percent <= 0:
-            continue
-
-        if current_price and current_price > 0:
-            saving = current_price * percent / 100
-            pay_price = current_price - saving
-        else:
-            saving = None
-            pay_price = None
-
-        return {
-            "type": "percent_offer",
-            "description": match.group(0).strip(),
-            "pay_price": (
-                round(pay_price, 2)
-                if pay_price is not None
-                else None
-            ),
-            "saving": (
-                round(saving, 2)
-                if saving is not None
-                else None
-            ),
-            "discount_percent": round(percent, 2),
-            "quantity": quantity,
-        }
-
-    # "Buy 3 for SAR 29.99"
-    bundle_patterns = [
-        (
-            r"\bbuy\s+(\d+)\s+for\s+"
-            r"(?:SAR\s*)?([\d,]+(?:\.\d{1,2})?)"
-            r"\s*(?:SAR|ريال)?"
-        ),
-        (
-            r"\b(\d+)\s+for\s+SAR\s*"
-            r"([\d,]+(?:\.\d{1,2})?)"
-        ),
-    ]
-
-    for pattern in bundle_patterns:
-        match = re.search(pattern, card_text, re.IGNORECASE)
-        if not match:
-            continue
-
-        quantity = int(match.group(1))
-        bundle_price = parse_price(match.group(2))
-
-        if quantity <= 0 or bundle_price is None:
-            continue
-
-        if not reference_price or reference_price <= 0:
-            return {
-                "type": "bundle_offer_unverified",
-                "description": match.group(0).strip(),
-                "pay_price": round(bundle_price, 2),
-                "saving": None,
-                "discount_percent": None,
-                "quantity": quantity,
-            }
-
-        regular_total = reference_price * quantity
-        saving = regular_total - bundle_price
-
-        if saving <= 0:
-            return {
-                "type": "bundle_offer_unverified",
-                "description": match.group(0).strip(),
-                "pay_price": round(bundle_price, 2),
-                "saving": None,
-                "discount_percent": None,
-                "quantity": quantity,
-            }
-
-        return {
-            "type": "bundle_offer",
-            "description": match.group(0).strip(),
-            "pay_price": round(bundle_price, 2),
-            "saving": round(saving, 2),
-            "discount_percent": round(
-                saving / regular_total * 100, 2
-            ),
-            "quantity": quantity,
-        }
-
-    return None
+    return deals["coupon"] or deals["promotion"]
 
 
 # ------------------------------------------------------------
@@ -1107,7 +865,7 @@ def build_telegram_caption(title, asin, price, offer):
         )
     elif offer.get("type") == "price_drop_80":
         caption = (
-            "🚨🔥 <b>80%+ PRICE DROP — NOT A COUPON</b>\n\n"
+            "🚨 <b>تخفيض مقارنة بالسعر المشطوب (وليس كوبونًا)</b>\n\n"
             f"<b>{html.escape(title[:300])}</b>\n"
         )
 
@@ -1125,17 +883,39 @@ def build_telegram_caption(title, asin, price, offer):
             f"Source: {html.escape(offer.get('source', ''))}\n\n"
         )
 
+    elif offer.get("type") == "second_item_promotion":
+        caption = (
+            "🏷️ <b>خصم مشروط على القطعة الثانية</b>\n\n"
+            f"<b>{html.escape(title[:300])}</b>\n"
+        )
+        if price and price > 0:
+            caption += f"سعر القطعة: SAR {price:.2f}\n"
+        caption += f"الخصم على القطعة الثانية: {offer['discount_percent']:.2f}%\n"
+        if offer.get("pay_price") is not None:
+            caption += f"إجمالي القطعتين التقريبي: SAR {offer['pay_price']:.2f}\n"
+        if offer.get("saving") is not None:
+            caption += f"التوفير التقريبي: SAR {offer['saving']:.2f}\n"
+        caption += (
+            f"متوسط الخصم على إجمالي القطعتين: "
+            f"{offer['effective_basket_discount_percent']:.2f}%\n\n"
+        )
     else:
         description = html.escape(
             offer.get("description") or offer.get("type", "Offer")
         )
 
+        offer_type = offer.get("type", "")
+        is_coupon_caption = "coupon" in offer_type
+        alert_heading = "🎟️ <b>كوبون</b>" if is_coupon_caption else "🏷️ <b>عرض ترويجي</b>"
         caption = (
-            "🔥 <b>Amazon deal</b>\n\n"
+            f"{alert_heading}\n\n"
             f"<b>{html.escape(title[:300])}</b>\n"
-            f"Listed price: SAR {price:.2f}\n"
-            f"Offer: {description}\n"
         )
+        if price and price > 0:
+            caption += f"Current price: SAR {price:.2f}\n"
+        else:
+            caption += "Current price: unavailable\n"
+        caption += f"Offer: {description}\n"
 
         if offer.get("type") == "bundle_offer":
             caption += (
@@ -1156,6 +936,9 @@ def build_telegram_caption(title, asin, price, offer):
                     f"Discount: "
                     f"{offer['discount_percent']:.2f}%\n"
                 )
+
+            if offer.get("quantity_condition"):
+                caption += "شرط العرض: شراء كمية محددة كما هو موضح في وصف أمازون.\n"
 
             if offer.get("quantity", 1) > 1:
                 caption += (
@@ -1236,7 +1019,8 @@ elements => elements.map(element => {
         || element.querySelector('[data-cy="title-recipe"]')
         || element.querySelector('.a-size-base-plus')
         || element.querySelector('.a-size-medium');
-    const priceElement = element.querySelector('.a-price .a-offscreen');
+    const priceElement = element.querySelector('.a-price:not([data-a-strike="true"]) .a-offscreen');
+    const referencePriceElement = element.querySelector('[data-a-strike="true"] .a-offscreen');
     const imageElement = element.querySelector('img.s-image')
         || element.querySelector('img');
     let imageUrl = null;
@@ -1263,6 +1047,7 @@ elements => elements.map(element => {
         text: element.innerText || '',
         title: titleElement ? titleElement.innerText : '',
         price_text: priceElement ? priceElement.innerText : '',
+        reference_price_text: referencePriceElement ? referencePriceElement.innerText : '',
         image_url: imageUrl
     };
 })
@@ -1307,9 +1092,16 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
     if current_price is None:
         price_text, current_price = fallback_price_from_text(card_text)
 
-    reference_price = extract_reference_price(card_text, current_price)
-    offer = parse_offer(card_text, current_price, reference_price)
-    price_drop = extract_price_drop(card_text, current_price, reference_price)
+    reference_price = extract_reference_price(
+        card_text, current_price, snapshot.get("reference_price_text")
+    )
+    classified_deals = classify_deals(
+        current_price=current_price,
+        reference_price=reference_price,
+        card_text=card_text,
+    )
+    offer = classified_deals["coupon"] or classified_deals["promotion"]
+    price_drop = classified_deals["price_drop"]
     product_url = f"https://www.amazon.sa/dp/{asin}"
 
     if VERBOSE_PRODUCT_LOGS:
@@ -1363,7 +1155,7 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
         offer_description_for_block = str(offer.get("description", "")).lower()
         coupon_type_for_block = (
             "coupon" in offer_description_for_block
-            or offer.get("type") in {"you_pay_coupon", "cash_coupon"}
+            or offer.get("type") in {"you_pay_coupon", "cash_coupon", "percent_coupon"}
         )
         threshold_for_block = (
             MIN_DISCOUNT_PERCENT if coupon_type_for_block
@@ -1470,7 +1262,7 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
             offer_description = str(offer.get("description", "")).lower()
             is_coupon_offer = (
                 "coupon" in offer_description
-                or offer.get("type") in {"you_pay_coupon", "cash_coupon"}
+                or offer.get("type") in {"you_pay_coupon", "cash_coupon", "percent_coupon"}
             )
             offer_threshold = (
                 MIN_DISCOUNT_PERCENT
@@ -1521,9 +1313,9 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
         RUN_PRICE_DROP_SIGNATURES.setdefault(asin, set()).add(price_drop_signature)
         if price_drop_signature == previous_80_alert:
             if VERBOSE_PRODUCT_LOGS:
-                print("Same 80%+ price drop already alerted.")
+                print("Same price-drop threshold already alerted.")
         elif TELEGRAM_READY:
-            print(f"🚨 80%+ price drop ({price_drop_discount:.2f}%): Search {search_index}, page {page_number}, product {index}")
+            print(f"🚨 Price drop ({price_drop_discount:.2f}%): Search {search_index}, page {page_number}, product {index}")
             price_drop_alert = {**price_drop, "type": "price_drop_80"}
             tracking_data["products"][asin] = record
             sent = await asyncio.to_thread(
@@ -1536,7 +1328,7 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                 record["last_price_drop_80_at"] = datetime.now().isoformat()
                 price_drop_alert_sent = True
                 save_tracking()
-                print("✅ 80%+ price-drop alert sent:", product_url)
+                print("✅ Price-drop alert sent:", product_url)
             elif sent is None:
                 print("⏭️ Price-drop alert skipped because it was already sent or reserved.")
             else:
