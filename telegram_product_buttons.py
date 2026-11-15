@@ -6,6 +6,8 @@ import math
 
 import requests
 
+_HTTP = requests.Session()
+
 
 def _price_text(price: float | None) -> str | None:
     try:
@@ -42,7 +44,7 @@ def edit_product_keyboard(
     state: str, price: float | None = None,
 ) -> bool:
     try:
-        response = requests.post(
+        response = _HTTP.post(
             f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
             json={
                 "chat_id": chat_id,
