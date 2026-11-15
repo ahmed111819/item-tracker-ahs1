@@ -92,6 +92,52 @@ def gtins(obj):
     return sorted(result)
 
 
+def amazon_product(soup, url):
+    """Read the selected Amazon item, never recommendation cards or list prices."""
+    host = (urlparse(url).hostname or "").lower()
+    if host not in {"amazon.sa", "www.amazon.sa"}:
+        return None
+    title = soup.select_one("#productTitle")
+    if title is None or not title.get_text(strip=True):
+        raise ComparisonError("أمازون لم يعرض تفاصيل المنتج؛ قد تكون الصفحة صفحة تحقق أو حظر مؤقت.")
+    result = {"@type": "Product", "name": title.get_text(" ", strip=True)}
+    brand = soup.select_one("#bylineInfo")
+    if brand:
+        raw = brand.get_text(" ", strip=True)
+        for pattern in (r"^Brand:\s*(.+)$", r"^Visit the (.+) Store$", r"^العلامة التجارية\s*:\s*(.+)$"):
+            found = re.match(pattern, raw, re.I)
+            if found:
+                result["brand"] = found.group(1)
+                break
+    labels = {"item model number": "model", "manufacturer part number": "mpn",
+              "model number": "model", "رقم الموديل": "model",
+              "رقم موديل السلعة": "model", "color": "color", "اللون": "color",
+              "size": "size", "الحجم": "size", "upc": "gtin12", "ean": "gtin13"}
+    containers = soup.select('[id^="productDetails_"], #detailBullets_feature_div, #productOverview_feature_div')
+    for container in containers:
+        for row in container.select("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if len(cells) == 2:
+                label = norm(cells[0].get_text(" ", strip=True)).strip(" :\u200e\u200f")
+                if label in labels:
+                    result[labels[label]] = cells[1].get_text(" ", strip=True).strip("\u200e\u200f")
+    price = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) .a-offscreen')
+    if price is None:
+        price = soup.select_one('#corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen')
+    availability = soup.select_one("#availability")
+    if price and availability and re.search(r"in stock|متوفر", availability.get_text(), re.I):
+        raw = norm(price.get_text(" ", strip=True))
+        amount = re.search(r"\d[\d,]*(?:\.\d+)?", raw)
+        if amount and ("sar" in raw or "ر.س" in raw or "ريال" in raw):
+            # Condition remains unknown unless the page explicitly states it.
+            condition_node = soup.select_one("#condition, #newAccordionRow .a-text-bold")
+            condition = norm(condition_node.get_text(" ", strip=True)) if condition_node else ""
+            result["offers"] = {"@type": "Offer", "price": amount.group().replace(",", ""),
+                                "priceCurrency": "SAR", "availability": "https://schema.org/InStock",
+                                "itemCondition": "NewCondition" if condition in {"new", "جديد"} else ""}
+    return result
+
+
 def parse_page(html, url):
     soup = BeautifulSoup(html, "html.parser")
     nodes = []
@@ -108,7 +154,11 @@ def parse_page(html, url):
         exact = [p for p in products if str(p.get("url", "")).rstrip("/") == url.rstrip("/")]
         products = exact if len(exact) == 1 else []
     if not products:
-        raise ValueError("لم أجد بيانات منتج واحد واضحة؛ قد تكون الصفحة محمية أو تحتاج JavaScript")
+        amazon = amazon_product(soup, url)
+        if amazon:
+            products = [amazon]
+        else:
+            raise ValueError("لم أجد بيانات منتج واحد واضحة؛ قد تكون الصفحة محمية أو تحتاج JavaScript")
     p = products[0]
     brand = p.get("brand", "")
     if isinstance(brand, dict):
@@ -203,6 +253,8 @@ def render(report):
             lines.append(f"| {md(p['store'])} | {p['offer']['price']} | [فتح المنتج]({url}) |")
     else:
         lines.append("لم أجد نتائج قدرت أثبت تطابقها وسعرها وحالتها وتوفرها. هذا لا يعني أنه لا يوجد سعر أرخص.")
+        if not report["source"]["gtins"]:
+            lines.extend(["", "صفحة المصدر لا تعرض باركودًا عالميًا صالحًا؛ تم البحث عن المنتج، لكن الاسم وحده لا يثبت التطابق في هذه النسخة."])
     lines.extend(["", f"فُحصت {report['checked']} صفحة مرشحة. المستبعدة: {len(report['excluded'])}.",
                   "", "المطابقة تعتمد على بيانات المتجر وقد تكون بياناته خاطئة؛ تحقق من الصفحة قبل الشراء."])
     return "\n".join(lines) + "\n"

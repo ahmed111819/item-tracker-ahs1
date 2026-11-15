@@ -27,6 +27,19 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_amazon_without_jsonld_reads_selected_product(self):
+        html = '''<span id="productTitle">Cello Box 50 Black</span>
+        <a id="bylineInfo">Brand: Cello</a>
+        <div id="corePriceDisplay_desktop_feature_div">
+          <span class="a-price"><span class="a-offscreen">SAR 15.78</span></span>
+          <span class="a-price a-text-price"><span class="a-offscreen">SAR 39.00</span></span>
+        </div><div id="availability">In Stock</div>'''
+        p = parse_page(html, "https://www.amazon.sa/dp/B0C6DRSLCG")
+        self.assertEqual(p["title"], "Cello Box 50 Black")
+        self.assertEqual(p["offer"]["price"], "15.78")
+        self.assertEqual(p["gtins"], [])
+        self.assertEqual(p["offer"]["condition"], "")
+
     def test_blocked_store_has_specific_safe_error(self):
         with patch("compare.public_url"), patch("compare.requests.get") as get:
             response = get.return_value.__enter__.return_value
