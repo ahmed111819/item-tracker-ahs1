@@ -18,7 +18,8 @@ from compare import (ComparisonError, clean_brand, match, norm, parse_page, publ
 def blocked(page):
     text = norm(page.locator('body').inner_text(timeout=10000)[:6000])
     return any(s in text for s in ('unusual traffic', 'verify you are human', 'not a robot',
-                                   'enter the characters you see', 'أثبت أنك', 'تحقق من أنك')) or '/sorry/' in page.url
+                                   'enter the characters you see', 'performing security verification',
+                                   'verifies you are not a bot', 'أثبت أنك', 'تحقق من أنك')) or '/sorry/' in page.url
 
 
 def visit(page, url):
@@ -104,7 +105,7 @@ def native_browser_search(page, source, output):
             entry.update(status='read', links=len(found))
             links.extend(found)
         except Exception as error:
-            entry.update(status='unreadable', reason=str(error) if isinstance(error, ComparisonError) else type(error).__name__)
+            entry.update(status='unreadable', reason=str(error)[:1200])
         page.screenshot(path=str(output / f'search-{name}.png'), full_page=False)
         diagnostics.append(entry)
     return list(dict.fromkeys(links)), diagnostics

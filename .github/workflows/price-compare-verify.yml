@@ -1,5 +1,5 @@
 name: Verify live price comparison
-# Verify native storefront search without supplying any paid-service key.
+# Diagnose native store transport failures and security challenges without API keys.
 on:
   push:
     branches: [main]
