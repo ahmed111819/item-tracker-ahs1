@@ -238,6 +238,45 @@ def inspect(url):
         return {"url": url, "reason": "تعذرت قراءة صفحة منتج واضحة"}
 
 
+def read_source(url, key):
+    """Try direct extraction, then the supported Amazon API for a blocked ASIN."""
+    host = (urlparse(url).hostname or "").lower()
+    asin = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?]|$)", url, re.I)
+    is_amazon = host in {"amazon.sa", "www.amazon.sa"} and asin is not None
+    canonical = f"https://www.amazon.sa/dp/{asin.group(1).upper()}" if is_amazon else url
+    try:
+        html, final = fetch(canonical)
+        return parse_page(html, final)
+    except (ValueError, requests.RequestException, OSError, KeyError):
+        if not is_amazon:
+            raise
+    try:
+        r = requests.get("https://serpapi.com/search.json", timeout=75,
+                         params={"engine": "amazon_product", "amazon_domain": "amazon.sa",
+                                 "asin": asin.group(1).upper(), "api_key": key})
+        if r.status_code != 200:
+            raise ComparisonError(f"تعذرت القراءة المباشرة من أمازون، والمسار البديل SerpApi أعاد HTTP {r.status_code}. تحقق من دعم amazon_product في خطتك والرصيد.")
+        data = r.json()
+    except requests.RequestException:
+        raise ComparisonError("تعذرت القراءة المباشرة من أمازون ثم تعذر الاتصال بمسار SerpApi البديل.") from None
+    if data.get("error"):
+        raise ComparisonError("تعذرت القراءة المباشرة من أمازون، وخدمة SerpApi رفضت طلب amazon_product؛ تحقق من الخطة والرصيد.")
+    p = data.get("product_results", {})
+    if not isinstance(p, dict) or p.get("asin", "").upper() != asin.group(1).upper():
+        raise ComparisonError("مسار أمازون البديل لم يُرجع نفس ASIN المطلوب؛ أوقفت المقارنة لتجنب مقارنة نسخة مختلفة.")
+    if not p.get("title"):
+        raise ComparisonError("مسار أمازون البديل لم يُرجع اسم المنتج؛ لم تبدأ المقارنة.")
+    # Only map explicit identity fields. Do not treat ASIN or retailer SKU as a GTIN.
+    brand = p.get("brand", "")
+    if isinstance(brand, dict):
+        brand = brand.get("name", "")
+    identity = {k: p[k] for k in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14") if p.get(k)}
+    return {"title": str(p["title"]), "brand": norm(brand), "mpn": norm(p.get("mpn")),
+            "model": norm(p.get("model")), "gtins": gtins(identity),
+            "attributes": {k: norm(p[k]) for k in ("color", "size", "material", "pattern") if p.get(k)},
+            "offer": None, "url": canonical, "store": "amazon.sa", "extraction": "serpapi_amazon_product"}
+
+
 def md(value):
     return re.sub(r"[\r\n|\[\]<>`*]", " ", str(value))[:300]
 
@@ -274,10 +313,9 @@ def main():
         key = os.environ.get("SERPAPI_API_KEY", "").strip()
         if not key:
             raise ComparisonError("مفتاح البحث غير موجود. أضف SERPAPI_API_KEY في GitHub Secrets أولًا")
-        stage = "فتح رابط المنتج"
-        html, final = fetch(args.url)
-        stage = "استخراج بيانات المنتج"
-        source = parse_page(html, final)
+        stage = "قراءة بيانات المنتج (مباشرة أو عبر المسار البديل)"
+        source = read_source(args.url, key)
+        final = source["url"]
         stage = "البحث عن المتاجر"
         urls = [u for u in search(source, key) if u.rstrip("/") != final.rstrip("/")]
         report = {"source": source, "checked_at": datetime.now(timezone.utc).isoformat(),

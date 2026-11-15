@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from compare import ComparisonError, fetch, main, match, parse_page, public_url, render, search
+from compare import ComparisonError, fetch, main, match, parse_page, public_url, read_source, render, search
 
 
 def product(**updates):
@@ -27,6 +27,17 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_amazon_block_uses_api_and_checks_asin(self):
+        with patch("compare.fetch", side_effect=ComparisonError("blocked")), patch("compare.requests.get") as get:
+            get.return_value.status_code = 200
+            get.return_value.json.return_value = {"product_results": {"asin": "B0C6DRSLCG", "title": "Cello pens", "brand": "Cello"}}
+            p = read_source("https://www.amazon.sa/dp/B0C6DRSLCG?ref=tracking", "fake")
+            self.assertEqual(p["title"], "Cello pens")
+            self.assertEqual(get.call_args.kwargs["params"]["engine"], "amazon_product")
+            get.return_value.json.return_value["product_results"]["asin"] = "B000000000"
+            with self.assertRaises(ComparisonError):
+                read_source("https://www.amazon.sa/dp/B0C6DRSLCG", "fake")
+
     def test_amazon_without_jsonld_reads_selected_product(self):
         html = '''<span id="productTitle">Cello Box 50 Black</span>
         <a id="bylineInfo">Brand: Cello</a>
