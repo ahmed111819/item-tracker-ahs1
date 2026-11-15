@@ -345,21 +345,49 @@ def variant_specs(product):
 
 
 def search(source, key):
-    identity = " ".join([source["brand"], source["mpn"] or source["model"], source["title"][:140]])
+    identity = '"' + norm(source["title"])[:140] + '"'
+    if source["mpn"] or source["model"]:
+        identity += ' "' + (source["mpn"] or source["model"]) + '"'
     query = source["gtins"][0] if source["gtins"] else identity
     if not query.strip():
         query = source["title"][:160]
     links = []
     for language, suffix in (("en", " Saudi Arabia buy"), ("ar", " شراء السعودية")):
         links.extend(search_language(query + suffix, language, key))
-    return list(dict.fromkeys(links))[:20]
+    direct = [u for u in links if not search_wrapper(u)]
+    if not direct or sum(search_wrapper(u) for u in links) > len(links) / 2:
+        # Do not keep retrying Google's opaque redirect links from the same network.
+        for language in ("en", "ar"):
+            try:
+                direct.extend(search_language(query + " Saudi Arabia", language, key, engine="bing"))
+            except ComparisonError:
+                continue
+        # Search known storefronts; never synthesize a product URL from a title.
+        shops = "(site:apple.com/sa-en/shop/product OR site:hnak.com OR site:alephksa.com OR site:extra.com OR site:jarir.com OR site:noon.com OR site:almanea.sa)"
+        try:
+            direct.extend(search_language(query + " " + shops, "en", key, engine="bing"))
+        except ComparisonError:
+            pass
+    clean = [u for u in direct if not search_wrapper(u) and not social_link(u)]
+    return list(dict.fromkeys(clean + links))[:30]
 
 
-def search_language(query, language, key):
+def search_wrapper(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"google.com", "www.google.com", "bing.com", "www.bing.com"}
+
+
+def social_link(url):
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in ("facebook.com", "instagram.com", "youtube.com", "tiktok.com", "x.com"))
+
+
+def search_language(query, language, key, engine="google"):
+    params = {"engine": engine, "q": query + " -site:facebook.com -site:instagram.com -site:youtube.com", "api_key": key}
+    params.update({"gl": "sa", "hl": language, "num": 10} if engine == "google" else {"mkt": language + "-SA"})
     try:
         r = requests.get("https://serpapi.com/search.json", timeout=35,
-                         params={"engine": "google", "q": query,
-                                 "gl": "sa", "hl": language, "num": 10, "api_key": key})
+                         params=params)
         # Never include the prepared URL (which contains the API key) in an error.
         if r.status_code != 200:
             raise ComparisonError(f"خدمة البحث أعادت HTTP {r.status_code}. راجع مفتاح SerpApi والرصيد في حسابك.")

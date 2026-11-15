@@ -27,6 +27,13 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_opaque_google_links_trigger_independent_search(self):
+        from compare import search_language
+        with patch("compare.search_language") as lookup:
+            lookup.side_effect = lambda q, lang, key, **kw: (["https://www.google.com/goto?url=opaque"] if not kw else ["https://shop.example/product"])
+            result = search(parsed(), "fake")
+            self.assertEqual(result[0], "https://shop.example/product")
+            self.assertTrue(any(c.kwargs.get("engine") == "bing" for c in lookup.call_args_list))
     def test_brand_store_label_is_not_brand_name(self):
         self.assertEqual(clean_brand("Visit the Apple Store"), "apple")
         self.assertEqual(clean_brand({"name": "Brand: Cello"}), "cello")

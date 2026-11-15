@@ -1,0 +1,40 @@
+name: Verify live price comparison
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/price-compare-verify.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r price_compare/requirements.txt
+      - run: python -m unittest discover -s price_compare -p 'test_*.py' -v
+      - name: Read live prices for the reported product
+        env:
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+        run: python price_compare/compare.py --url 'https://www.amazon.sa/dp/B0FQFNYGWZ' --output price_compare/reports
+      - name: Require an actual readable matching-name store price
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('price_compare/reports/report.json').read_text())
+          prices = r['matches'] + r.get('pending', [])
+          assert prices, 'No store prices read: comparison is not verified'
+          print('Verified readable store prices:', len(prices))
+          print('Confirmed exact matches:', len(r['matches']))
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-comparison-verification
+          path: price_compare/reports/
+          retention-days: 7
