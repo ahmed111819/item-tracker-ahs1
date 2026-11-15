@@ -40,6 +40,7 @@ from deal_parser_v2 import classify_deals, extract_reference_price as parse_refe
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_MESSAGE_THREAD_ID = int(os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "13094"))
 TELEGRAM_READY = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 if not TELEGRAM_READY:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Actions secrets.")
@@ -958,6 +959,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
                 f"{base_url}/sendPhoto",
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
+                    "message_thread_id": TELEGRAM_MESSAGE_THREAD_ID,
                     "photo": image_url,
                     "caption": caption,
                     "parse_mode": "HTML",
@@ -980,6 +982,7 @@ def send_telegram_alert(title, asin, price, offer, image_url):
             f"{base_url}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
+                "message_thread_id": TELEGRAM_MESSAGE_THREAD_ID,
                 "text": caption,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False,
