@@ -1,5 +1,5 @@
 name: Verify live price comparison
-# Verify real Google browser search and rendered store reading.
+# Verify service-discovered direct URLs with actual Chromium store reading.
 on:
   push:
     branches: [main]
@@ -30,7 +30,8 @@ jobs:
           from pathlib import Path
           r = json.loads(Path('price_compare/reports/report.json').read_text())
           prices = r['matches'] + r.get('pending', [])
-          assert r['browser_search_links'] > 0, 'Google browser search did not return usable links'
+          assert r['search_provider'] == 'service'
+          assert r['discovered_store_links'] > 0, 'No direct store links discovered'
           assert prices, 'No store prices read: comparison is not verified'
           print('Verified readable store prices:', len(prices))
           print('Confirmed exact matches:', len(r['matches']))

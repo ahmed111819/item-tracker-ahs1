@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
 
 from compare import (ComparisonError, clean_brand, match, norm, parse_page, public_url,
-                     read_source, render, same_named_product, social_link)
+                     read_source, render, same_named_product, social_link, search, search_wrapper)
 
 
 def blocked(page):
@@ -73,11 +73,20 @@ def rendered_product(page):
     return parse_page('<script type="application/ld+json">' + json.dumps(p) + '</script>', url)
 
 
-def run(url, output, headed=False):
+def discover_store_links(source, key):
+    if not key:
+        raise ComparisonError('وضع خدمة البحث يتطلب SERPAPI_API_KEY في Secrets')
+    # Never give Chromium the same opaque Google wrapper that failed previously.
+    return list(dict.fromkeys(u for u in search(source, key)
+                              if not search_wrapper(u) and not social_link(u)))[:20]
+
+
+def run(url, output, headed=False, search_provider='service'):
     output.mkdir(parents=True, exist_ok=True)
     report = {'checked_at': datetime.now(timezone.utc).isoformat(), 'source': {},
               'matches': [], 'pending': [], 'excluded': [], 'checked': 0,
-              'mode': 'chromium', 'searches': [], 'browser_search_links': 0}
+              'mode': 'chromium', 'search_provider': search_provider,
+              'searches': [], 'browser_search_links': 0, 'discovered_store_links': 0}
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not headed)
         context = browser.new_context(locale='en-US', viewport={'width': 1440, 'height': 1000})
@@ -109,7 +118,11 @@ def run(url, output, headed=False):
             page.screenshot(path=str(output / 'source.png'), full_page=False)
         report['source'] = source
         links = []
-        for language in ('en', 'ar'):
+        if search_provider == 'service':
+            links = discover_store_links(source, os.environ.get('SERPAPI_API_KEY', ''))
+            report['searches'].append({'method': 'service_and_native_store_search',
+                                      'languages': ['en', 'ar'], 'links': len(links)})
+        for language in (('en', 'ar') if search_provider == 'browser' else ()):
             query = norm(source['title']) + (' Saudi Arabia price' if language == 'en' else ' سعر السعودية')
             entry = {'language': language, 'query': query}
             try:
@@ -122,7 +135,8 @@ def run(url, output, headed=False):
             page.screenshot(path=str(output / f'google-{language}.png'), full_page=False)
             report['searches'].append(entry)
         links = list(dict.fromkeys(links))[:20]
-        report['browser_search_links'] = len(links)
+        report['browser_search_links'] = len(links) if search_provider == 'browser' else 0
+        report['discovered_store_links'] = len(links)
         seen = {source['url'].rstrip('/')}
         for index, link in enumerate(links):
             report['checked'] += 1
@@ -151,15 +165,16 @@ def run(url, output, headed=False):
     for key in ('matches', 'pending'):
         report[key].sort(key=lambda p: Decimal(p['offer']['price']))
     text = render(report)
-    if not report['browser_search_links']:
-        text += '\nلم يتمكن المتصفح من قراءة روابط نتائج Google. راجع صور البحث؛ هذا ليس إثباتًا لعدم توفر المنتج.\n'
+    text += f"\nمسار البحث: {search_provider}. روابط متاجر مباشرة: {len(links)}. قراءة الصفحات: Chromium.\n"
+    if not report['discovered_store_links']:
+        text += '\nلم يتم اكتشاف روابط متاجر قابلة للفحص؛ هذا ليس إثباتًا لعدم توفر المنتج.\n'
     (output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     (output / 'report.md').write_text(text, encoding='utf-8')
     print(text)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
             f.write(text)
-    return 0 if report['browser_search_links'] and (report['matches'] or report['pending']) else 2
+    return 0 if report['discovered_store_links'] and (report['matches'] or report['pending']) else 2
 
 
 if __name__ == '__main__':
@@ -167,5 +182,6 @@ if __name__ == '__main__':
     parser.add_argument('--url', default=os.environ.get('PRODUCT_URL'), required=not bool(os.environ.get('PRODUCT_URL')))
     parser.add_argument('--output', type=Path, default=Path('reports'))
     parser.add_argument('--headed', action='store_true')
+    parser.add_argument('--search-provider', choices=['service', 'browser'], default='service')
     args = parser.parse_args()
-    raise SystemExit(run(args.url, args.output, args.headed))
+    raise SystemExit(run(args.url, args.output, args.headed, args.search_provider))
