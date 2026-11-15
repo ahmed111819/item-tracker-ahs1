@@ -191,33 +191,118 @@ def parse_page(html, url):
 
 
 def match(source, candidate):
-    # Family/model matches alone do not prove color, capacity, region or pack quantity.
-    if not set(source["gtins"]) & set(candidate["gtins"]):
-        return False, "لا يوجد باركود عالمي متطابق؛ الاسم أو الموديل وحده لا يكفي"
+    shared_gtin = bool(set(source["gtins"]) & set(candidate["gtins"]))
+    if source["gtins"] and candidate["gtins"] and not shared_gtin:
+        return False, "اختلاف الباركود العالمي"
     if source["brand"] and candidate["brand"] and source["brand"] != candidate["brand"]:
         return False, "اختلاف الماركة"
     for k in ("mpn", "model"):
         if source[k] and candidate[k] and source[k] != candidate[k]:
             return False, "اختلاف رقم الشركة أو الموديل"
-    if source["attributes"] != candidate["attributes"]:
+    if any(k in candidate["attributes"] and norm(v) != norm(candidate["attributes"][k])
+           for k, v in source["attributes"].items() if k not in {"color", "size"}):
         return False, "المواصفات مختلفة أو ناقصة"
+    sa, ca = variant_specs(source), variant_specs(candidate)
+    for key in sa.keys() | ca.keys():
+        if key in sa and key in ca and sa[key] != ca[key]:
+            return False, f"اختلاف مواصفات النسخة: {key}"
+        if not shared_gtin and sa.get(key) != ca.get(key):
+            return False, f"مواصفات ناقصة لتأكيد نفس النسخة: {key}"
+    if not shared_gtin:
+        brand = source["brand"]
+        candidate_brand = candidate["brand"] or (brand if contains(candidate["title"], brand) else "")
+        ids = [source[k] for k in ("mpn", "model") if valid_model(source[k])]
+        if not brand or candidate_brand != brand or not ids:
+            return False, "لا يوجد باركود متطابق أو ماركة ورقم موديل كافيان"
+        if not any(any(model_key(i) == model_key(candidate[k]) for k in ("mpn", "model") if candidate[k])
+                   or contains(candidate["title"], i) for i in ids):
+            return False, "رقم الموديل الكامل غير موجود في النتيجة"
+        if source["attributes"].get("material") != candidate["attributes"].get("material"):
+            return False, "الخامة مختلفة أو ناقصة"
+        if source["attributes"].get("pattern") != candidate["attributes"].get("pattern"):
+            return False, "النقشة مختلفة أو ناقصة"
     a, b = source["offer"], candidate["offer"]
-    if not a or not b:
+    if not b:
         return False, "السعر بالريال أو التوفر أو العرض المحدد غير مؤكد"
-    if not a["condition"] or a["condition"] != b["condition"]:
+    if a and a["condition"] and a["condition"] != b["condition"]:
         return False, "حالة المنتج مختلفة أو غير محددة"
-    return True, "باركود عالمي متطابق ومواصفات وحالة متوافقة في الصفحة"
+    if not b["condition"]:
+        return False, "حالة المنتج في المتجر غير محددة"
+    if not a or not a["condition"]:
+        if b["condition"] != "NewCondition" or re.search(r"\b(used|renewed|refurbished)\b|مستعمل|مجدد", norm(source["title"])):
+            return False, "لا يمكن تأكيد توافق حالة المنتج"
+    return True, "باركود متطابق ومواصفات متوافقة" if shared_gtin else "ماركة ورقم موديل كامل ومواصفات نسخة متطابقة"
+
+
+def model_key(value):
+    return re.sub(r"[^a-z0-9]", "", norm(value))
+
+
+def valid_model(value):
+    key = model_key(value)
+    return len(key) >= 5 and bool(re.search(r"[a-z]", key)) and bool(re.search(r"\d", key))
+
+
+def contains(text, value):
+    return bool(value and re.search(r"(?<!\w)" + re.escape(norm(value)) + r"(?!\w)", norm(text)))
+
+
+def variant_specs(product):
+    text = norm(product["title"] + " " + " ".join(str(v) for v in product["attributes"].values()))
+    result = {}
+    colors = {"black": ["black", "أسود", "اسود"], "white": ["white", "أبيض", "ابيض"],
+              "blue": ["blue", "أزرق", "ازرق"], "red": ["red", "أحمر", "احمر"],
+              "green": ["green", "أخضر", "اخضر"], "silver": ["silver", "فضي"],
+              "gold": ["gold", "ذهبي"], "grey": ["grey", "gray", "رمادي"]}
+    found = {key for key, words in colors.items() if any(contains(text, word) for word in words)}
+    raw_color = norm(product["attributes"].get("color"))
+    if found:
+        result["color"] = tuple(sorted(found))
+    elif raw_color:
+        result["color"] = (raw_color,)
+    packs = set()
+    for pattern in (r"\b(?:pack|box|set)\s*(?:of\s*)?(\d+)\b",
+                    r"\b(\d+)\s*(?:pcs?|pieces?|count|ct|pack)\b",
+                    r"(?:عبوة|علبة|طقم)\s*(?:من\s*)?(\d+)", r"(\d+)\s*(?:قطعة|قطع|حبة|حبات|قلم)"):
+        packs.update(str(int(n)) for n in re.findall(pattern, text))
+    if packs:
+        result["pack"] = tuple(sorted(packs))
+    multipacks = re.findall(r"\b(\d+)\s*[x×]\s*(\d+)\s*(?:pcs?|pieces?|count|ct)\b", text)
+    if multipacks:
+        result["multipack"] = tuple(sorted(f"{int(a)}x{int(b)}" for a, b in multipacks))
+    # Preserve capacities and dimensions; normalize equivalent volume/storage units.
+    units = {"gb": ("storage", 1), "جيجابايت": ("storage", 1), "tb": ("storage", 1000),
+             "ml": ("volume", 1), "مل": ("volume", 1), "l": ("volume", 1000), "لتر": ("volume", 1000),
+             "mm": ("length", 1), "مم": ("length", 1), "cm": ("length", 10),
+             "g": ("weight", 1), "kg": ("weight", 1000), "inch": ("inch", 1), "inches": ("inch", 1),
+             "v": ("voltage", 1), "volt": ("voltage", 1), "w": ("power", 1)}
+    for amount, unit in re.findall(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(gb|tb|ml|mm|cm|kg|inches|inch|volt|v|w|g|l|جيجابايت|مل|مم|لتر)(?!\w)", text):
+        category, factor = units[unit]
+        result.setdefault(category, set()).add(str((Decimal(amount) * factor).normalize()))
+    for k, value in list(result.items()):
+        if isinstance(value, set):
+            result[k] = tuple(sorted(value))
+    if product["attributes"].get("size") and not any(k in result for k in ("length", "volume", "weight", "storage", "inch")):
+        result["size"] = norm(product["attributes"]["size"])
+    return result
 
 
 def search(source, key):
-    identity = " ".join([source["brand"], source["mpn"] or source["model"]])
+    identity = " ".join([source["brand"], source["mpn"] or source["model"], source["title"][:140]])
     query = source["gtins"][0] if source["gtins"] else identity
     if not query.strip():
         query = source["title"][:160]
+    links = []
+    for language, suffix in (("en", " Saudi Arabia buy"), ("ar", " شراء السعودية")):
+        links.extend(search_language(query + suffix, language, key))
+    return list(dict.fromkeys(links))[:20]
+
+
+def search_language(query, language, key):
     try:
         r = requests.get("https://serpapi.com/search.json", timeout=35,
-                         params={"engine": "google", "q": query + " شراء السعودية",
-                                 "gl": "sa", "hl": "ar", "num": 10, "api_key": key})
+                         params={"engine": "google", "q": query,
+                                 "gl": "sa", "hl": language, "num": 10, "api_key": key})
         # Never include the prepared URL (which contains the API key) in an error.
         if r.status_code != 200:
             raise ComparisonError(f"خدمة البحث أعادت HTTP {r.status_code}. راجع مفتاح SerpApi والرصيد في حسابك.")
@@ -271,8 +356,21 @@ def read_source(url, key):
     if isinstance(brand, dict):
         brand = brand.get("name", "")
     identity = {k: p[k] for k in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14") if p.get(k)}
-    return {"title": str(p["title"]), "brand": norm(brand), "mpn": norm(p.get("mpn")),
-            "model": norm(p.get("model")), "gtins": gtins(identity),
+    fields = {"model": p.get("model", ""), "mpn": p.get("mpn", "")}
+    # Product details only; recommendations can contain unrelated identifiers.
+    aliases = {"item_model_number": "model", "model_number": "model", "model": "model",
+               "manufacturer_part_number": "mpn", "mpn": "mpn", "upc": "gtin12", "ean": "gtin13"}
+    for section in ("product_details", "technical_details", "specifications"):
+        for node in walk(p.get(section, {})):
+            for label, value in node.items():
+                name = aliases.get(norm(label).replace(" ", "_"))
+                if name and isinstance(value, (str, int)):
+                    if name.startswith("gtin"):
+                        identity[name] = value
+                    elif not fields[name]:
+                        fields[name] = value
+    return {"title": str(p["title"]), "brand": norm(brand), "mpn": norm(fields["mpn"]),
+            "model": norm(fields["model"]), "gtins": gtins(identity),
             "attributes": {k: norm(p[k]) for k in ("color", "size", "material", "pattern") if p.get(k)},
             "offer": None, "url": canonical, "store": "amazon.sa", "extraction": "serpapi_amazon_product"}
 
@@ -286,14 +384,14 @@ def render(report):
              f"وقت الفحص UTC: {report['checked_at']}", "",
              "الأسعار من صفحات المتاجر، بالريال السعودي، بدون الشحن.", ""]
     if report["matches"]:
-        lines.extend(["| المتجر | السعر | رابط المنتج |", "|---|---:|---|"])
+        lines.extend(["| المتجر | السعر | أساس المطابقة | رابط المنتج |", "|---|---:|---|---|"])
         for p in report["matches"]:
             url = p["url"].replace("(", "%28").replace(")", "%29").replace(" ", "%20")
-            lines.append(f"| {md(p['store'])} | {p['offer']['price']} | [فتح المنتج]({url}) |")
+            lines.append(f"| {md(p['store'])} | {p['offer']['price']} | {md(p.get('match_reason', ''))} | [فتح المنتج]({url}) |")
     else:
         lines.append("لم أجد نتائج قدرت أثبت تطابقها وسعرها وحالتها وتوفرها. هذا لا يعني أنه لا يوجد سعر أرخص.")
         if not report["source"]["gtins"]:
-            lines.extend(["", "صفحة المصدر لا تعرض باركودًا عالميًا صالحًا؛ تم البحث عن المنتج، لكن الاسم وحده لا يثبت التطابق في هذه النسخة."])
+            lines.extend(["", "لا يوجد باركود صالح بالمصدر؛ جرت محاولة المطابقة بالماركة ورقم الموديل الكامل ومواصفات النسخة. الاسم وحده لا يكفي."])
     lines.extend(["", f"فُحصت {report['checked']} صفحة مرشحة. المستبعدة: {len(report['excluded'])}.",
                   "", "المطابقة تعتمد على بيانات المتجر وقد تكون بياناته خاطئة؛ تحقق من الصفحة قبل الشراء."])
     return "\n".join(lines) + "\n"
@@ -332,6 +430,7 @@ def main():
                 seen.add(candidate["url"])
                 ok, reason = match(source, candidate)
                 if ok:
+                    candidate["match_reason"] = reason
                     report["matches"].append(candidate)
                 else:
                     report["excluded"].append({"url": candidate["url"], "reason": reason})

@@ -65,7 +65,36 @@ class MatchingTests(unittest.TestCase):
         self.assertTrue(match(parsed(), parsed())[0])
 
     def test_similar_name_not_enough(self):
-        self.assertFalse(match(parsed(), parsed(gtin13=""))[0])
+        self.assertFalse(match(parsed(gtin13="", mpn=""), parsed(gtin13="", mpn=""))[0])
+
+    def test_model_brand_and_variants_match_without_gtin(self):
+        self.assertTrue(match(parsed(gtin13=""), parsed(gtin13=""))[0])
+
+    def test_source_price_not_required(self):
+        source = parsed(gtin13="")
+        source["offer"] = None
+        self.assertTrue(match(source, parsed(gtin13=""))[0])
+
+    def test_pack_and_tip_size_conflicts(self):
+        source = parsed(gtin13="", name="Example HP-100-B Black 0.7mm Box of 50Pc")
+        for title in ("Example HP-100-B Black 0.7mm Box of 10Pc", "Example HP-100-B Black 0.5mm Box of 50Pc",
+                      "Example HP-100-B Black 0.7mm"):
+            self.assertFalse(match(source, parsed(gtin13="", name=title))[0])
+
+    def test_arabic_english_variant_equivalence(self):
+        a = parsed(gtin13="", name="Example Black 0.7mm Box of 50Pc")
+        b = parsed(gtin13="", name="Example أسود ٠٫٧ مم علبة ٥٠ قلم", color="أسود")
+        # Use a decimal point recognized in both Arabic and English.
+        b["title"] = "Example أسود 0.7 مم علبة ٥٠ قلم"
+        self.assertTrue(match(a, b)[0])
+
+    def test_bilingual_search_deduplicates(self):
+        with patch("compare.requests.get") as get:
+            get.return_value.status_code = 200
+            get.return_value.json.return_value = {"organic_results": [{"link": "https://shop.example/p"}]}
+            self.assertEqual(search(parsed(), "fake"), ["https://shop.example/p"])
+            self.assertEqual([c.kwargs["params"]["hl"] for c in get.call_args_list], ["en", "ar"])
+            self.assertIn("Saudi Arabia", get.call_args_list[0].kwargs["params"]["q"])
 
     def test_invalid_barcode_is_not_evidence(self):
         self.assertEqual(parsed(gtin13="4006381333932")["gtins"], [])
@@ -74,7 +103,7 @@ class MatchingTests(unittest.TestCase):
         self.assertFalse(match(parsed(), parsed(color="White"))[0])
 
     def test_missing_variant_rejected(self):
-        self.assertFalse(match(parsed(), parsed(color=""))[0])
+        self.assertFalse(match(parsed(gtin13=""), parsed(gtin13="", color="", name="Example headphones"))[0])
 
     def test_refurbished_rejected(self):
         candidate = parsed()
