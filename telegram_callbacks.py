@@ -35,6 +35,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 STOP = False
 ACKED_CALLBACKS: set[str] = set()
+HTTP = requests.Session()
 
 
 def stop_listener(_signum: int, _frame: Any) -> None:
@@ -44,7 +45,7 @@ def stop_listener(_signum: int, _frame: Any) -> None:
 
 def telegram_call(method: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
     try:
-        response = requests.post(f"{API}/{method}", json=payload, timeout=timeout)
+        response = HTTP.post(f"{API}/{method}", json=payload, timeout=timeout)
         result = response.json()
     except Exception as exc:
         raise RuntimeError(f"Telegram {method} request failed ({type(exc).__name__}).") from None
@@ -68,7 +69,7 @@ def answer(callback_id: str, text: str, show_alert: bool = False) -> None:
 def price_from_message(message: dict[str, Any]) -> float | None:
     text = str(message.get("caption") or message.get("text") or "")
     patterns = (
-        r"السعر الحالي\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
+        r"السعر الحالي\s*:\s*(?:SAR\s*)?([\d,]+(?:\.\d{1,2})?)(?:\s*(?:SAR|ريال))?",
         r"\bNow\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
         r"\bListed price\s*:\s*SAR\s*([\d,]+(?:\.\d{1,2})?)",
     )

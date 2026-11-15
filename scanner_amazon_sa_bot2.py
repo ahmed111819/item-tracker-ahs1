@@ -847,103 +847,58 @@ async def extract_image_url(card):
 
 def build_telegram_caption(title, asin, price, offer):
     product_url = f"https://www.amazon.sa/dp/{asin}"
+    safe_title = html.escape(str(title or "اسم المنتج غير متوفر")[:200])
+    product_line = f"📝 <b>{safe_title}</b>\n"
+    price_line = (
+        f"💰 السعر الحالي: {price:.2f} SAR\n"
+        if price is not None and price > 0
+        else "💰 السعر الحالي: غير متوفر\n"
+    )
+    offer_type = str(offer.get("type") or "")
+    discount = offer.get("discount_percent")
 
-    if offer.get("type") == "product_block_release":
+    if offer_type == "product_block_release":
+        caption = "📉 <b>انفك الحجب المؤقت</b>\n" + product_line + price_line
+    elif offer_type == "price_drop_80":
         caption = (
-            "📉 <b>انفك الحجب المؤقت: وصل السعر إلى حد الانخفاض</b>\n\n"
-            f"<b>{html.escape(title[:300])}</b>\n"
-            f"السعر وقت الحجب: SAR {offer['blocked_price']:.2f}\n"
-            f"حد فك الحجب: SAR {offer['resume_price']:.2f}\n"
-            f"السعر الحالي: SAR {price:.2f}\n\n"
+            f"🎉 <b>خصم جديد {MIN_PRICE_DROP_PERCENT:.0f}% وأكثر</b>\n"
+            + product_line
+            + price_line
         )
-    elif offer.get("type") == "price_drop_80":
-        caption = (
-            "🚨 <b>تخفيض مقارنة بالسعر المشطوب (وليس كوبونًا)</b>\n\n"
-            f"<b>{html.escape(title[:300])}</b>\n"
-        )
-
         reference_price = offer.get("reference_price")
         if reference_price is not None:
-            caption += f"Was: SAR {reference_price:.2f}\n"
-
-        caption += f"Now: SAR {price:.2f}\n"
-
-        if offer.get("saving") is not None:
-            caption += f"Price saving: SAR {offer['saving']:.2f}\n"
-
-        caption += (
-            f"Price drop: {offer['discount_percent']:.2f}%\n"
-            f"Source: {html.escape(offer.get('source', ''))}\n\n"
-        )
-
-    elif offer.get("type") == "second_item_promotion":
+            caption += f"🏷️ السعر السابق المعروض: {reference_price:.2f} SAR\n"
+        caption += f"🏷️ خصم Amazon الحالي: {float(discount or 0):.2f}%\n"
+    elif offer_type in {"you_pay_coupon", "cash_coupon", "percent_coupon"}:
         caption = (
-            "🏷️ <b>خصم مشروط على القطعة الثانية</b>\n\n"
-            f"<b>{html.escape(title[:300])}</b>\n"
+            f"🎟️ <b>كوبون جديد {MIN_DISCOUNT_PERCENT:.0f}% وأكثر</b>\n"
+            + product_line
+            + price_line
+            + f"🏷️ نسبة الكوبون: {float(discount or 0):.2f}%\n"
         )
-        if price and price > 0:
-            caption += f"سعر القطعة: SAR {price:.2f}\n"
-        caption += f"الخصم على القطعة الثانية: {offer['discount_percent']:.2f}%\n"
-        if offer.get("pay_price") is not None:
-            caption += f"إجمالي القطعتين التقريبي: SAR {offer['pay_price']:.2f}\n"
-        if offer.get("saving") is not None:
-            caption += f"التوفير التقريبي: SAR {offer['saving']:.2f}\n"
-        caption += (
-            f"متوسط الخصم على إجمالي القطعتين: "
-            f"{offer['effective_basket_discount_percent']:.2f}%\n\n"
+    elif offer_type == "second_item_promotion":
+        caption = (
+            f"🎁 <b>وفر {float(discount or 0):.2f}% على المنتج الثاني</b>\n"
+            + product_line
+            + price_line
         )
+    elif offer_type == "bundle_offer":
+        caption = "🎁 <b>عرض باقة</b>\n" + product_line + price_line
+        quantity = int(offer.get("quantity") or 0)
+        bundle_price = offer.get("pay_price")
+        if quantity and bundle_price is not None:
+            caption += f"🛒 {quantity} قطع بـ{float(bundle_price):.2f} SAR\n"
+        if discount is not None:
+            caption += f"🏷️ نسبة الخصم على الباقة: {float(discount):.2f}%\n"
     else:
         description = html.escape(
-            offer.get("description") or offer.get("type", "Offer")
+            str(offer.get("description") or "عرض ترويجي")[:120]
         )
+        caption = f"🎁 <b>{description}</b>\n" + product_line + price_line
+        if discount is not None:
+            caption += f"🏷️ نسبة الخصم: {float(discount):.2f}%\n"
 
-        offer_type = offer.get("type", "")
-        is_coupon_caption = "coupon" in offer_type
-        alert_heading = "🎟️ <b>كوبون</b>" if is_coupon_caption else "🏷️ <b>عرض ترويجي</b>"
-        caption = (
-            f"{alert_heading}\n\n"
-            f"<b>{html.escape(title[:300])}</b>\n"
-        )
-        if price and price > 0:
-            caption += f"Current price: SAR {price:.2f}\n"
-        else:
-            caption += "Current price: unavailable\n"
-        caption += f"Offer: {description}\n"
-
-        if offer.get("type") == "bundle_offer":
-            caption += (
-                f"Bundle quantity: {offer['quantity']}\n"
-                f"Bundle price: SAR {offer['pay_price']:.2f}\n"
-                f"Estimated total saving: SAR {offer['saving']:.2f}\n"
-                f"Discount: {offer['discount_percent']:.2f}%\n"
-            )
-        else:
-            if offer.get("saving") is not None:
-                caption += f"Saving: SAR {offer['saving']:.2f}\n"
-
-            if offer.get("pay_price") is not None:
-                caption += f"Pay price: SAR {offer['pay_price']:.2f}\n"
-
-            if offer.get("discount_percent") is not None:
-                caption += (
-                    f"Discount: "
-                    f"{offer['discount_percent']:.2f}%\n"
-                )
-
-            if offer.get("quantity_condition"):
-                caption += "شرط العرض: شراء كمية محددة كما هو موضح في وصف أمازون.\n"
-
-            if offer.get("quantity", 1) > 1:
-                caption += (
-                    f"Minimum quantity: {offer['quantity']}\n"
-                )
-
-        caption += "\n"
-
-    caption += (
-        f'<a href="{html.escape(product_url, quote=True)}">'
-        "Open product</a>"
-    )
+    caption += f'\n🔗 <a href="{html.escape(product_url, quote=True)}">رابط المنتج</a>'
     return caption
 
 
