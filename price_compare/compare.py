@@ -11,7 +11,7 @@ import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -351,6 +351,7 @@ def search(source, key):
     query = source["gtins"][0] if source["gtins"] else identity
     if not query.strip():
         query = source["title"][:160]
+    native = native_store_search(source)
     links = []
     for language, suffix in (("en", " Saudi Arabia buy"), ("ar", " شراء السعودية")):
         links.extend(search_language(query + suffix, language, key))
@@ -374,7 +375,26 @@ def search(source, key):
             except ComparisonError as error:
                 print("Fallback search:", str(error))
     clean = [u for u in direct if not search_wrapper(u) and not social_link(u)]
-    return list(dict.fromkeys(clean + links))[:30]
+    return list(dict.fromkeys(native + clean + links))[:30]
+
+
+def native_store_search(source):
+    # Use an actual store search and links returned by it, never a guessed product slug.
+    if clean_brand(source["brand"]) != "apple":
+        return []
+    query = re.sub(r"^apple\s+", "", norm(source["title"]))
+    try:
+        html, final = fetch("https://www.apple.com/sa-en/shop/search/" + quote(query.replace(" ", "-"), safe="-"))
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for anchor in soup.find_all("a", href=True):
+            link = urljoin(final, anchor["href"])
+            parsed = urlparse(link)
+            if parsed.hostname == "www.apple.com" and parsed.path.startswith("/sa-en/shop/product/"):
+                links.append(parsed._replace(query="", fragment="").geturl())
+        return list(dict.fromkeys(links))[:5]
+    except (ValueError, requests.RequestException, OSError):
+        return []
 
 
 def search_wrapper(url):

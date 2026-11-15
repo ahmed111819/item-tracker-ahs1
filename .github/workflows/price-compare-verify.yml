@@ -1,5 +1,5 @@
 name: Verify live price comparison
-# Exercise direct storefront discovery as well as broad search.
+# Exercise native storefront search and independent web discovery.
 on:
   push:
     branches: [main]

@@ -27,6 +27,11 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_native_store_search_discovers_not_invents_product_links(self):
+        from compare import native_store_search
+        source = parsed(brand="Apple", name="Apple iPhone Air MagSafe Battery")
+        with patch("compare.fetch", return_value=('<a href="/sa-en/shop/product/actual/item?fnode=tracking">Battery</a><a href="https://evil.example/sa-en/shop/product/x">x</a>', 'https://www.apple.com/sa-en/search/query')):
+            self.assertEqual(native_store_search(source), ["https://www.apple.com/sa-en/shop/product/actual/item"])
     def test_opaque_google_links_trigger_independent_search(self):
         from compare import search_language
         with patch("compare.search_language") as lookup:
