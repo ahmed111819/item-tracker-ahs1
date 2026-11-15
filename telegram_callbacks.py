@@ -31,12 +31,10 @@ from telegram_product_buttons import edit_product_keyboard
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-MESSAGE_THREAD_ID = int(os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "13094"))
 API = f"https://api.telegram.org/bot{TOKEN}"
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 STOP = False
 ACKED_CALLBACKS: set[str] = set()
-NOTIFIED_FAILED_CALLBACKS: set[str] = set()
 
 
 def stop_listener(_signum: int, _frame: Any) -> None:
@@ -97,24 +95,6 @@ def edit_markup(message: dict[str, Any], asin: str, state: str, price: float | N
     return ok
 
 
-def notify_chat(message: dict[str, Any], text: str) -> None:
-    chat = message.get("chat") or {}
-    if chat.get("id") is None:
-        return
-    payload = {
-        "chat_id": str(chat["id"]),
-        "message_thread_id": MESSAGE_THREAD_ID,
-        "text": text,
-        "disable_notification": True,
-    }
-    if message.get("message_id") is not None:
-        payload["reply_to_message_id"] = int(message["message_id"])
-    try:
-        telegram_call("sendMessage", payload)
-    except Exception as exc:
-        print(f"Telegram confirmation message failed ({type(exc).__name__}).")
-
-
 def handle_callback(callback: dict[str, Any]) -> None:
     callback_id = callback.get("id")
     message = callback.get("message") or {}
@@ -165,7 +145,7 @@ def handle_callback(callback: dict[str, Any]) -> None:
             # Final fallback for older messages that don't contain a parseable price.
             price = get_latest_known_product_price(asin)
         if price is None:
-            notify_chat(message, "ما عندي سعر محفوظ لهذا التنبيه القديم. التنبيهات الجديدة تسجل السعر داخل الزر.")
+            print(f"Cannot block {asin}: no price in alert or saved product state.")
             return
         block = create_or_get_product_block(
             asin=asin,
@@ -176,9 +156,7 @@ def handle_callback(callback: dict[str, Any]) -> None:
         )
         active_price = float(block["blocked_price"])
         if block["status"] == "active":
-            updated = edit_markup(message, asin, "blocked", active_price)
-            if not updated:
-                notify_chat(message, "تم حفظ الحجب، لكن تعذر تحديث أزرار الرسالة.")
+            edit_markup(message, asin, "blocked", active_price)
             print(f"Temporary product block created/confirmed for {asin}.")
         else:
             edit_markup(message, asin, "open", active_price)
@@ -261,18 +239,8 @@ def main() -> None:
                     if isinstance(callback, dict):
                         callback_id = str(callback.get("id") or "")
                         ACKED_CALLBACKS.discard(callback_id)
-                        NOTIFIED_FAILED_CALLBACKS.discard(callback_id)
                 except Exception as exc:
                     print(f"Could not apply Telegram callback/update ({type(exc).__name__}); keeping it queued for retry.")
-                    callback = update.get("callback_query")
-                    if isinstance(callback, dict):
-                        callback_id = str(callback.get("id") or "")
-                        if callback_id and callback_id not in NOTIFIED_FAILED_CALLBACKS:
-                            notify_chat(
-                                callback.get("message") or {},
-                                "تعذر الاتصال بقاعدة البيانات مؤقتًا؛ سأعيد محاولة الحجب تلقائيًا.",
-                            )
-                            NOTIFIED_FAILED_CALLBACKS.add(callback_id)
                     time.sleep(3)
                     break
         except Exception as exc:
