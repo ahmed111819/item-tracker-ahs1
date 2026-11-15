@@ -31,6 +31,7 @@ from telegram_product_buttons import edit_product_keyboard
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+MESSAGE_THREAD_ID = int(os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "13094"))
 API = f"https://api.telegram.org/bot{TOKEN}"
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 STOP = False
@@ -102,6 +103,7 @@ def notify_chat(message: dict[str, Any], text: str) -> None:
         return
     payload = {
         "chat_id": str(chat["id"]),
+        "message_thread_id": MESSAGE_THREAD_ID,
         "text": text,
         "disable_notification": True,
     }
@@ -175,16 +177,11 @@ def handle_callback(callback: dict[str, Any]) -> None:
         active_price = float(block["blocked_price"])
         if block["status"] == "active":
             updated = edit_markup(message, asin, "blocked", active_price)
-            notify_chat(
-                message,
-                f"تم الحجب عند {active_price:.2f} ريال. "
-                f"ينفك تلقائيًا عند {float(block['resume_price']):.2f} ريال أو أقل."
-                + ("" if updated else " تعذر تحديث أزرار الرسالة؛ الحجب محفوظ ويمكن المحاولة مجددًا."),
-            )
+            if not updated:
+                notify_chat(message, "تم حفظ الحجب، لكن تعذر تحديث أزرار الرسالة.")
             print(f"Temporary product block created/confirmed for {asin}.")
         else:
             edit_markup(message, asin, "open", active_price)
-            notify_chat(message, "الحجب السابق انتهى تلقائيًا.")
         return
 
     block = get_product_block(asin)
@@ -196,23 +193,15 @@ def handle_callback(callback: dict[str, Any]) -> None:
     if action == "edit":
         if block is None:
             edit_markup(message, asin, "open", remembered_price)
-            notify_chat(message, "هذا المنتج غير محجوب.")
         elif block["status"] == "active":
             edit_markup(message, asin, "edit", remembered_price)
-            notify_chat(message, "اختر «فك الحجب» لإلغاء الحجب يدويًا.")
         else:
             edit_markup(message, asin, "blocked", remembered_price)
-            notify_chat(message, "يجري فك الحجب تلقائيًا بعد بلوغ حد السعر.")
         return
 
     if action == "unblock":
         removed = remove_product_block(asin)
         edit_markup(message, asin, "open", remembered_price)
-        notify_chat(
-            message,
-            "تم فك الحجب، ولن أرسل تنبيهًا قديمًا بأثر رجعي."
-            if removed else "هذا المنتج غير محجوب.",
-        )
         if removed:
             print(f"Temporary product block manually removed for {asin}.")
         return
