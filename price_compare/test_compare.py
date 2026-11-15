@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from compare import main, match, parse_page, public_url, render, search
+from compare import ComparisonError, fetch, main, match, parse_page, public_url, render, search
 
 
 def product(**updates):
@@ -27,6 +27,16 @@ def parsed(**updates):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_blocked_store_has_specific_safe_error(self):
+        with patch("compare.public_url"), patch("compare.requests.get") as get:
+            response = get.return_value.__enter__.return_value
+            response.is_redirect = False
+            response.status_code = 403
+            with self.assertRaises(ComparisonError) as error:
+                fetch("https://store.example/product?private=do-not-log")
+            self.assertIn("403", str(error.exception))
+            self.assertNotIn("do-not-log", str(error.exception))
+
     def test_same_gtin_matches(self):
         self.assertTrue(match(parsed(), parsed())[0])
 

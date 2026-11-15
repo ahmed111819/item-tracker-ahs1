@@ -19,6 +19,10 @@ from bs4 import BeautifulSoup
 MAX_BYTES = 4_000_000
 
 
+class ComparisonError(ValueError):
+    """A deliberately safe, user-facing diagnostic with no request credentials."""
+
+
 def norm(value):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or "")).casefold()).strip()
 
@@ -44,7 +48,10 @@ def fetch(url):
             if r.is_redirect:
                 url = urljoin(url, r.headers["Location"])
                 continue
-            r.raise_for_status()
+            if r.status_code in {403, 429}:
+                raise ComparisonError(f"المتجر رفض القراءة الآلية (HTTP {r.status_code}). لم يتم الوصول إلى مرحلة مقارنة الأسعار. جرّب رابط نفس المنتج من متجر آخر؛ إعادة التشغيل وحدها قد لا تحل الحظر.")
+            if r.status_code >= 400:
+                raise ComparisonError(f"تعذر فتح صفحة المنتج (HTTP {r.status_code}). تحقق أن الرابط يعمل وأن المنتج لم يُحذف.")
             if "html" not in r.headers.get("Content-Type", "").lower():
                 raise ValueError("الصفحة ليست HTML")
             data = bytearray()
@@ -163,12 +170,12 @@ def search(source, key):
                                  "gl": "sa", "hl": "ar", "num": 10, "api_key": key})
         # Never include the prepared URL (which contains the API key) in an error.
         if r.status_code != 200:
-            raise ValueError(f"خدمة البحث أعادت HTTP {r.status_code}")
+            raise ComparisonError(f"خدمة البحث أعادت HTTP {r.status_code}. راجع مفتاح SerpApi والرصيد في حسابك.")
         data = r.json()
     except requests.RequestException:
-        raise ValueError("تعذر الاتصال بخدمة البحث") from None
+        raise ComparisonError("تعذر الاتصال بخدمة البحث؛ حاول لاحقًا") from None
     if data.get("error"):
-        raise ValueError("رفضت خدمة البحث الطلب؛ راجع المفتاح والرصيد")
+        raise ComparisonError("رفضت خدمة البحث الطلب؛ راجع المفتاح والرصيد")
     return list(dict.fromkeys(x["link"] for x in data.get("organic_results", [])
                              if isinstance(x.get("link"), str)))[:10]
 
@@ -208,14 +215,18 @@ def main():
     args = ap.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
+    stage = "الإعداد"
     try:
         if not args.url:
-            raise ValueError("أدخل رابط المنتج")
+            raise ComparisonError("أدخل رابط المنتج في خانة product_url")
         key = os.environ.get("SERPAPI_API_KEY", "").strip()
         if not key:
-            raise ValueError("أضف SERPAPI_API_KEY في GitHub Secrets أولًا")
+            raise ComparisonError("مفتاح البحث غير موجود. أضف SERPAPI_API_KEY في GitHub Secrets أولًا")
+        stage = "فتح رابط المنتج"
         html, final = fetch(args.url)
+        stage = "استخراج بيانات المنتج"
         source = parse_page(html, final)
+        stage = "البحث عن المتاجر"
         urls = [u for u in search(source, key) if u.rstrip("/") != final.rstrip("/")]
         report = {"source": source, "checked_at": datetime.now(timezone.utc).isoformat(),
                   "matches": [], "excluded": [], "checked": len(urls)}
@@ -238,9 +249,18 @@ def main():
         text = render(report)
         (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         (out / "report.md").write_text(text, encoding="utf-8")
-    except (ValueError, requests.RequestException, OSError, KeyError):
+    except (ValueError, requests.RequestException, OSError, KeyError) as error:
         # HTTP errors can contain private URL parameters. Keep logs and reports generic.
-        text = "# تعذرت المقارنة\n\nتحقق من الرابط ومفتاح SERPAPI_API_KEY والرصيد. قد تكون الصفحة محمية أو لا تحتوي بيانات منتج واضحة.\n"
+        if isinstance(error, ComparisonError):
+            reason = str(error)
+        elif isinstance(error, requests.Timeout):
+            reason = "انتهت مهلة الاتصال بصفحة المنتج. المتجر لم يستجب في الوقت المحدد؛ قد يرفض الاتصالات الآلية."
+        elif stage == "استخراج بيانات المنتج":
+            reason = "الصفحة لا تحتوي بيانات منتج واحد واضحة بصيغة JSON-LD المدعومة حاليًا. قد تحتاج JavaScript أو قارئًا مخصصًا لهذا المتجر."
+        else:
+            reason = "تعذر إتمام هذه المرحلة. تحقق من الرابط والاتصال؛ لا تغيّر المفتاح دون ظهور خطأ من خدمة البحث."
+        text = f"# تعذرت المقارنة\n\nالمرحلة: {stage}\n\n{reason}\n"
+        (out / "error.json").write_text(json.dumps({"stage": stage, "reason": reason}, ensure_ascii=False, indent=2), encoding="utf-8")
         (out / "report.md").write_text(text, encoding="utf-8")
         print(text)
         return 1
