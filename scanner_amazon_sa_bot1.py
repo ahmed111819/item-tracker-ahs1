@@ -31,6 +31,7 @@ from datetime import datetime
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from telegram_product_buttons import edit_product_keyboard, product_keyboard
+from deal_offer_rules import select_qualifying_offer, record_unrecognized
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
 
@@ -82,7 +83,7 @@ HOME_URL = "https://www.amazon.sa/"
 
 MIN_DISCOUNT_PERCENT = 40.0
 MIN_PROMOTION_DISCOUNT_PERCENT = 40.0
-MIN_PRICE_DROP_PERCENT = 50.0
+MIN_PRICE_DROP_PERCENT = 80.0
 
 MAX_CONCURRENT_PAGES = 3
 PAGE_WORKERS_PER_SEARCH = 3
@@ -890,14 +891,15 @@ def build_telegram_caption(title, asin, price, offer):
             + product_line
             + price_line
         )
-    elif offer_type == "bundle_offer":
-        caption = "🎁 <b>عرض باقة</b>\n" + product_line + price_line
+    elif offer_type in {"bundle_offer", "quantity_price_offer", "free_items_promotion", "quantity_promotion", "quantity_cash_promotion"}:
+        description = html.escape(str(offer.get("description") or "عرض كمية")[:120])
+        caption = f"🎁 <b>{description}</b>\n" + product_line + price_line
         quantity = int(offer.get("quantity") or 0)
         bundle_price = offer.get("pay_price")
         if quantity and bundle_price is not None:
             caption += f"🛒 {quantity} قطع بـ{float(bundle_price):.2f} SAR\n"
         if discount is not None:
-            caption += f"🏷️ نسبة الخصم على الباقة: {float(discount):.2f}%\n"
+            caption += f"🏷️ نسبة الخصم على الإجمالي: {float(discount):.2f}%\n"
     else:
         description = html.escape(
             str(offer.get("description") or "عرض ترويجي")[:120]
@@ -1058,7 +1060,10 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
         reference_price=reference_price,
         card_text=card_text,
     )
-    offer = classified_deals["coupon"] or classified_deals["promotion"]
+    record_unrecognized(asin, BOT_ID, classified_deals)
+    offer = select_qualifying_offer(
+        classified_deals, MIN_DISCOUNT_PERCENT, MIN_PROMOTION_DISCOUNT_PERCENT
+    )
     price_drop = classified_deals["price_drop"]
     product_url = f"https://www.amazon.sa/dp/{asin}"
 
