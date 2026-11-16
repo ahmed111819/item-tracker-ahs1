@@ -139,6 +139,11 @@ class OfferRulesTests(unittest.TestCase):
         self.assertFalse(read('50% cotton 2 pieces')['offers'])
         self.assertFalse(read('Buy 5 for SAR 500')['offers'])
 
+    def test_shipping_boilerplate_does_not_fill_unknown_sample_limit(self):
+        d = read('Product title\nFREE Delivery tomorrow\nFREE Returns\nتوصيل مجاني')
+        self.assertFalse(d['unrecognized'])
+        self.assertFalse(d['offers'])
+
 
 if __name__ == '__main__':
     unittest.main()

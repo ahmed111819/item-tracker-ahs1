@@ -175,6 +175,7 @@ def classify_offers(current_price, reference_price, card_text):
 
         # Even with one recognized offer, retain a second unexplained one.
         residual = ''.join(' ' if any(a <= i < b for a,b in occupied) else c for i,c in enumerate(text))
+        residual = re.sub(r'\bfree\s+(?:delivery|shipping|returns?)\b|(?:توصيل|شحن|ارجاع|إرجاع)\s*مجاني', '', residual, flags=re.I)
         if len(unknown) == review_start and re.search(rf'{COUPON}|\b(?:buy|free|offer)\b|(?:save|discount|خصم|وفر)\s*\d|مجانا|اشتر|احصل',residual,re.I):
             unknown.append(dict(text=text[:500],reason='unrecognized_offer_terms'))
 
