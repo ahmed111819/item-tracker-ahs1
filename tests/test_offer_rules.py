@@ -1,0 +1,144 @@
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from deal_parser_v2 import classify_deals
+from deal_offer_rules import select_qualifying_offer, record_unrecognized
+
+
+def read(text, price=20):
+    return classify_deals(current_price=price,reference_price=None,card_text=text)
+
+
+class OfferRulesTests(unittest.TestCase):
+    def test_quantity_price_and_free_item_equations(self):
+        cases = [
+            ('Buy 2 for the price of 1', 2, 20, 50),
+            ('اشتر 2 بسعر 1', 2, 20, 50),
+            ('اشتري ٢ بسعر ١', 2, 20, 50),
+            ('2 for 1', 2, 20, 50),
+            ('Buy 1 get 1 free', 2, 20, 50),
+            ('Buy one get one free', 2, 20, 50),
+            ('اشتر 1 واحصل على 1 مجانا', 2, 20, 50),
+            ('اشتر واحدة واحصل على الثانية مجانا', 2, 20, 50),
+            ('الثانية مجانا', 2, 20, 50),
+            ('Buy 2 get 1 free', 3, 40, 33.33),
+            ('Buy 3 get 2 free', 5, 60, 40),
+            ('Buy 3 for the price of 2', 3, 40, 33.33),
+            ('Buy 2 for SAR 20', 2, 20, 50),
+            ('اشتر 2 بسعر 20 ريال', 2, 20, 50),
+            ('3 for SAR 30', 3, 30, 50),
+        ]
+        for text,quantity,pay,percent in cases:
+            with self.subTest(text=text):
+                o = read(text)['promotion']
+                self.assertIsNotNone(o)
+                self.assertEqual((o['quantity'],o['pay_price'],o['discount_percent']), (quantity,pay,percent))
+                self.assertEqual(o['regular_total'],20*quantity)
+                self.assertEqual(o['saving'],20*quantity-pay)
+
+    def test_buy_five_discount_both_languages_and_word_orders(self):
+        for text in ['اشتر 5 واحصل على خصم 50%', 'اشتري 5 منتجات واحصل على خصم 50%',
+                     'Buy 5 and get 50% off', 'Buy 5 get a discount of 50%',
+                     'Save 50% when you buy 5', 'خصم 50% عند شراء 5 قطع',
+                     'وفر 50% على أي من 5 أو أكثر', 'اشتر خمسة واحصل على خصم 50%']:
+            with self.subTest(text=text):
+                o = read(text)['promotion']
+                self.assertIsNotNone(o)
+                self.assertEqual((o['quantity'],o['regular_total'],o['pay_price'],o['discount_percent']), (5,100,50,50))
+                self.assertIsNotNone(select_qualifying_offer(read(text),40,40))
+
+    def test_coupon_is_independent_of_other_percent_and_quantity_offer(self):
+        for separator in ['. ', '\n', '; ', ' ']:
+            with self.subTest(separator=separator):
+                d = read('Save 5% on any 5 or more'+separator+'Save 50% with coupon',100)
+                self.assertEqual(d['promotion']['discount_percent'],5)
+                self.assertEqual(d['coupon']['discount_percent'],50)
+                self.assertEqual(select_qualifying_offer(d,40,40)['type'],'percent_coupon')
+        d = read('40% off. Save 50% with coupon',100)
+        self.assertEqual(d['coupon']['discount_percent'],50)
+        d = read('خصم 70% قسيمة خصم 40%',100)
+        self.assertEqual(d['coupon']['discount_percent'],40)
+
+    def test_promotion_not_hidden_by_small_coupon(self):
+        d = read('Save 10% with coupon; Buy 2 for the price of 1')
+        self.assertEqual(d['coupon']['discount_percent'],10)
+        self.assertEqual(select_qualifying_offer(d,40,40)['discount_percent'],50)
+
+    def test_distinct_coupon_and_second_item_offer(self):
+        d = read('50% off the second item; Save 60% with coupon',100)
+        self.assertEqual(len(d['offers']),2)
+        self.assertEqual(d['promotion']['effective_basket_discount_percent'],25)
+        self.assertEqual(d['coupon']['discount_percent'],60)
+
+    def test_coupon_math(self):
+        for text,rate,pay in [('You pay SAR 60 with coupon',40,60),
+                              ('تدفع 60 ريال مع القسيمة',40,60),
+                              ('SAR 40 off coupon applied',40,60),
+                              ('قسيمة خصم 40 ريال',40,60),
+                              ('قسيمة خصم 40%',40,60)]:
+            with self.subTest(text=text):
+                o = read(text,100)['coupon']
+                self.assertIsNotNone(o)
+                self.assertEqual((o['discount_percent'],o['pay_price']),(rate,pay))
+
+    def test_multiline_coupon_phrase(self):
+        for text in ['Save 50%\nwith coupon','قسيمة خصم\n50%','وفر 50%\nمع القسيمة']:
+            with self.subTest(text=text):
+                self.assertEqual(read(text)['coupon']['discount_percent'],50)
+
+    def test_arabic_second_item_at_purchase(self):
+        o = read('خصم 50% عند شراء المنتج الثاني')['promotion']
+        self.assertEqual(o['discount_percent'],50)
+        self.assertEqual(o['effective_basket_discount_percent'],25)
+
+    def test_fixed_savings_on_quantity(self):
+        for text in ['Save SAR 50 when you buy 5','وفر 50 ريال عند شراء 5 قطع']:
+            with self.subTest(text=text):
+                o = read(text)['promotion']
+                self.assertEqual((o['quantity'],o['pay_price'],o['discount_percent']),(5,50,50))
+
+    def test_checkout_percentage_and_cash_saving(self):
+        for text in ['Save 50% at checkout','وفر 50% عند الدفع','وفر 50 ريال']:
+            with self.subTest(text=text):
+                self.assertEqual(read(text,100)['promotion']['discount_percent'],50)
+
+    def test_recognized_and_unknown_offer_both_retained(self):
+        d = read('Save 50% with coupon; Buy 3 get a special discount')
+        self.assertEqual(d['coupon']['discount_percent'],50)
+        self.assertTrue(d['unrecognized'])
+
+    def test_inclusive_40_percent_threshold(self):
+        self.assertIsNone(select_qualifying_offer(read('Buy 2 get 1 free'),40,40))
+        self.assertIsNotNone(select_qualifying_offer(read('Buy 3 get 2 free'),40,40))
+
+    def test_missing_price_and_conditions_require_review(self):
+        for text,price in [('Buy 1 get 1 free',None),('Up to 50% with coupon',20),
+                           ('Save 50% with coupon maximum SAR 5',20),
+                           ('Save 50% with bank card',20),
+                           ('Buy 2 get the cheapest free',20),
+                           ('اشتر 2 واحصل على خصم خاص',20)]:
+            with self.subTest(text=text):
+                d = read(text,price)
+                self.assertFalse(d['offers'])
+                self.assertTrue(d['unrecognized'])
+
+    def test_unknown_cases_recorded_without_telegram(self):
+        d = read('Buy 2 get a mystery discount')
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{'UNKNOWN_OFFERS_DIR':folder}):
+            record_unrecognized('B012345678','test_bot',d)
+            record_unrecognized('B012345678','test_bot',d)
+            lines = (Path(folder)/'test_bot.jsonl').read_text(encoding='utf-8').splitlines()
+            self.assertEqual(len(lines),1)
+            self.assertEqual(json.loads(lines[0])['asin'],'B012345678')
+
+    def test_no_promotion_from_unrelated_bare_percent(self):
+        self.assertFalse(read('50% cotton 2 pieces')['offers'])
+        self.assertFalse(read('Buy 5 for SAR 500')['offers'])
+
+
+if __name__ == '__main__':
+    unittest.main()
