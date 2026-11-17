@@ -76,6 +76,22 @@ SEARCH_URLS = [
     "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true&ds=v1%3AIguX2am7OLTAxY9M0l2KsHRMdAuycTH0xTLcLbXem4o&qid=1794850219&ref=sr_ex_n_1",
 
     "https://www.amazon.sa/s?k=shampoo&rh=p_98%3A16895730031&low-price=&high-price=155",
+      # Link التلفزيونات
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A16966461031%2Cp_n_deal_type%3A26902957031&s=popularity-rank&dc&fs=true",
+    # Link الكاميرات
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A16966385031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link سماعات الرأس
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A16966390031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link هاي فاي والمعدات الصوتية المنزلية
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A12463162031%2Cn%3A16966391031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link السينما المنزلية والتلفزيون والفيديو
+    "https://www.amazon.sa/s?keywords=%D9%85%D9%86%D8%AA%D8%AC%D8%A7%D8%AA+%D9%86%D8%B8%D8%A7%D9%85+%D8%A7%D9%84%D9%85%D8%B3%D8%B1%D8%AD+%D8%A7%D9%84%D9%85%D9%86%D8%B2%D9%84%D9%8A+%D9%88%D8%A7%D9%84%D8%AA%D9%84%D9%81%D8%B2%D9%8A%D9%88%D9%86+%D9%88%D8%A7%D9%84%D9%81%D9%8A%D8%AF%D9%8A%D9%88&i=electronics&rh=n%3A16966392031%2Cp_n_deal_type%3A26902957031&dc&c=ts",
+      # Link بطاريات وشواحن المنزل
+    "https://www.amazon.sa/s?k=%D8%A8%D8%B7%D8%A7%D8%B1%D9%8A%D8%A7%D8%AA+%D9%88%D8%B4%D8%A7%D8%AD%D9%86+%D9%85%D9%86%D8%B2%D9%84%D9%8A%D8%A9&i=electronics&rh=n%3A16966393031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&c=ts",
+    # Link ملحقات الطاقة
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A16966395031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link الأجهزة التكنولوجية القابلة للارتداء
+    "https://www.amazon.sa/s?i=electronics&rh=n%3A16966397031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]
