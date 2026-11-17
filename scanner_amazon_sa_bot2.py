@@ -32,6 +32,7 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from telegram_product_buttons import edit_product_keyboard, product_keyboard
 from deal_offer_rules import select_qualifying_offer, record_unrecognized
+from scan_link_report import classify_card_for_report, new_page_metrics, record_event
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
 
@@ -859,7 +860,10 @@ def build_telegram_caption(title, asin, price, offer):
     discount = offer.get("discount_percent")
 
     if offer_type == "product_block_release":
-        caption = "📉 <b>انفك الحجب المؤقت</b>\n" + product_line + price_line
+        caption = "📉 <b>انفك الحجب المؤقت</b>\n" + product_line
+        if offer.get("blocked_price") is not None:
+            caption += f"🔒 السعر وقت الحجب: {offer['blocked_price']:.2f} SAR\n"
+        caption += price_line
     elif offer_type == "price_drop_80":
         caption = (
             f"🎉 <b>خصم جديد {MIN_PRICE_DROP_PERCENT:.0f}% وأكثر</b>\n"
@@ -1029,7 +1033,7 @@ def fallback_price_from_text(card_text):
     return "Price unavailable", None
 
 
-async def process_card_locked(search_url, page_number, index, search_index, snapshot):
+async def process_card_locked(search_url, page_number, index, search_index, snapshot, metrics=None):
     card_text = snapshot.get("text", "")
     asin = snapshot.get("asin")
     if not asin:
@@ -1053,6 +1057,11 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
         card_text=card_text,
     )
     record_unrecognized(asin, BOT_ID, classified_deals)
+    if metrics is not None:
+        classify_card_for_report(
+            metrics, asin, classified_deals, MIN_DISCOUNT_PERCENT,
+            MIN_PROMOTION_DISCOUNT_PERCENT, MIN_PRICE_DROP_PERCENT,
+        )
     offer = select_qualifying_offer(
         classified_deals, MIN_DISCOUNT_PERCENT, MIN_PROMOTION_DISCOUNT_PERCENT
     )
@@ -1165,6 +1174,8 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
             print(f"⚠️ Temporary block release alert failed ({type(exc).__name__}).")
             release_sent = False
 
+        if release_sent and metrics is not None:
+            metrics["sent"]["block_release"] += 1
         if not release_sent:
             try:
                 release_sent = await asyncio.to_thread(alert_was_sent, release_alert_key)
@@ -1253,6 +1264,8 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                         record["last_alert_signature"] = coupon_signature
                         record["last_alert_at"] = datetime.now().isoformat()
                         coupon_alert_sent = True
+                        if metrics is not None:
+                            metrics["sent"][offer_kind] += 1
                         save_tracking()
                         print("✅ Coupon/offer alert sent:", product_url)
                     elif sent is None:
@@ -1282,6 +1295,8 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
                 record["last_price_drop_80_signature"] = price_drop_signature
                 record["last_price_drop_80_at"] = datetime.now().isoformat()
                 price_drop_alert_sent = True
+                if metrics is not None:
+                    metrics["sent"]["price_drop"] += 1
                 save_tracking()
                 print("✅ Price-drop alert sent:", product_url)
             elif sent is None:
@@ -1297,14 +1312,14 @@ async def process_card_locked(search_url, page_number, index, search_index, snap
     return True, coupon_alert_sent or price_drop_alert_sent
 
 
-async def process_card(snapshot, search_url, page_number, index, search_index):
+async def process_card(snapshot, search_url, page_number, index, search_index, metrics):
     asin = snapshot.get("asin")
     if not asin:
         return None, False, False
     lock = product_locks.setdefault(asin, asyncio.Lock())
     async with lock:
         saved, alerted = await process_card_locked(
-            search_url, page_number, index, search_index, snapshot
+            search_url, page_number, index, search_index, snapshot, metrics
         )
     return asin, saved, alerted
 
@@ -1313,7 +1328,7 @@ async def process_card(snapshot, search_url, page_number, index, search_index):
 # SCAN ONE PAGE
 # ------------------------------------------------------------
 
-async def _scan_one_page(context, search_url, page_number, search_index):
+async def _scan_one_page(context, search_url, page_number, search_index, metrics):
     """Scan one page. A disabled Next button is strong end-of-results evidence.
 
     A 503, CAPTCHA, error page, or unconfirmed empty page is never treated as
@@ -1438,7 +1453,7 @@ async def _scan_one_page(context, search_url, page_number, search_index):
                             try:
                                 snapshot = card_snapshots[index - 1]
                                 asin, saved, alerted = await process_card(
-                                    snapshot, search_url, page_number, index, search_index
+                                    snapshot, search_url, page_number, index, search_index, metrics
                                 )
                                 return asin, saved, alerted, None
                             except Exception as e:
@@ -1548,15 +1563,27 @@ PRODUCT_SEMAPHORE = None
 
 
 async def scan_one_page(context, search_url, page_number, search_index):
-    if PAGE_SEMAPHORE is None:
-        return await _scan_one_page(
-            context, search_url, page_number, search_index
-        )
+    metrics = new_page_metrics()
+    try:
+        if PAGE_SEMAPHORE is None:
+            result = await _scan_one_page(context, search_url, page_number, search_index, metrics)
+        else:
+            async with PAGE_SEMAPHORE:
+                result = await _scan_one_page(context, search_url, page_number, search_index, metrics)
+    except Exception:
+        report_page(search_index, search_url, page_number, {}, metrics)
+        raise
+    report_page(search_index, search_url, page_number, result, metrics)
+    return result
 
-    async with PAGE_SEMAPHORE:
-        return await _scan_one_page(
-            context, search_url, page_number, search_index
-        )
+
+def report_page(search_index, search_url, page_number, result, metrics):
+    record_event(
+        BOT_ID, search_index, search_url, kind="page", page=page_number,
+        success=result.get("success", False), products=sorted(result.get("asins", ())),
+        found={kind: sorted(asins) for kind, asins in metrics["found"].items()},
+        sent=metrics["sent"], unknown=sorted(metrics["unknown"]),
+    )
 
 # ------------------------------------------------------------
 # SCAN PAGES FOR ONE SEARCH IN SMALL PARALLEL BATCHES
@@ -1565,6 +1592,7 @@ async def scan_one_page(context, search_url, page_number, search_index):
 async def scan_one_search(context, search_url, search_index):
     """Scan each search in bounded page batches and checkpoint in page order."""
     # Start every new run from page 1 instead of resuming an old cursor.
+    record_event(BOT_ID, search_index, search_url, kind="start")
     page_number = 1
     print(f"Starting search {search_index} at page 1 (fresh scan).")
 
@@ -1697,6 +1725,8 @@ async def scan_one_search(context, search_url, search_index):
         f"products saved/updated: {products_saved}, alerts: {alerts_sent}, "
         f"unique ASINs seen this run: {len(seen_asins)}"
     )
+    status = tracking_data["scan_state"].get(search_url, {}).get("end_reason", "failed")
+    record_event(BOT_ID, search_index, search_url, kind="finish", status=status)
     return pages_scanned, products_saved, alerts_sent
 
 
@@ -1705,6 +1735,8 @@ async def scan_one_search(context, search_url, search_index):
 # ------------------------------------------------------------
 
 async def scan_all_searches():
+    for search_index, search_url in enumerate(SEARCH_URLS, start=1):
+        record_event(BOT_ID, search_index, search_url, kind="registered")
     if not SEARCH_URLS:
         print("⚠️ Add at least one Amazon search URL.")
         return
@@ -1801,6 +1833,7 @@ async def scan_all_searches():
                             )
                         except Exception as e:
                             search_results[queue_index] = e
+                            record_event(BOT_ID, search_index, queue_url, kind="finish", status="failed")
                     finally:
                         search_queue.task_done()
 

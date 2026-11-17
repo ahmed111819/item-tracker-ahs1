@@ -27,9 +27,11 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       STORAGE_BACKEND: postgres
       CONTINUOUS_MODE: "false"
+      SCAN_REPORT_DIR: ${{ github.workspace }}/scan-report-events
       UNKNOWN_OFFERS_DIR: ${{ github.workspace }}/unknown-offers
     steps:
       - uses: actions/checkout@v4
+        id: checkout_scan
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -128,6 +130,18 @@ jobs:
           python -u telegram_callbacks.py --cleanup-released || status=1
           trap - EXIT
           exit "$status"
+      - name: Summarize scanner links
+        id: scan_report
+        if: ${{ always() && steps.checkout_scan.outcome == 'success' }}
+        run: python scan_link_report.py scan-report-events scan-report
+      - name: Upload scanner link report
+        if: ${{ always() && steps.scan_report.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-link-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scan-report/
+          if-no-files-found: error
+          retention-days: 30
       - name: Save unrecognized offer samples for review
         if: always()
         uses: actions/upload-artifact@v4

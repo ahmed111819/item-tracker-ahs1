@@ -9,6 +9,7 @@ from pathlib import Path
 
 from deal_parser_v2 import classify_deals, extract_reference_price, parse_price
 from deal_offer_rules import select_qualifying_offer
+from scan_link_report import classify_card_for_report, new_page_metrics
 
 
 def run(coroutine):
@@ -33,6 +34,7 @@ def handler(bot, suppressed=False):
     sent=[]
     ns=dict(asyncio=SimpleNamespace(to_thread=local_call),datetime=datetime,html=html,
             classify_deals=classify_deals,parse_price=parse_price,
+            classify_card_for_report=classify_card_for_report,
             extract_reference_price=extract_reference_price,
             select_qualifying_offer=select_qualifying_offer,
             record_unrecognized=lambda *args:None,
@@ -90,3 +92,22 @@ class ScannerIntegrationTests(unittest.TestCase):
                     if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name)
                     and n.targets[0].id in ('MIN_DISCOUNT_PERCENT','MIN_PROMOTION_DISCOUNT_PERCENT','MIN_PRICE_DROP_PERCENT')}
             self.assertEqual(values,dict(MIN_DISCOUNT_PERCENT=40,MIN_PROMOTION_DISCOUNT_PERCENT=40,MIN_PRICE_DROP_PERCENT=80))
+
+    def test_report_counts_eligible_types_independently_of_alerts(self):
+        for bot in (1, 2, 3):
+            with self.subTest(bot=bot):
+                ns, sent = handler(bot)
+                metrics = new_page_metrics()
+                snapshot = dict(asin='B012345678', title='A valid product title',
+                                text='Save 45% with coupon; Buy 2 for the price of 1',
+                                price_text='SAR 20', reference_price_text='SAR 100')
+                run(ns['process_card_locked']('search', 1, 1, 1, snapshot, metrics))
+                run(ns['process_card_locked']('search', 2, 1, 1, snapshot, metrics))
+                self.assertEqual(metrics['found'], {kind: {'B012345678'} for kind in
+                                 ('coupon', 'promotion', 'price_drop')})
+                self.assertEqual(metrics['sent'], dict(coupon=0, promotion=1,
+                                 price_drop=1, block_release=0))
+                caption = ns['build_telegram_caption'](snapshot['title'], snapshot['asin'], 20,
+                        dict(type='product_block_release', blocked_price=25))
+                self.assertIn('وقت الحجب: 25.00 SAR', caption)
+                self.assertIn('الحالي: 20.00 SAR', caption)
