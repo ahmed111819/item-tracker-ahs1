@@ -51,22 +51,22 @@ if not TELEGRAM_READY:
 # ------------------------------------------------------------
 
 SEARCH_URLS = [
-    # Link 3
-    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_36%3A-14000%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_90%3A16641876031&s=price-asc-rank&dc&fs=true&qid=1791556924&rnid=16641874031&ref=sr_st_price-asc-rank&ds=v1%3A%2BBlKd3UHRtsd%2F66%2FwBtCTeMtL1TxD1hZkQxWtOb6P9w",
-    # Link 4
+    # Link المنزل والمطبخ
+    "https://www.amazon.sa/s?i=home&rh=n%3A12463333031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true",
+    # Link منتجات تنظيف قريب من الصحه
     "https://www.amazon.sa/s?i=hpc&srs=26058961031&bbn=26058961031&rh=n%3A26058961031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791557621&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3A83RAfxuKWV0fkUSde5QuOt9eO42ZkR5UMEB%2BpiAgZZM",
-    # Link 9
-    "https://www.amazon.sa/s?i=appliances&rh=n%3A16856130031%2Cp_36%3A-22000%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_90%3A16641876031&s=price-asc-rank&dc&fs=true&qid=1791579172&rnid=16641874031&ref=sr_st_price-asc-rank&ds=v1%3AcEcmNbPw87ExmKAm%2F52abHbserXd0EHAIZWorVl1n34",
-    # Link 10
-    "https://www.amazon.sa/s?i=grocery&rh=n%3A16636903031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1791579336&rnid=26902955031&ref=sr_st_price-asc-rank&ds=v1%3A9nGw%2Bt1BGyjlUJ2Ok2RT5PeufFLgaUhg8lxiSmJzjZ8",
-    # Link 15
-    "https://www.amazon.sa/s?i=kitchen&rh=n%3A16856132031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580226&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3Az1NF6PfrBd4LVrVQFuHWWAjuoJrVn2y2JWRxq5LHRXM",
-    # Link 16
-    "https://www.amazon.sa/s?i=baby&rh=n%3A12462934031%2Cp_36%3A-15000%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_90%3A16641876031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580356&rnid=16641811031&ref=sr_st_price-asc-rank&ds=v1%3Ago4KYqvWkPWWRqmRMo%2FTQzxYXBhd2YNdJdQ8IW%2BSuus",
-    # Link 19
-    "https://www.amazon.sa/s?i=pets&rh=n%3A16637302031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true&qid=1791580717&rnid=16895729031&ref=sr_st_price-asc-rank&ds=v1%3AjumfElU2KHzxO2El0gKeEqnaSYXEKo4myshF7pYU2G4",
-    # Link 0
-    "https://www.amazon.sa/s?i=appliances&rh=n%3A12463333031%2Cp_36%3A-22000%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031%2Cp_90%3A16641876031&s=price-asc-rank&dc&fs=true&ds=v1%3A6tO5qCB%2BWiFof2ShuU58bYm%2BxqhF9eD1ehWYsjot0a8&qid=1794217517&ref=sr_ex_n_1",
+    # Link السوبر ماركت
+    "https://www.amazon.sa/s?i=grocery&rh=n%3A16636903031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link منتجات الاطفال
+    "https://www.amazon.sa/s?i=baby&rh=n%3A12462934031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true",
+    # Link إكسسوارات الكمبيوتر
+    "https://www.amazon.sa/s?i=computers&rh=n%3A16966422031",
+    # Link مكونات وقطع غيار الكمبيوتر
+    "https://www.amazon.sa/b?node=16966424031",
+    # Link حيوانات اليفه
+    "https://www.amazon.sa/s?i=pets&rh=n%3A16637302031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true",
+    # Link أجهزة الكمبيوتر المكتبية
+    "https://www.amazon.sa/b?node=16966426031",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]
