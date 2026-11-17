@@ -46,3 +46,5 @@ class WorkflowConfigurationTests(unittest.TestCase):
         writer = re.search(r'^\s+UNKNOWN_OFFERS_DIR:\s*(.+)$',source,re.M).group(1).strip()
         reader = re.search(r'^\s+path:\s*(.+)/\*\.jsonl\s*$',source,re.M).group(1).strip()
         self.assertEqual(writer,reader)
+        self.assertFalse(writer.rsplit('/', 1)[-1].startswith('.'),
+                         'The artifact uploader excludes hidden directories by default.')
