@@ -72,7 +72,7 @@ SEARCH_URLS = [
     "https://www.amazon.sa/s?k=%D8%B3%D9%85%D8%A7%D8%B9%D9%87+%D8%A7%D8%B0%D9%86&rh=p_36%3A-14500%2Cp_98%3A16895730031%2Cp_n_fulfilled_by_amazon%3A16895730031&dc&crid=3NYABD3ONAL73&qid=1788881287&rnid=16895729031&ref=sr_nr_p_n_fulfilled_by_amazon_1&ds=v1%3AP9hvA63GBQOWAOb%2Bco6oxkuBc6weIkk9jRcfd3vPSik",
     "https://www.amazon.sa/s?k=%D8%B3%D9%84%D9%83+%D8%B4%D8%A7%D8%AD%D9%86&rh=p_98%3A16895730031%2Cp_n_deal_type%3A210770220031&dc&crid=2RH8PQJ145LBJ&qid=1788732731&rnid=26902955031&sprefix=%D8%B3%D9%84%D9%83+%D8%B4%D8%A7%D8%AD%D9%86%2Caps%2C242&ref=sr_nr_p_n_deal_type_4&ds=v1%3AclDDXn1TaOHlaLYxkoaIfh41TJrhSJl8PIoVjdpVeDk",
     "https://www.amazon.sa/s?k=%D8%A8%D8%A7%D9%88%D8%B1+%D8%A8%D8%A7%D9%86%D9%83&rh=p_n_fulfilled_by_amazon%3A16895730031&dc&qid=1788881222&rnid=16895729031&ref=sr_nr_p_n_fulfilled_by_amazon_1&ds=v1%3ASvLV3FRiHqrkloCrY0QY%2B4ldnNi8nJYGzTXQw7NYcK0",
-    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_availability%3A16641825031&s=popularity-rank&dc&fs=true&qid=1785288705&rnid=16641824031&xpid=9tpH9A4x9_WgM&ref=sr_pg_1",
+    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true&ds=v1%3AIguX2am7OLTAxY9M0l2KsHRMdAuycTH0xTLcLbXem4o&qid=1794850219&ref=sr_ex_n_1",
 
     "https://www.amazon.sa/s?k=shampoo&rh=p_98%3A16895730031&low-price=&high-price=155",
 ]
