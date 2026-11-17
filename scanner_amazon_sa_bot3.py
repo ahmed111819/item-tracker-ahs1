@@ -51,24 +51,36 @@ if not TELEGRAM_READY:
 # ------------------------------------------------------------
 
 SEARCH_URLS = [
-    # Link 5
-    "https://www.amazon.sa/s?i=home-improvement&rh=n%3A12463390031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1791557877&rnid=26902955031&ref=sr_nr_p_n_deal_type_2&ds=v1%3AFMMbLv7t3xAwdQgwK0XTtXFXx3UrCOR9dsaahq4wx7Q",
-     # Link 0
-    "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&rh=p_n_deal_type%3A26902956031&s=exact-aware-popularity-rank",
-    # Link 8
-    "https://www.amazon.sa/s?i=videogames&rh=n%3A12463675031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc=&fs=true&qid=1791558845&rnid=16641831031&ref=sr_nr_p_36_0_0&low-price=&high-price=180",
-    # Link 12
-    "https://www.amazon.sa/s?i=sports&rh=n%3A12463561031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK%2Cp_n_deal_type%3A26902957031%2Cp_90%3A16641876031&s=price-asc-rank&dc&fs=true&qid=1791579919&rnid=28071520031&ref=sr_nr_p_n_condition-type_1&ds=v1%3A3Kcl%2BPfV9rzUm5u%2BhOoYYNqLrSpeJ8WO0gyPgIoQdZ0",
-    # Link 13
-    "https://www.amazon.sa/s?i=industrial&rh=n%3A16636960031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218046&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AoGW%2FAcfui9ChIIQIWtjIKJQeZS9ZYfVuHycbG%2BdnjU8",
-    # Link 17
-    "https://www.amazon.sa/s?i=automotive&rh=n%3A12462877031%2Cp_36%3A-16500%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218059&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AjbY%2F1Yae5LZzyCAdaBAQnBzv0Q%2FE%2Ffm4ynioljWOzGY",
-    # Link 18
-    "https://www.amazon.sa/s?i=hpc&rh=n%3A12463276031%2Cp_36%3A-15500%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794218071&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3Aevnir%2BdBtWs%2FOfc4ljjF6zwZZE6dc%2F2aHXBuz3A1TWQ",
-    # Link 00
-    "https://www.amazon.sa/s?i=grocery&rh=n%3A16636903031&s=price-asc-rank&fs=true&qid=1794218616&ref=sr_st_price-asc-rank&ds=v1%3ATPGemPfv%2F%2BhlqAtT2EzASFb7N7tLGfg%2FUcOHok%2FkA2c",
-     # Link 000
-    "https://www.amazon.sa/s?i=grocery&rh=n%3A16636903031%2Cp_6%3AA2XPWB6MYN7ZDK&s=popularity-rank&dc&fs=true&qid=1794218721&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AC54AmRYfSgwspYkKOfzT99bzblaRSPQJlOFZzaVdGnw",
+    # Link الاعمال اليدوية والادوات
+    "https://www.amazon.sa/s?i=home-improvement&rh=n%3A12463390031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc=&fs=true&low-price=&high-price=30",
+     # Link صفقات اليوم
+    "https://www.amazon.sa/s?i=merchant-items&me=A2XPWB6MYN7ZDK&rh=p_n_deal_type%3A26902956031&s=price-asc-rank&dc&rnid=16895729031",
+    # Link العاب الفيديو
+    "https://www.amazon.sa/s?i=videogames&rh=n%3A12463675031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link الرياضه
+    "https://www.amazon.sa/s?i=sports&rh=n%3A12463561031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc=&fs=true&low-price=&high-price=31",
+    # Link صناعي وعملي
+    "https://www.amazon.sa/s?i=industrial&rh=n%3A16636960031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_n_condition-type%3A28071522031&dc&fs=true",
+    # Link السيارات
+    "https://www.amazon.sa/s?i=automotive&srs=17471910031&bbn=17471910031&rh=n%3A12462877031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031&s=price-asc-rank&dc&fs=true",
+    # Link محركات الأقراص والتخزين
+    "https://www.amazon.sa/s?i=computers&rh=n%3A16966425031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true",
+    # Link اللابتوبات
+    "https://www.amazon.sa/s?i=computers&rh=n%3A16966427031%2Cp_n_deal_type%3A26902957031&s=popularity-rank&dc&fs=true",
+     # Link شاشات الكمبيوتر
+    "https://www.amazon.sa/b?node=16966428031",
+     # Link أجهزة شبكات الكمبيوتر
+    "https://www.amazon.sa/s?keywords=%D8%A3%D8%AC%D9%87%D8%B2%D8%A9+%D8%B4%D8%A8%D9%83%D8%A7%D8%AA+%D8%A7%D9%84%D9%83%D9%85%D8%A8%D9%8A%D9%88%D8%AA%D8%B1&i=computers&rh=n%3A16966429031%2Cp_n_deal_type%3A26902957031&dc&c=ts",
+    # Link الطابعات وملحقاتها
+    "https://www.amazon.sa/s?keywords=%D8%A7%D9%84%D8%B7%D8%A7%D8%A8%D8%B9%D8%A7%D8%AA+%D9%88%D8%A7%D9%84%D9%85%D9%84%D8%AD%D9%82%D8%A7%D8%AA&i=computers&rh=n%3A16966430031%2Cp_n_deal_type%3A26902957031&dc&c=ts",
+     # Link السكانر والماسحات الضوئية
+    "https://www.amazon.sa/s?keywords=%D8%A3%D8%AC%D9%87%D8%B2%D8%A9+%D8%A7%D9%84%D8%B3%D9%83%D8%A7%D9%86%D8%B1%2C+%D8%A7%D9%84%D9%85%D8%A7%D8%B3%D8%AD%D8%A7%D8%AA+%D8%A7%D9%84%D8%B6%D9%88%D8%A6%D9%8A%D8%A9+%D9%88%D9%85%D9%84%D8%AD%D9%82%D8%A7%D8%AA%D9%87%D8%A7&i=computers&rh=n%3A16966431031%2Cp_n_deal_type%3A26902957031&dc&c=ts",
+     # Link خوادم الكمبيوتر
+    "https://www.amazon.sa/s?i=computers&rh=n%3A16966432031%2Cp_n_deal_type%3A26902957031&s=popularity-rank&dc&fs=true",
+    # Link الأجهزة اللوحية
+    "https://www.amazon.sa/s?keywords=%D8%A3%D8%AC%D9%87%D8%B2%D8%A9+%D8%A7%D9%84%D8%AA%D8%A7%D8%A8%D9%84%D8%AA&i=computers&rh=n%3A16966433031%2Cp_n_deal_type%3A26902957031&dc&c=ts",
+     # Link الكمبيوتر والإكسسوارات
+    "https://www.amazon.sa/s?i=computers&rh=n%3A16966388031%2Cp_n_deal_type%3A26902957031%2Cp_n_condition-type%3A28071522031%2Cp_6%3AA14PAP71RVPZX1%257CA2G5247R6UIDP1%257CA2H1MERC09E4Q4%257CA2R3VIMQ1WRL53%257CA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]
