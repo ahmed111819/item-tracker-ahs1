@@ -508,6 +508,9 @@ def scan_page(page_id, url):
               ON CONFLICT(page_id,asin) DO UPDATE SET title=excluded.title,price=excluded.price,
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
+            percent = promotion.get("percent") if promotion else None
+            buy_quantity = promotion.get("buy_quantity") if promotion else None
+            discounted_quantity = promotion.get("discounted_quantity") if promotion else None
             if event and not is_muted:
                 if percent is not None and not was_pending:
                     if buy_quantity and discounted_quantity:
