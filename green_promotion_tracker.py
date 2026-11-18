@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import tempfile
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -97,15 +98,19 @@ def send_product_alert(caption, product_url, image_url):
             }
             if THREAD_ID:
                 data["message_thread_id"] = str(THREAD_ID)
-            response = HTTP.post(
-                f"{API}/sendPhoto",
-                data=data,
-                files={"photo": ("product.jpg", image_bytes, "image/jpeg")},
-                timeout=45,
-            )
-            result = response.json()
-            if not response.ok or not result.get("ok"):
-                raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as saved_image:
+                saved_image.write(image_bytes)
+                saved_image.flush()
+                saved_image.seek(0)
+                response = HTTP.post(
+                    f"{API}/sendPhoto",
+                    data=data,
+                    files={"photo": ("product.jpg", saved_image, "image/jpeg")},
+                    timeout=45,
+                )
+                result = response.json()
+                if not response.ok or not result.get("ok"):
+                    raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
             return
         except Exception as exc:
             print(f"Product photo upload failed: {type(exc).__name__}: {exc}")
