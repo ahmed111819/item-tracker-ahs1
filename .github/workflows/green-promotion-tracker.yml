@@ -1,0 +1,38 @@
+name: Green promotion page tracker
+
+on:
+  workflow_dispatch:
+    inputs:
+      continuous:
+        description: "Repeat scans with a five-minute rest after each completed scan"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: green-promotion-page-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GREEN_DEALS_TELEGRAM_BOT_TOKEN: ${{ secrets.GREEN_DEALS_TELEGRAM_BOT_TOKEN }}
+      GREEN_DEALS_TELEGRAM_CHAT_ID: ${{ secrets.GREEN_DEALS_TELEGRAM_CHAT_ID }}
+      GREEN_DEALS_DATABASE_URL: ${{ secrets.GREEN_DEALS_DATABASE_URL }}
+      GREEN_DEALS_SCAN_INTERVAL_SECONDS: "300"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tracker dependencies
+        run: python -m pip install "playwright>=1.52,<2" "requests>=2.32,<3" "psycopg[binary]>=3.2,<4"
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Run green promotion page tracker
+        run: python -u green_promotion_tracker.py ${{ inputs.continuous && '--continuous' || '' }}
