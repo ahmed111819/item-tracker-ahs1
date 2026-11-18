@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright
 
 TOKEN = os.environ["GREEN_DEALS_TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["GREEN_DEALS_TELEGRAM_CHAT_ID"]
+THREAD_ID = int(os.getenv("GREEN_DEALS_TELEGRAM_MESSAGE_THREAD_ID", "0"))
 DB_URL = os.environ["GREEN_DEALS_DATABASE_URL"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
@@ -58,6 +59,8 @@ def tg(method, payload):
 
 def send(text, markup=None):
     payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False}
+    if THREAD_ID:
+        payload["message_thread_id"] = THREAD_ID
     if markup:
         payload["reply_markup"] = markup
     tg("sendMessage", payload)
