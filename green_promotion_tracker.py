@@ -12,6 +12,7 @@ import re
 import time
 from html import escape
 from io import BytesIO
+from threading import Event, Thread, local
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -27,7 +28,8 @@ DB_URL = os.environ["GREEN_DEALS_DATABASE_URL"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
 HTTP = requests.Session()
-SCAN_REQUESTED = False
+SCAN_REQUESTED = Event()
+TELEGRAM = local()
 
 
 def db():
@@ -62,12 +64,28 @@ def init_db():
 
 
 def tg(method, payload):
-    response = HTTP.post(f"{API}/{method}", json=payload, timeout=35)
+    polling = method == "getUpdates"
+    session = getattr(TELEGRAM, "session", HTTP)
+    response = session.post(f"{API}/{method}", json=payload, timeout=(5, 35 if polling else 10))
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
         raise RuntimeError(data.get("description", "Telegram API error"))
     return data["result"]
+
+
+
+def answer_callback(payload):
+    try:
+        tg("answerCallbackQuery", payload)
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is None or response.status_code != 400:
+            raise
+        description = response.json().get("description", "").lower()
+        if "query is too old" not in description and "query id is invalid" not in description:
+            raise
+        print("Telegram callback expired before it could be acknowledged.")
 
 
 def send(text, markup=None, *, parse_mode=None, disable_preview=False):
@@ -141,7 +159,6 @@ def valid_url(value):
 
 
 def add_page(value):
-    global SCAN_REQUESTED
     parts = [part.strip() for part in value.split("|", 1)]
     url = parts[0]
     title = parts[1] if len(parts) > 1 else ""
@@ -155,7 +172,7 @@ def add_page(value):
             "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
             (url, title),
         )
-    SCAN_REQUESTED = True
+    SCAN_REQUESTED.set()
     send(f"تمت إضافة صفحة العرض للمتابعة ✅\n{title or 'سيُقرأ اسم العرض في أول فحص'}\n{url}")
 
 
@@ -351,7 +368,6 @@ def command(update):
 
 
 def menu_callback(query, message, data):
-    global SCAN_REQUESTED
     selection = re.fullmatch(r"menu:([a-z]+):([0-9]{1,6})", data)
     manage = re.fullmatch(r"manage:([a-z]+):([0-9]{1,6}):([A-Z0-9]{10})", data)
     page_action = re.fullmatch(r"page:(details|confirm|stop|enable|remove):([0-9]{1,18}):([0-9]{1,6})", data)
@@ -359,7 +375,7 @@ def menu_callback(query, message, data):
     if selection:
         view, raw_page = selection.groups()
         page = int(raw_page)
-        tg("answerCallbackQuery", answer)
+        answer_callback(answer)
         if view == "help":
             show_help(message)
         elif view in {"pages", "status"}:
@@ -377,7 +393,7 @@ def menu_callback(query, message, data):
                     f"UPDATE green_deal_product_preferences SET {preference}=false,updated_at=now() WHERE asin=%s",
                     (asin,),
                 )
-        tg("answerCallbackQuery", {**answer, "text": "تم التحديث"})
+        answer_callback({**answer, "text": "تم التحديث"})
         show_product_menu(view, int(raw_page), message)
     elif page_action:
         action, raw_page_id, raw_page = page_action.groups()
@@ -387,10 +403,10 @@ def menu_callback(query, message, data):
                 if action == "remove":
                     conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
                 else:
-                    conn.execute("UPDATE green_deal_pages SET active=%s WHERE id=%s", (action == "enable", page_id))
+                    conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL WHERE id=%s", (action == "enable", page_id))
             if action == "enable":
-                SCAN_REQUESTED = True
-        tg("answerCallbackQuery", answer)
+                SCAN_REQUESTED.set()
+        answer_callback(answer)
         if action == "remove":
             show_pages("pages", page, message)
         else:
@@ -401,7 +417,6 @@ def menu_callback(query, message, data):
 
 
 def callback(update):
-    global SCAN_REQUESTED
     query = update.get("callback_query", {})
     message = query.get("message", {})
     if str((message.get("chat") or {}).get("id")) != CHAT_ID:
@@ -413,7 +428,7 @@ def callback(update):
     if len(parts) >= 3 and parts[0] == "product":
         asin = parts[2]
         if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-            tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "بيانات المنتج غير صالحة", "show_alert": True})
+            answer_callback({"callback_query_id": query["id"], "text": "بيانات المنتج غير صالحة", "show_alert": True})
             return
         action = parts[1]
         if action == "block" and len(parts) == 4:
@@ -422,7 +437,7 @@ def callback(update):
                 if not 0 < blocked_price < 10000000:
                     raise ValueError
             except ValueError:
-                tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "السعر غير صالح", "show_alert": True})
+                answer_callback({"callback_query_id": query["id"], "text": "السعر غير صالح", "show_alert": True})
                 return
             resume_price = round(blocked_price * 0.95, 2)
             with db() as conn:
@@ -440,42 +455,65 @@ def callback(update):
             state = bool(row[0]) if row else False
             answer_text = "أضيف للمفضلة ⭐" if action == "favorite" and state else "أزيل من المفضلة" if action == "favorite" else "تم إيقاف تنبيه المنتج 🔕" if state else "تمت إعادة تنبيهات المنتج 🔔"
         else:
-            tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "الإجراء غير معروف", "show_alert": True})
+            answer_callback({"callback_query_id": query["id"], "text": "الإجراء غير معروف", "show_alert": True})
             return
-        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": answer_text})
+        answer_callback({"callback_query_id": query["id"], "text": answer_text})
         return
 
     try:
         _, action, raw_id = data.split(":")
         page_id = int(raw_id)
     except (ValueError, TypeError):
-        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "الزر غير صالح"})
+        answer_callback({"callback_query_id": query["id"], "text": "الزر غير صالح"})
         return
     if action == "show":
         with db() as conn:
             row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
-        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": row[0] if row else "الصفحة غير موجودة"})
+        answer_callback({"callback_query_id": query["id"], "text": row[0] if row else "الصفحة غير موجودة"})
         return
     with db() as conn:
         if action in {"pause", "resume"}:
             conn.execute("UPDATE green_deal_pages SET active=%s WHERE id=%s", (action == "resume", page_id))
-            SCAN_REQUESTED = action == "resume"
+            if action == "resume":
+                SCAN_REQUESTED.set()
         elif action == "delete":
             conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
-    tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "تم"})
+    answer_callback({"callback_query_id": query["id"], "text": "تم"})
     show_pages()
 
 
-def handle_updates(offset):
-    result = tg("getUpdates", {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]})
-    for item in result:
-        if "message" in item:
-            command(item)
-        elif "callback_query" in item:
-            callback(item)
-        offset = item["update_id"] + 1
-    return offset
-
+def telegram_worker(stop):
+    offset = 0
+    print("Telegram command worker started.")
+    with requests.Session() as session:
+        TELEGRAM.session = session
+        while not stop.is_set():
+            try:
+                updates = tg("getUpdates", {
+                    "offset": offset, "timeout": 25,
+                    "allowed_updates": ["message", "callback_query"],
+                })
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                status = response.status_code if response is not None else None
+                print(f"Telegram polling failed: {type(exc).__name__} (HTTP {status}); retrying.")
+                # Back off on polling errors, including overlapping pollers and rate limits.
+                stop.wait(30 if status == 429 else 3)
+                continue
+            for item in updates:
+                if stop.is_set():
+                    return
+                try:
+                    if "message" in item:
+                        command(item)
+                    elif "callback_query" in item:
+                        callback(item)
+                except Exception as exc:
+                    response = getattr(exc, "response", None)
+                    status = response.status_code if response is not None else None
+                    # Avoid logging exception URLs, which may contain the bot token.
+                    print(f"Telegram update {item['update_id']} failed: {type(exc).__name__} (HTTP {status}).")
+                offset = item["update_id"] + 1
 
 
 def parse_expiry_date(text):
@@ -657,6 +695,10 @@ def promotion_details(title):
     }
 
 
+class ScanStopped(Exception):
+    """The page was paused or removed during a scan."""
+
+
 def scan_page(page_id, url):
     found = {}
     with db() as conn:
@@ -680,6 +722,11 @@ def scan_page(page_id, url):
     def save_product(asin, title, price, product_url, image_url):
         found[asin] = (title, price, product_url)
         with db() as conn:
+            page_active = conn.execute(
+                "SELECT active FROM green_deal_pages WHERE id=%s FOR SHARE", (page_id,)
+            ).fetchone()
+            if not page_active or not page_active[0]:
+                raise ScanStopped()
             old = conn.execute(
                 "SELECT price,present,pending_alert,pending_url,pending_image_url "
                 "FROM green_deal_products WHERE page_id=%s AND asin=%s FOR UPDATE",
@@ -752,45 +799,54 @@ def scan_page(page_id, url):
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
 
 
-def run(continuous):
-    global SCAN_REQUESTED
-    init_db()
-    offset = 0
+def scan_loop(continuous):
     while True:
-        offset = handle_updates(offset)
-        SCAN_REQUESTED = False
+        SCAN_REQUESTED.clear()
         today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
         with db() as conn:
             conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
             pages = conn.execute("SELECT id,url FROM green_deal_pages WHERE active=true ORDER BY id").fetchall()
         for page_id, url in pages:
-            completed = False
             for attempt in range(1, 5):
                 try:
                     with db() as conn:
-                        conn.execute("UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s", (page_id,))
+                        updated = conn.execute(
+                            "UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s AND active",
+                            (page_id,),
+                        )
+                        if not updated.rowcount:
+                            break
                     print(f"Starting page {page_id}, attempt {attempt}/4")
                     scan_page(page_id, url)
-                    completed = True
+                    break
+                except ScanStopped:
+                    with db() as conn:
+                        conn.execute("UPDATE green_deal_pages SET scan_started_at=NULL WHERE id=%s", (page_id,))
                     break
                 except Exception as exc:
-                    detail = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    detail = f"{type(exc).__name__}: {str(exc).replace(TOKEN, '[redacted]')[:300]}"
                     print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
                     with db() as conn:
                         conn.execute("UPDATE green_deal_pages SET last_error=%s WHERE id=%s", (detail, page_id))
                     if attempt < 4:
                         time.sleep((10, 20, 40)[attempt - 1])
-            if not completed:
+            else:
                 with db() as conn:
                     conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),scan_started_at=NULL WHERE id=%s", (page_id,))
-            offset = handle_updates(offset)
         if not continuous:
             break
-        deadline = time.monotonic() + WAIT_SECONDS
-        while time.monotonic() < deadline:
-            offset = handle_updates(offset)
-            if SCAN_REQUESTED:
-                break
+        SCAN_REQUESTED.wait(WAIT_SECONDS)
+
+
+def run(continuous):
+    init_db()
+    stop = Event()
+    worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
+    worker.start()
+    try:
+        scan_loop(continuous)
+    finally:
+        stop.set()
 
 
 if __name__ == "__main__":
