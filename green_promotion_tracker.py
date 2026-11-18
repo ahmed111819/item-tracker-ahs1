@@ -72,7 +72,7 @@ def send(text, markup=None):
 
 def send_product_alert(caption, product_url, image_url):
     markup = {"inline_keyboard": [[{"text": "🛒 رابط المنتج", "url": product_url}]]}
-    message_text = caption + "\\n👇 رابط فتح المنتج بالزر"
+    message_text = caption + "\n👇 رابط فتح المنتج بالزر"
 
     if image_url:
         try:
@@ -272,20 +272,24 @@ def collect_products(url, on_product, on_offer_title):
                     image_url = ""
                     try:
                         image = card.locator("img").first
-                        image_url = (
-                            image.get_attribute("data-a-hires")
-                            or image.get_attribute("data-src")
-                            or image.get_attribute("src")
-                            or ""
-                        )
+                        image_candidates = []
+                        for attribute in ("data-a-hires", "data-src", "src"):
+                            candidate = image.get_attribute(attribute) or ""
+                            if candidate.startswith("https://"):
+                                candidate_host = (urlparse(candidate).hostname or "").lower()
+                                if candidate_host.endswith(("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")):
+                                    image_candidates.append(candidate)
                         dynamic_image = image.get_attribute("data-a-dynamic-image") or ""
-                        if not image_url and dynamic_image:
-                            image_candidates = json.loads(dynamic_image)
-                            if image_candidates:
-                                image_url = max(
-                                    image_candidates,
-                                    key=lambda candidate: image_candidates[candidate][0] * image_candidates[candidate][1],
+                        if dynamic_image:
+                            dimensions = json.loads(dynamic_image)
+                            image_candidates.extend(
+                                candidate for candidate in dimensions
+                                if candidate.startswith("https://")
+                                and (urlparse(candidate).hostname or "").lower().endswith(
+                                    ("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")
                                 )
+                            )
+                        image_url = image_candidates[0] if image_candidates else ""
                     except Exception:
                         pass
                     product = (title[:300] or asin, price, product_url, image_url)
@@ -395,7 +399,7 @@ def scan_page(page_id, url):
                     event += f"\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
                 if promotion_title:
                     event += f"\n📌 شرط العرض: {promotion_title}"
-            send(f"{event}\n🔗 {product_url}")
+            send_product_alert(event, product_url, image_url)
 
     collect_products(url, save_product, save_offer_title)
     if not found:
