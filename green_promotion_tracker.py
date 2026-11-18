@@ -375,8 +375,8 @@ def collect_products(url, on_product, on_offer_title):
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
                     image_url = ""
                     try:
-                        image_locator = card.locator("img[src*=\'media-amazon.com\'], img[data-a-hires], img[data-a-dynamic-image]")
-                    image = image_locator.first if image_locator.count() else card.locator("img").first
+                        image_locator = card.locator("img[data-a-hires], img[data-a-dynamic-image], img[data-src]")
+                        image = image_locator.first if image_locator.count() else card.locator("img").first
                         image_candidates = []
                         for attribute in ("data-a-hires", "data-src", "src"):
                             candidate = image.get_attribute(attribute) or ""
