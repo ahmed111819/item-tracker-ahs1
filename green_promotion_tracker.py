@@ -6,6 +6,7 @@ an independent Telegram bot token. It stores observed items in PostgreSQL.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import time
@@ -70,22 +71,46 @@ def send(text, markup=None):
 
 
 def send_product_alert(caption, product_url, image_url):
-    markup = {"inline_keyboard": [[{"text": "🛒 فتح المنتج", "url": product_url}]]}
+    markup = {"inline_keyboard": [[{"text": "🛒 رابط المنتج", "url": product_url}]]}
+    message_text = caption + "\\n👇 رابط فتح المنتج بالزر"
+
     if image_url:
-        payload = {
-            "chat_id": CHAT_ID,
-            "photo": image_url,
-            "caption": caption[:1000],
-            "reply_markup": markup,
-        }
-        if THREAD_ID:
-            payload["message_thread_id"] = THREAD_ID
         try:
-            tg("sendPhoto", payload)
+            host = (urlparse(image_url).hostname or "").lower()
+            allowed_image_host = any(
+                host.endswith(domain)
+                for domain in ("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")
+            )
+            if not allowed_image_host:
+                raise RuntimeError("Product image host is not an Amazon image domain.")
+
+            image_response = HTTP.get(image_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            image_response.raise_for_status()
+            image_bytes = image_response.content
+            if not image_bytes or len(image_bytes) > 8 * 1024 * 1024:
+                raise RuntimeError("Product image is empty or exceeds 8 MiB.")
+
+            data = {
+                "chat_id": CHAT_ID,
+                "caption": message_text[:1000],
+                "reply_markup": json.dumps(markup, ensure_ascii=False),
+            }
+            if THREAD_ID:
+                data["message_thread_id"] = str(THREAD_ID)
+            response = HTTP.post(
+                f"{API}/sendPhoto",
+                data=data,
+                files={"photo": ("product.jpg", image_bytes, "image/jpeg")},
+                timeout=45,
+            )
+            result = response.json()
+            if not response.ok or not result.get("ok"):
+                raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
             return
         except Exception as exc:
-            print(f"Product image could not be sent ({type(exc).__name__}); sending text alert.")
-    send(caption + f"\n🔗 {product_url}", markup)
+            print(f"Product photo upload failed: {type(exc).__name__}: {exc}")
+
+    send(message_text, markup)
 
 
 def valid_url(value):
@@ -247,7 +272,20 @@ def collect_products(url, on_product, on_offer_title):
                     image_url = ""
                     try:
                         image = card.locator("img").first
-                        image_url = image.get_attribute("data-a-hires") or image.get_attribute("src") or image.get_attribute("data-src") or ""
+                        image_url = (
+                            image.get_attribute("data-a-hires")
+                            or image.get_attribute("data-src")
+                            or image.get_attribute("src")
+                            or ""
+                        )
+                        dynamic_image = image.get_attribute("data-a-dynamic-image") or ""
+                        if not image_url and dynamic_image:
+                            image_candidates = json.loads(dynamic_image)
+                            if image_candidates:
+                                image_url = max(
+                                    image_candidates,
+                                    key=lambda candidate: image_candidates[candidate][0] * image_candidates[candidate][1],
+                                )
                     except Exception:
                         pass
                     product = (title[:300] or asin, price, product_url, image_url)
