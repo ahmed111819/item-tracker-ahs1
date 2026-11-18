@@ -171,7 +171,7 @@ def handle_updates(offset):
     return offset
 
 
-def collect_products(url, on_product):
+def collect_products(url, on_product, on_offer_title):
     products = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -180,6 +180,12 @@ def collect_products(url, on_product):
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3500)
             print(f"Opened promotion page: status={response.status if response else 'unknown'} title={page.title()!r}")
+            try:
+                offer_title = page.locator("h1").first.inner_text(timeout=2000).strip()
+                if offer_title:
+                    on_offer_title(offer_title)
+            except Exception:
+                pass
             for batch in range(100):
                 cards = page.locator("[data-asin]").all()
                 print(f"Promotion batch {batch + 1}: {len(cards)} ASIN elements")
@@ -241,8 +247,7 @@ def collect_products(url, on_product):
                     )
                     page.wait_for_timeout(700)
                 except Exception as exc:
-                    print(f"Could not load the next promotion batch: {type(exc).__name__}: {exc}")
-                    break
+                    raise RuntimeError(f"Could not load next batch after {len(products)} products: {type(exc).__name__}: {exc}") from exc
             if not products:
                 body = (page.locator("body").inner_text(timeout=3000) or "")[:500]
                 raise RuntimeError(f"No priced ASIN products were parsed. Page title={page.title()!r}; body preview={body!r}")
@@ -268,6 +273,15 @@ def scan_page(page_id, url):
         page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
     promotion_title = page_row[0] if page_row else ""
     discount = promotion_percent(promotion_title)
+
+    def save_offer_title(value):
+        nonlocal promotion_title, discount
+        if not promotion_title and value:
+            promotion_title = value[:200]
+            discount = promotion_percent(promotion_title)
+            with db() as conn:
+                conn.execute("UPDATE green_deal_pages SET title=%s WHERE id=%s", (promotion_title, page_id))
+
     def save_product(asin, title, price, product_url):
         discounted = round(price * (1 - discount / 100), 2) if discount is not None else None
         found[asin] = (title, price, product_url)
@@ -296,7 +310,7 @@ def scan_page(page_id, url):
                     event += f"\nشرط العرض: {promotion_title}"
             send(f"{event}\n🔗 {product_url}")
 
-    collect_products(url, save_product)
+    collect_products(url, save_product, save_offer_title)
     if not found:
         raise RuntimeError("No products could be read. Treating this scan as incomplete.")
     with db() as conn:
