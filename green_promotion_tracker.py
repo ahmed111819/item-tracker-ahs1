@@ -87,7 +87,7 @@ def add_page(value):
             "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
             (url, title),
         )
-    send(f"تمت إضافة صفحة العرض للمتابعة ✅\\n{title or 'سيُقرأ اسم العرض في أول فحص'}\\n{url}")
+    send(f"تمت إضافة صفحة العرض للمتابعة ✅\n{title or 'سيُقرأ اسم العرض في أول فحص'}\n{url}")
 
 
 def show_pages():
@@ -101,7 +101,7 @@ def show_pages():
     for page_id, url, active, title, expiry, checked in rows:
         status = "تعمل" if active else "متوقفة"
         end = expiry.isoformat() if expiry else "غير محدد"
-        lines.append(f"{page_id}. {title or 'اسم العرض'} • {status} • النهاية: {end}\\n{url}")
+        lines.append(f"{page_id}. {title or 'اسم العرض'} • {status} • النهاية: {end}\n{url}")
         buttons.append([{"text": f"إيقاف #{page_id}" if active else f"استئناف #{page_id}", "callback_data": f"page:{'pause' if active else 'resume'}:{page_id}"}])
         buttons.append([{"text": f"حذف #{page_id}", "callback_data": f"page:delete:{page_id}"}])
     send("\n\n".join(lines), {"inline_keyboard": buttons})
@@ -119,7 +119,7 @@ def command(update):
     elif text.startswith("/status"):
         show_status()
     elif text.startswith("/help") or text.startswith("/start"):
-        send("أوامر متابع صفحات العروض\n/add رابط الصفحة — إضافة صفحة\n/pages — عرض الصفحات وإدارتها")
+        send("👀 متابع صفحات العروض\n\n/add رابط | اسم العرض — إضافة صفحة\n/pages — الصفحات والأزرار\n/status — حالة الفحص\n\nمثال\n/add https://www.amazon.sa/promotion/psp/… | وفر 15٪ عند شراء 100 ريال")
 
 
 def show_status():
@@ -135,9 +135,9 @@ def show_status():
         present,total = count_map.get(page_id,(0,0))
         state = "يفحص الآن" if started else ("مفعّل" if active else "متوقف")
         last = checked.strftime("%Y-%m-%d %H:%M UTC") if checked else "لم يفحص بعد"
-        issue = f"\\nآخر خطأ: {error}" if error else ""
-        lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\\n{url}")
-    send("\\n\\n".join(lines))
+        issue = f"\nآخر خطأ: {error}" if error else ""
+        lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\n{url}")
+    send("\n\n".join(lines))
 
 
 def callback(update):
@@ -202,7 +202,7 @@ def collect_products(url, on_product):
                     try:
                         price_node = card.locator(".a-price .a-offscreen, .a-price-whole").first
                         price_text = price_node.inner_text(timeout=800)
-                        match = re.search(r"([0-9][0-9,]*(?:\\.[0-9]{1,2})?)", price_text)
+                        match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
                         if match:
                             price = float(match.group(1).replace(",", ""))
                     except Exception:
@@ -210,7 +210,7 @@ def collect_products(url, on_product):
                     if price is None:
                         try:
                             card_text = card.inner_text(timeout=800)
-                            match = re.search(r"(?:SAR|ر\\s*ي\\s*ال|ريال)\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\\.[0-9]{1,2})?)\\s*(?:SAR|ريال)", card_text, re.I)
+                            match = re.search(r"(?:SAR|ر\s*ي\s*ال|ريال)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:SAR|ريال)", card_text, re.I)
                             if match:
                                 price = float((match.group(1) or match.group(2)).replace(",", ""))
                         except Exception:
@@ -223,7 +223,7 @@ def collect_products(url, on_product):
                         products[asin] = product
                         on_product(asin, *product)
 
-                more = page.get_by_text(re.compile(r"^\\s*(إظهار المزيد|Show more|Load more)\\s*$", re.I)).last
+                more = page.get_by_text(re.compile(r"^\s*(إظهار المزيد|Show more|Load more)\s*$", re.I)).last
                 if more.count() == 0:
                     print("No visible 'show more' control was found.")
                     break
@@ -263,11 +263,11 @@ def scan_page(page_id, url):
             ).fetchone()
             event = None
             if old is None:
-                event = f"🆕 منتج جديد\\n{title}\\nالسعر: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\n{title}\nالسعر: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\\n{title}\\nالسابق: {float(old[0]):.2f} ريال\\nالحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\n{title}\nالسابق: {float(old[0]):.2f} ريال\nالحالي: {price:.2f} ريال"
             conn.execute("""
               INSERT INTO green_deal_products(page_id,asin,title,price,product_url,present,last_seen_at)
               VALUES (%s,%s,%s,%s,%s,true,now())
@@ -275,7 +275,7 @@ def scan_page(page_id, url):
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
         if event:
-            send(f"{event}\\n{product_url}")
+            send(f"{event}\n🔗 {product_url}")
 
     collect_products(url, save_product)
     if not found:
@@ -293,14 +293,25 @@ def run(continuous):
         with db() as conn:
             pages = conn.execute("SELECT id,url FROM green_deal_pages WHERE active=true ORDER BY id").fetchall()
         for page_id, url in pages:
-            try:
+            completed = False
+            for attempt in range(1, 5):
+                try:
+                    with db() as conn:
+                        conn.execute("UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s", (page_id,))
+                    print(f"Starting page {page_id}, attempt {attempt}/4")
+                    scan_page(page_id, url)
+                    completed = True
+                    break
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
+                    with db() as conn:
+                        conn.execute("UPDATE green_deal_pages SET last_error=%s WHERE id=%s", (detail, page_id))
+                    if attempt < 4:
+                        time.sleep((10, 20, 40)[attempt - 1])
+            if not completed:
                 with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s", (page_id,))
-                scan_page(page_id, url)
-            except Exception as exc:
-                with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=%s,scan_started_at=NULL WHERE id=%s", (f"{type(exc).__name__}: {str(exc)[:300]}", page_id))
-                print(f"Page {page_id} scan failed: {type(exc).__name__}: {exc}")
+                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),scan_started_at=NULL WHERE id=%s", (page_id,))
             offset = handle_updates(offset)
         if not continuous:
             break
