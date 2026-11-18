@@ -47,10 +47,8 @@ jobs:
             -i "$HOME/.ssh/oracle_pg_key" coupon-tunnel@84.13.143.171
       - name: Install tracker dependencies
         run: python -m pip install "playwright>=1.52,<2" "requests>=2.32,<3" "psycopg[binary]>=3.2,<4"
-      - name: Install Chromium
-        run: python -m playwright install --with-deps chromium
       - name: Run green promotion page tracker
-        run: python -u green_promotion_tracker.py ${{ inputs.continuous && '--continuous' || '' }}
+        run: python -u green_promotion_tracker.py --prepare-browser ${{ inputs.continuous && '--continuous' || '' }}
       - name: Close SSH tunnel
         if: always()
         run: |
