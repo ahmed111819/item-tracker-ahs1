@@ -686,7 +686,33 @@ def read_card_image(card):
     return ""
 
 
-def collect_products(url, on_product, on_offer_title, browser_channel=None):
+SHOW_MORE_NAME = re.compile(r"^\s*(إظهار المزيد|Show more|Load more)\s*$", re.I)
+SHOW_MORE_WRAPPER = (
+    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' a-button ')][1]"
+)
+CLICKABLE = "input.a-button-input, button, a[href], [role='button'], input[type='submit'], input[type='button']"
+
+
+def show_more_button(page):
+    labels = page.get_by_text(SHOW_MORE_NAME).filter(visible=True)
+    for label in reversed(labels.all()):
+        # Amazon's button text can be a span sitting on top of the actual input.
+        wrapper = label.locator(SHOW_MORE_WRAPPER)
+        controls = wrapper.locator(CLICKABLE).filter(visible=True)
+        if controls.count():
+            return controls.first
+        control = label.locator("xpath=ancestor-or-self::*[self::button or self::a or @role='button'][1]")
+        if control.count():
+            return control
+    control = page.get_by_role("button", name=SHOW_MORE_NAME).filter(visible=True).last
+    if control.count():
+        return control
+    if labels.count():
+        raise RuntimeError("Show more label was visible but no clickable control was found.")
+    return None
+
+
+def collect_products(url, on_batch, on_offer_title, browser_channel=None):
     products = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, channel=browser_channel)
@@ -709,6 +735,7 @@ def collect_products(url, on_product, on_offer_title, browser_channel=None):
                 snapshots = cards.evaluate_all(READ_PRODUCT_CARDS)
                 print(f"Promotion batch {batch + 1}: {len(snapshots)} product cards read "
                       f"in {time.monotonic() - batch_start:.2f}s")
+                changed = {}
                 for card in snapshots:
                     asin = card["asin"]
                     price = read_card_price(card)
@@ -718,29 +745,37 @@ def collect_products(url, on_product, on_offer_title, browser_channel=None):
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
                     product = (card["title"][:300] or asin, price, product_url, read_card_image(card))
                     if products.get(asin) != product:
-                        products[asin] = product
-                        on_product(asin, *product)
+                        changed[asin] = product
+                if changed:
+                    on_batch(changed)
+                    products.update(changed)
                 print(f"Promotion batch {batch + 1} processed in {time.monotonic() - batch_start:.2f}s")
 
-                more = page.get_by_text(re.compile(r"^\s*(إظهار المزيد|Show more|Load more)\s*$", re.I)).last
-                if more.count() == 0:
-                    print("No visible 'show more' control was found.")
-                    break
                 try:
-                    if not more.is_visible() or not more.is_enabled():
-                        print("'Show more' control is hidden or disabled.")
+                    more = show_more_button(page)
+                    if more is None or not more.is_enabled():
+                        print("No enabled 'show more' control; reached the end of the offer.")
                         break
-                    before_count = cards.count()
-                    more.scroll_into_view_if_needed(timeout=3000)
-                    more.click(timeout=8000)
+                    previous = list({card["asin"] for card in snapshots})
+                    more.click(timeout=5000)
                     page.wait_for_function(
-                        "(previous) => document.querySelectorAll('[data-asin]').length > previous",
-                        arg=before_count,
+                        """previous => {
+                            const seen = new Set(previous);
+                            return [...document.querySelectorAll('[data-asin]')].some(card => {
+                                const asin = (card.getAttribute('data-asin') || '').trim();
+                                return /^[A-Z0-9]{10}$/.test(asin) && !seen.has(asin);
+                            });
+                        }""",
+                        arg=previous,
                         timeout=12000,
                     )
                     page.wait_for_timeout(700)
-                except Exception as exc:
-                    raise RuntimeError(f"Could not load next batch after {len(products)} products: {type(exc).__name__}: {exc}") from exc
+                except PlaywrightError as exc:
+                    raise RuntimeError(
+                        f"Could not load next batch after {len(products)} products: {str(exc).splitlines()[0]}"
+                    ) from exc
+            else:
+                raise RuntimeError("Pagination limit reached; scan is incomplete.")
             if not products:
                 body = (page.locator("body").inner_text(timeout=3000) or "")[:500]
                 raise RuntimeError(f"No priced ASIN products were parsed. Page title={page.title()!r}; body preview={body!r}")
@@ -879,7 +914,40 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                     (page_id, asin),
                 )
 
-    collect_products(url, save_product, save_offer_title, browser_channel)
+    def save_batch(products):
+        incoming = [
+            {"asin": asin, "title": title, "price": price, "product_url": url}
+            for asin, (title, price, url, _) in products.items()
+        ]
+        with conn.transaction():
+            page_active = conn.execute(
+                "SELECT active FROM green_deal_pages WHERE id=%s FOR SHARE", (page_id,)
+            ).fetchone()
+            if not page_active or not page_active[0]:
+                raise ScanStopped()
+            rows = conn.execute("""
+                UPDATE green_deal_products AS saved
+                SET title=incoming.title, product_url=incoming.product_url, last_seen_at=now()
+                FROM jsonb_to_recordset(%s::jsonb)
+                    AS incoming(asin text, title text, price numeric, product_url text)
+                WHERE saved.page_id=%s AND saved.asin=incoming.asin
+                  AND saved.present AND saved.price=incoming.price AND saved.pending_alert IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM green_deal_product_blocks AS block
+                      WHERE block.asin=saved.asin AND block.resume_price >= incoming.price
+                  )
+                RETURNING saved.asin
+            """, (json.dumps(incoming), page_id)).fetchall()
+        unchanged = {row[0] for row in rows}
+        print(f"Updated {len(unchanged)} unchanged products in one query; "
+              f"{len(products) - len(unchanged)} require individual processing.")
+        for asin, product in products.items():
+            if asin in unchanged:
+                found[asin] = product[:3]
+            else:
+                save_product(asin, *product)
+
+    collect_products(url, save_batch, save_offer_title, browser_channel)
     if not found:
         raise RuntimeError("No products could be read. Treating this scan as incomplete.")
     with conn.transaction():
@@ -890,6 +958,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
 def scan_loop(continuous, browser_channel=None):
     while True:
         SCAN_REQUESTED.clear()
+        round_started = time.monotonic()
         today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
         with db() as conn:
             conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
@@ -923,6 +992,8 @@ def scan_loop(continuous, browser_channel=None):
                     conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),scan_started_at=NULL WHERE id=%s", (page_id,))
         if not continuous:
             break
+        print(f"Scan round finished in {time.monotonic() - round_started:.1f}s. "
+              f"Waiting up to {WAIT_SECONDS}s before the next round.")
         SCAN_REQUESTED.wait(WAIT_SECONDS)
 
 
