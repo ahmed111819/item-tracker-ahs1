@@ -34,6 +34,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
 HTTP = requests.Session()
 SCAN_REQUESTED = Event()
+RETURN_ALERT = "↩️ عاد المنتج للظهور"
 TELEGRAM = local()
 
 
@@ -51,7 +52,7 @@ def init_db():
           last_checked_at timestamptz, last_error text, scan_started_at timestamptz
         );
         CREATE TABLE IF NOT EXISTS green_deal_product_blocks (asin text PRIMARY KEY, blocked_price numeric NOT NULL, resume_price numeric NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
-        CREATE TABLE IF NOT EXISTS green_deal_product_preferences (asin text PRIMARY KEY, favorite boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now());
+        CREATE TABLE IF NOT EXISTS green_deal_product_preferences (asin text PRIMARY KEY, favorite boolean NOT NULL DEFAULT false, following boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS green_deal_products (
           page_id bigint NOT NULL REFERENCES green_deal_pages(id) ON DELETE CASCADE,
           asin text NOT NULL, title text NOT NULL DEFAULT '', price numeric,
@@ -63,6 +64,7 @@ def init_db():
         """)
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS scan_started_at timestamptz")
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS title text NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE green_deal_product_preferences ADD COLUMN IF NOT EXISTS following boolean NOT NULL DEFAULT false")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_alert text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_url text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_image_url text")
@@ -105,13 +107,13 @@ def send(text, markup=None, *, parse_mode=None, disable_preview=False):
 
 
 
-def product_keyboard(asin, price, favorite, muted, blocked):
+def product_keyboard(asin, price, following, muted, blocked):
     suffix = f":{price:.2f}" if price is not None else ""
-    favorite_action = "unfavorite" if favorite else "favorite"
+    follow_action = "unfollow" if following else "follow"
     mute_action = "unmute" if muted else "mute"
-    favorite_label = "⭐ إزالة من المفضلة" if favorite else "☆ إضافة للمفضلة"
+    follow_label = "إيقاف متابعة المنتج" if following else "👀 متابعة المنتج"
     mute_label = "🔔 استئناف التنبيه" if muted else "🔕 إيقاف التنبيه"
-    main_row = [menu_button(favorite_label, f"deal:{favorite_action}:{asin}{suffix}")]
+    main_row = [menu_button(follow_label, f"deal:{follow_action}:{asin}{suffix}")]
     if blocked:
         main_row.append(menu_button("✅ فك الحجب", f"deal:unblock:{asin}{suffix}"))
     elif price is not None:
@@ -124,7 +126,7 @@ def product_keyboard(asin, price, favorite, muted, blocked):
 
 def get_product_controls(conn, asin):
     row = conn.execute("""
-        SELECT COALESCE(pref.favorite,false), COALESCE(pref.muted,false),
+        SELECT COALESCE(pref.following,false), COALESCE(pref.muted,false),
                EXISTS(SELECT 1 FROM green_deal_product_blocks WHERE asin=product.asin)
         FROM (VALUES (%s::text)) AS product(asin)
         LEFT JOIN green_deal_product_preferences AS pref ON pref.asin=product.asin
@@ -134,10 +136,10 @@ def get_product_controls(conn, asin):
 
 def send_product_alert(caption, product_url, image_url, asin, price):
     with db() as conn:
-        favorite, muted, blocked = get_product_controls(conn, asin)
-    if muted or blocked:
+        following, muted, blocked = get_product_controls(conn, asin)
+    if muted or blocked or (caption.startswith(RETURN_ALERT) and not following):
         return
-    markup = product_keyboard(asin, price, favorite, muted, blocked)
+    markup = product_keyboard(asin, price, following, muted, blocked)
     link = f'<a href="{escape(product_url, quote=True)}">رابط المنتج</a>'
     message_text = f"{escape(caption[:1000].rstrip())}\n\n{link}"
 
@@ -208,7 +210,7 @@ def add_page(value):
 
 MENU_SIZE = 5
 PRODUCT_MENUS = {
-    "favorites": ("⭐ المفضلة", "إزالة من المفضلة", "favorite"),
+    "following": ("👀 المنتجات المتابَعة", "إيقاف متابعة المنتج", "following"),
     "blocked": ("🚫 المنتجات المحجوبة", "فك الحجب", None),
     "muted": ("🔕 التنبيهات الموقوفة", "استئناف التنبيه", "muted"),
 }
@@ -265,12 +267,12 @@ def show_help(message=None):
         "/pages — الصفحات المتابعة\n"
         "/status — حالة الفحص",
         "<b>إدارة المنتجات</b>\n"
-        "/favorites — المفضلة\n"
+        "/following — المنتجات المتابَعة\n"
         "/blocked — المنتجات المحجوبة\n"
         "/muted — التنبيهات الموقوفة",
     ], [
         [menu_button("📋 الصفحات", "menu:pages:0"), menu_button("🔎 حالة الفحص", "menu:status:0")],
-        [menu_button("⭐ المفضلة", "menu:favorites:0"), menu_button("🚫 المحجوبات", "menu:blocked:0")],
+        [menu_button("👀 المنتجات المتابَعة", "menu:following:0"), menu_button("🚫 المحجوبات", "menu:blocked:0")],
         [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0")],
     ], message)
 
@@ -383,6 +385,8 @@ def command(update):
     if not words:
         return
     name = words[0].split("@", 1)[0]
+    if name == "/favorites":
+        name = "/following"
     argument = words[1].strip() if len(words) > 1 else ""
     if name == "/add":
         if argument:
@@ -410,8 +414,13 @@ def menu_callback(query, message, data):
             show_help(message)
         elif view in {"pages", "status"}:
             show_pages(view, page, message)
+        elif view == "favorites":
+            show_product_menu("following", page, message)
         elif view in PRODUCT_MENUS:
             show_product_menu(view, page, message)
+    elif manage and manage[1] == "favorites":
+        answer_callback(answer)
+        show_product_menu("following", int(manage[2]), message)
     elif manage and manage[1] in PRODUCT_MENUS:
         view, raw_page, asin = manage.groups()
         preference = PRODUCT_MENUS[view][2]
@@ -448,7 +457,7 @@ def menu_callback(query, message, data):
 
 def product_callback(query, message, parts):
     answer = {"callback_query_id": query["id"]}
-    actions = {"block", "unblock", "favorite", "unfavorite", "mute", "unmute"}
+    actions = {"block", "unblock", "follow", "unfollow", "favorite", "unfavorite", "mute", "unmute"}
     if len(parts) not in (3, 4) or parts[1] not in actions or not re.fullmatch(r"[A-Z0-9]{10}", parts[2]):
         answer_callback({**answer, "text": "بيانات الزر غير صالحة", "show_alert": True})
         return
@@ -468,7 +477,7 @@ def product_callback(query, message, parts):
         return
 
     with db() as conn:
-        favorite, muted, _ = get_product_controls(conn, asin)
+        _, muted, _ = get_product_controls(conn, asin)
         if action == "block":
             resume_price = round(price * 0.95, 2)
             row = conn.execute("""
@@ -479,22 +488,24 @@ def product_callback(query, message, parts):
         elif action == "unblock":
             conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
             confirmation = "تم فك الحجب ✅"
+        elif action in {"favorite", "unfavorite"}:
+            confirmation = "اضغط «متابعة المنتج» لتفعيل تنبيه الرجوع"
         else:
-            column = "favorite" if action in {"favorite", "unfavorite"} else "muted"
-            if version == "product" and action in {"favorite", "mute"}:
-                active = not (favorite if column == "favorite" else muted)
+            column = "following" if action in {"follow", "unfollow"} else "muted"
+            if version == "product" and action == "mute":
+                active = not muted
             else:
-                active = action in {"favorite", "mute"}
+                active = action in {"follow", "mute"}
             conn.execute(f"""
                 INSERT INTO green_deal_product_preferences(asin,{column}) VALUES (%s,%s)
                 ON CONFLICT(asin) DO UPDATE SET {column}=excluded.{column},updated_at=now()
             """, (asin, active))
-            if column == "favorite":
-                confirmation = "أضيف للمفضلة ⭐" if active else "أزيل من المفضلة"
+            if column == "following":
+                confirmation = "بتوصلك رسالة إذا رجع المنتج للصفحة" if active else "تم إيقاف متابعة المنتج"
             else:
                 confirmation = "تم إيقاف التنبيه 🔕" if active else "تم استئناف التنبيه 🔔"
 
-        favorite, muted, blocked = get_product_controls(conn, asin)
+        following, muted, blocked = get_product_controls(conn, asin)
         if price is None:
             row = conn.execute("""
                 SELECT price FROM green_deal_products
@@ -508,7 +519,7 @@ def product_callback(query, message, parts):
         tg("editMessageReplyMarkup", {
             "chat_id": CHAT_ID,
             "message_id": message["message_id"],
-            "reply_markup": product_keyboard(asin, price, favorite, muted, blocked),
+            "reply_markup": product_keyboard(asin, price, following, muted, blocked),
         })
     except requests.HTTPError as exc:
         response = exc.response
@@ -846,7 +857,8 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 raise ScanStopped()
             state = conn.execute("""
                 SELECT saved.price, saved.present, saved.pending_alert, saved.pending_url,
-                       saved.pending_image_url, COALESCE(pref.muted,false), block.resume_price
+                       saved.pending_image_url, COALESCE(pref.muted,false),
+                       COALESCE(pref.following,false), block.resume_price
                 FROM (VALUES (%s::text)) AS product(asin)
                 LEFT JOIN LATERAL (
                     SELECT price,present,pending_alert,pending_url,pending_image_url
@@ -857,7 +869,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 LEFT JOIN green_deal_product_blocks AS block ON block.asin=product.asin
             """, (asin, page_id)).fetchone()
             old = state[:5] if state[1] is not None else None
-            is_muted, resume_price = state[5:]
+            is_muted, following, resume_price = state[5:]
             event = None
             if resume_price is not None and price > float(resume_price):
                 event = None
@@ -867,14 +879,21 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
             elif old is None:
                 event = f"🆕 منتج جديد\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
+                if following:
+                    event = f"{RETURN_ALERT}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and price < float(old[0]):
                 event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
+            if pending_alert and pending_alert.startswith(RETURN_ALERT) and not following:
+                conn.execute(
+                    "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL "
+                    "WHERE page_id=%s AND asin=%s", (page_id, asin),
+                )
+                pending_alert = None
             was_pending = bool(pending_alert and not is_muted and resume_price is None)
-            alert_url = old[3] if old and old[3] else product_url
-            alert_image = old[4] if old and old[4] else image_url
+            alert_url = (old[3] or product_url) if was_pending else product_url
+            alert_image = (old[4] or image_url) if was_pending else image_url
             if was_pending:
                 event = pending_alert
             conn.execute("""
