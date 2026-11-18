@@ -126,7 +126,8 @@ def _price_markdown(current_price: float | None, reference_price: float | None) 
     }
 
 
-def classify_deals(*, current_price, reference_price, card_text):
+def classify_deals(*, current_price, reference_price, card_text, regular_price_verified=True):
     """Classify independent offers; unknown conditions remain reviewable."""
     from deal_offer_rules import classify_offers
-    return classify_offers(current_price, reference_price, card_text)
+    return classify_offers(current_price, reference_price, card_text,
+                           regular_price_verified=regular_price_verified)

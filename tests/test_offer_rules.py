@@ -174,6 +174,39 @@ class ReviewedBasketOffersTests(unittest.TestCase):
         self.assertEqual((offer['discount_percent'], offer['minimum_spend']), (45, 80))
         self.assertFalse(read('Save 45% when you buy SAR 80.00 of select items, maximum SAR 10')['offers'])
 
+    def test_prime_member_price_is_a_promotion_with_its_own_threshold(self):
+        for text in ('Join Prime to buy this item at SAR 29.99',
+                     'انضم إلى برايم لشراء هذا المنتج بسعر 29.99 ريال'):
+            with self.subTest(text=text):
+                offer = select_qualifying_offer(read(text, 49.99), 90, 40)
+                self.assertEqual(offer['type'], 'prime_price_promotion')
+                self.assertEqual(offer['pay_price'], 29.99)
+                self.assertIsNone(select_qualifying_offer(read(text, 49.98), 40, 40))
+
+    def test_prime_without_a_verified_regular_price_is_reviewable(self):
+        text = 'Join Prime to buy this item at SAR 29.99'
+        for price, verified in ((None, True), (29.99, True), (50, False)):
+            with self.subTest(price=price, verified=verified):
+                deals = classify_deals(current_price=price, reference_price=80,
+                                       card_text=text, regular_price_verified=verified)
+                self.assertFalse(deals['offers'])
+                self.assertEqual(deals['unrecognized'][0]['reason'], 'prime_regular_price_unverified')
+
+    def test_only_corroborated_bare_markdown_badges_are_removed_from_review(self):
+        for current, reference, text in ((11.95, 43.56, 'Save 73%'),
+                                         (15.48, 40, 'Save 61.30%'),
+                                         (39, 79, 'خصم 51%')):
+            with self.subTest(text=text):
+                deals = classify_deals(current_price=current, reference_price=reference,
+                                       card_text=text + '; Buy 3 get a special discount')
+                self.assertIsNotNone(deals['price_drop'])
+                self.assertFalse(deals['offers'])
+                self.assertEqual([case['text'] for case in deals['unrecognized']],
+                                 ['Buy 3 get a special discount'])
+        self.assertTrue(read('Save 73%')['unrecognized'])
+        self.assertTrue(classify_deals(current_price=11.95, reference_price=43.56,
+                                      card_text='Save 80%')['unrecognized'])
+
     def test_unhandled_later_item_is_never_an_all_items_offer(self):
         d = read('Buy 4 and get 50% off the fifth item')
         self.assertFalse(d['offers'])

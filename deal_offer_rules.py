@@ -22,6 +22,12 @@ COUPON = r"(?:coupon|voucher|(?:ال)?قسيم[ةه]|كوبون)"
 CURRENCY = r"(?:SAR|ريال(?:ا)?|ر\.س\.?)"
 UNVERIFIED_TERMS = re.compile(r"\b(?:up to|maximum|max\.?|bank|cardholders?|subscribe|subscription|cashback|prime|selected|eligible|different|cheapest|lowest)\b|حتى|بحد\s*(?:اقصى|أقصى)|بنك|بطاقة|اشتراك|استرداد|برايم|مختار|مؤهل|الارخص|الأرخص|الاقل|الأقل", re.I)
 _REPORTED = set()
+PRIME_PRICE = (
+    r'^(?:join\s+(?:amazon\s+)?prime\s+to\s+buy\s+this\s+(?:item|product)\s+(?:at|for)'
+    r'|انضم\s+(?:إلى|الى)\s+(?:أمازون\s+|امازون\s+)?برايم\s+لشراء\s+هذا\s+المنتج\s+ب(?:سعر)?)\s*'
+    rf'(?:{CURRENCY}\s*(?P<prime_a>{AMOUNT})|(?P<prime_b>{AMOUNT})\s*{CURRENCY})\s*\.?$'
+)
+SAVINGS_BADGE = re.compile(rf'^(?:save|وفر|خصم)\s*(?P<rate>{NUM})\s*%\s*\.?$', re.I)
 PARTIAL_QUANTITY = (
     rf'^{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?[,،]?\s*(?:and\s+)?'
     rf'(?:save|get|وفر|و?احصل(?:\s+عل[ىي])?)\s*(?:خصم\s*)?(?P<rate>{NUM})\s*%'
@@ -91,7 +97,7 @@ def calculated(kind, description, unit, quantity=1, *, paid_quantity=None,
                 quantity_condition=int(qty) > 1, equal_price_assumption=int(qty) > 1)
 
 
-def classify_offers(current_price, reference_price, card_text):
+def classify_offers(current_price, reference_price, card_text, *, regular_price_verified=True):
     # Preserve sentence boundaries before whitespace normalization. A percent
     # elsewhere in a card must never be attributed to a nearby coupon marker.
     raw = str(card_text or '')
@@ -101,6 +107,7 @@ def classify_offers(current_price, reference_price, card_text):
     clauses = [normalize_text(t) for t in re.split(r'[\n;؛]|(?<=[%!?])\s*\.\s*|(?<!\d)\.(?!\d)', raw)]
     clauses = [t for t in clauses if t]
     offers, unknown = [], []
+    price_drop = _price_markdown(current_price, reference_price)
 
     def add(candidate):
         if candidate and not any((x['type'],x['quantity'],x['pay_price'],x['stated_discount_percent']) ==
@@ -112,6 +119,25 @@ def classify_offers(current_price, reference_price, card_text):
     for text in clauses:
         text = re.sub(rf'({BUY})\s*(?:قطعتين|منتجين|اثنين|اثنتين)\b', r'\1 2 قطع', text, flags=re.I)
         text = re.sub(rf'({BUY})\s*(?:خمسة|خمس)\b', r'\1 5', text, flags=re.I)
+        badge = SAVINGS_BADGE.fullmatch(text)
+        if badge and price_drop:
+            advertised = number(badge['rate'])
+            calculated_rate = number(price_drop['discount_percent'])
+            if advertised == calculated_rate.quantize(advertised, rounding=ROUND_HALF_UP):
+                continue
+
+        prime = re.fullmatch(PRIME_PRICE, text, re.I)
+        if prime:
+            member_price = number(prime['prime_a'] or prime['prime_b'])
+            regular_price = number(current_price) if regular_price_verified else None
+            if regular_price and member_price and member_price < regular_price:
+                offer = calculated('prime_price_promotion', text, regular_price, total=member_price)
+                offer['discount_percent'] = float((regular_price - member_price) / regular_price * 100)
+                add(offer)
+            else:
+                unknown.append(dict(text=text[:500], reason='prime_regular_price_unverified'))
+            continue
+
         occupied = []
         review_start = len(unknown)
 
@@ -253,7 +279,7 @@ def classify_offers(current_price, reference_price, card_text):
 
     coupons = [o for o in offers if 'coupon' in o['type']]
     promos = [o for o in offers if 'coupon' not in o['type']]
-    return dict(price_drop=_price_markdown(current_price,reference_price),
+    return dict(price_drop=price_drop,
                 coupon=max(coupons,key=lambda o:o['discount_percent'],default=None),
                 promotion=max(promos,key=lambda o:o['discount_percent'],default=None),
                 offers=offers, unrecognized=unknown)
@@ -279,6 +305,25 @@ def reviewed_promotion_details(offer):
         return (f"🏷️ نسبة الخصم على القطع المشمولة: {offer['stated_discount_percent']:.2f}%\n"
                 f"🛒 التوفير على الإجمالي: {offer['discount_percent']:.2f}%\n")
     return ""
+
+
+def offer_payable_details(offer):
+    """Display the calculated payable amount and its purchase conditions."""
+    if not offer or offer.get('pay_price') is None:
+        return ""
+    amount = offer['pay_price']
+    kind = offer['type']
+    quantity = offer.get('quantity', 1)
+    if 'coupon' in kind:
+        return f"💳 السعر بعد الكوبون: {amount:.2f} SAR\n"
+    if kind == 'prime_price_promotion':
+        return f"💳 السعر لأعضاء برايم: {amount:.2f} SAR\n"
+    if kind == 'spend_tier_promotion':
+        return f"💳 إجمالي السلة بعد خصم الشريحة: {amount:.2f} SAR (عند شراء {offer['minimum_spend']:.2f} SAR)\n"
+    if quantity > 1:
+        label = "الإجمالي التقديري" if offer.get('equal_price_assumption') and kind != 'partial_quantity_promotion' else "الإجمالي"
+        return f"💳 {label} لـ{quantity} قطع بعد العرض: {amount:.2f} SAR\n"
+    return f"💳 السعر بعد العرض: {amount:.2f} SAR\n"
 
 
 def record_unrecognized(asin, bot_id, deals):

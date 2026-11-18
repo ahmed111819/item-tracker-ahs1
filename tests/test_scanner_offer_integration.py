@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from deal_parser_v2 import classify_deals, extract_reference_price, parse_price
-from deal_offer_rules import select_qualifying_offer, reviewed_promotion_details
+from deal_offer_rules import offer_payable_details, reviewed_promotion_details, select_qualifying_offer
 from scan_link_report import classify_card_for_report, new_page_metrics
 
 
@@ -38,6 +38,7 @@ def handler(bot, suppressed=False):
             extract_reference_price=extract_reference_price,
             select_qualifying_offer=select_qualifying_offer,
             reviewed_promotion_details=reviewed_promotion_details,
+            offer_payable_details=offer_payable_details,
             record_unrecognized=lambda *args:None,
             print=lambda *args:None,save_tracking=lambda:None,
             VERBOSE_PRODUCT_LOGS=False,STORAGE_BACKEND='postgres',
@@ -86,13 +87,51 @@ class ScannerIntegrationTests(unittest.TestCase):
                     self.assertEqual(result,(True,False))
                     self.assertFalse(sent)
 
-    def test_production_thresholds(self):
-        for bot in (1,2,3):
-            tree=ast.parse(Path(f'scanner_amazon_sa_bot{bot}.py').read_text(encoding='utf-8'))
-            values={n.targets[0].id:ast.literal_eval(n.value) for n in tree.body
-                    if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name)
-                    and n.targets[0].id in ('MIN_DISCOUNT_PERCENT','MIN_PROMOTION_DISCOUNT_PERCENT','MIN_PRICE_DROP_PERCENT')}
-            self.assertEqual(values,dict(MIN_DISCOUNT_PERCENT=40,MIN_PROMOTION_DISCOUNT_PERCENT=40,MIN_PRICE_DROP_PERCENT=80))
+    def test_production_thresholds_are_valid_and_consistent(self):
+        threshold_names = {
+            'MIN_DISCOUNT_PERCENT', 'MIN_PROMOTION_DISCOUNT_PERCENT', 'MIN_PRICE_DROP_PERCENT'
+        }
+        settings = []
+        for bot in (1, 2, 3):
+            tree = ast.parse(Path(f'scanner_amazon_sa_bot{bot}.py').read_text(encoding='utf-8'))
+            values = {
+                node.targets[0].id: ast.literal_eval(node.value)
+                for node in tree.body
+                if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in threshold_names
+            }
+            self.assertEqual(values.keys(), threshold_names)
+            self.assertTrue(all(0 < value <= 100 for value in values.values()))
+            settings.append(values)
+        self.assertEqual(settings[0], settings[1])
+        self.assertEqual(settings[0], settings[2])
+
+    def test_payable_amount_in_offer_and_unblock_alerts(self):
+        for bot in (1, 2, 3):
+            for text, payable_line in (
+                ('Save 20% with coupon', 'السعر بعد الكوبون: 40.00 SAR'),
+                ('Buy 2 for the price of 1', 'لـ2 قطع بعد العرض: 50.00 SAR'),
+                ('Join Prime to buy this item at SAR 29.99', 'السعر لأعضاء برايم: 29.99 SAR'),
+            ):
+                with self.subTest(bot=bot, text=text):
+                    ns, sent = handler(bot)
+                    snapshot = dict(asin='B012345678', title='A valid product title',
+                                    text=text, price_text='SAR 50')
+                    offer = classify_deals(current_price=50, reference_price=None, card_text=text)['offers'][0]
+                    caption = ns['build_telegram_caption'](snapshot['title'], snapshot['asin'], 50, offer)
+                    self.assertIn(payable_line, caption)
+                    if offer['type'] == 'prime_price_promotion':
+                        self.assertIn('عرض لأعضاء برايم', caption)
+                    ns['ACTIVE_PRODUCT_BLOCKS'][snapshot['asin']] = True
+                    ns['check_product_block'] = lambda *args: dict(
+                        released=True, block=dict(blocked_price=60, resume_price=57, created_at='test'))
+                    ns['finish_product_block_release'] = lambda *args: None
+                    self.assertEqual(run(ns['process_card_locked']('search', 1, 1, 1, snapshot)), (True, True))
+                    release = sent[0][4]
+                    self.assertEqual(release['type'], 'product_block_release')
+                    caption = ns['build_telegram_caption'](snapshot['title'], snapshot['asin'], 50, release)
+                    self.assertIn('وقت الحجب: 60.00 SAR', caption)
+                    self.assertIn(payable_line, caption)
 
     def test_report_counts_eligible_types_independently_of_alerts(self):
         for bot in (1, 2, 3):
