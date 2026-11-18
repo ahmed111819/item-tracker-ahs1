@@ -11,6 +11,7 @@ import os
 import re
 import time
 import tempfile
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -25,6 +26,7 @@ DB_URL = os.environ["GREEN_DEALS_DATABASE_URL"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
 HTTP = requests.Session()
+SCAN_REQUESTED = False
 
 
 def db():
@@ -40,16 +42,22 @@ def init_db():
           added_at timestamptz NOT NULL DEFAULT now(),
           last_checked_at timestamptz, last_error text, scan_started_at timestamptz
         );
+        CREATE TABLE IF NOT EXISTS green_deal_product_blocks (asin text PRIMARY KEY, blocked_price numeric NOT NULL, resume_price numeric NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+        CREATE TABLE IF NOT EXISTS green_deal_product_preferences (asin text PRIMARY KEY, favorite boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS green_deal_products (
           page_id bigint NOT NULL REFERENCES green_deal_pages(id) ON DELETE CASCADE,
           asin text NOT NULL, title text NOT NULL DEFAULT '', price numeric,
           product_url text NOT NULL, present boolean NOT NULL DEFAULT true,
+          pending_alert text, pending_url text, pending_image_url text,
           last_seen_at timestamptz NOT NULL DEFAULT now(),
           PRIMARY KEY(page_id, asin)
         );
         """)
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS scan_started_at timestamptz")
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS title text NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_alert text")
+        conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_url text")
+        conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_image_url text")
 
 
 def tg(method, payload):
@@ -71,8 +79,15 @@ def send(text, markup=None):
 
 
 
-def send_product_alert(caption, product_url, image_url):
-    markup = {"inline_keyboard": [[{"text": "🛒 رابط المنتج", "url": product_url}]]}
+def send_product_alert(caption, product_url, image_url, asin, price):
+    markup = {"inline_keyboard": [
+        [{"text": "🛒 فتح المنتج", "url": product_url}],
+        [
+            {"text": "⭐ المفضلة", "callback_data": f"product:favorite:{asin}"},
+            {"text": "🚫 حجب مؤقت", "callback_data": f"product:block:{asin}:{price:.2f}"},
+        ],
+        [{"text": "🔕 إيقاف تنبيه المنتج", "callback_data": f"product:mute:{asin}"}],
+    ]}
     message_text = caption + "\n👇 رابط فتح المنتج بالزر"
 
     if image_url:
@@ -120,10 +135,12 @@ def send_product_alert(caption, product_url, image_url):
 
 def valid_url(value):
     parsed = urlparse(value)
-    return parsed.scheme == "https" and parsed.netloc.endswith("amazon.sa") and "/promotion/psp/" in parsed.path
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "amazon.sa" or host.endswith(".amazon.sa")) and "/promotion/psp/" in parsed.path
 
 
 def add_page(value):
+    global SCAN_REQUESTED
     parts = [part.strip() for part in value.split("|", 1)]
     url = parts[0]
     title = parts[1] if len(parts) > 1 else ""
@@ -137,6 +154,7 @@ def add_page(value):
             "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
             (url, title),
         )
+    SCAN_REQUESTED = True
     send(f"تمت إضافة صفحة العرض للمتابعة ✅\n{title or 'سيُقرأ اسم العرض في أول فحص'}\n{url}")
 
 
@@ -148,28 +166,36 @@ def show_pages():
         return
     lines = ["صفحات العروض المتابعة:"]
     buttons = []
-    for page_id, url, active, title, expiry, checked in rows:
+    for position, (page_id, url, active, title, expiry, checked) in enumerate(rows, start=1):
         status = "تعمل" if active else "متوقفة"
         end = expiry.isoformat() if expiry else "غير محدد"
         lines.append(f"{page_id}. {title or 'اسم العرض'} • {status} • النهاية: {end}\n{url}")
-        buttons.append([{"text": f"إيقاف #{page_id}" if active else f"استئناف #{page_id}", "callback_data": f"page:{'pause' if active else 'resume'}:{page_id}"}])
+        buttons.append([{"text": str(position), "callback_data": f"page:show:{page_id}"}, {"text": "⏸" if active else "▶️", "callback_data": f"page:{'pause' if active else 'resume'}:{page_id}"}])
         buttons.append([{"text": f"حذف #{page_id}", "callback_data": f"page:delete:{page_id}"}])
     send("\n\n".join(lines), {"inline_keyboard": buttons})
 
 
 def command(update):
-    msg = update.get("message", {})
-    if str((msg.get("chat") or {}).get("id")) != CHAT_ID:
+    message = update.get("message", {})
+    chat = message.get("chat") or {}
+    if str(chat.get("id", "")) != CHAT_ID:
         return
-    text = (msg.get("text") or "").strip()
-    if text.startswith("/add"):
-        add_page(text[len("/add"):].strip())
-    elif text.startswith("/pages"):
+    if THREAD_ID and message.get("message_thread_id") not in (None, THREAD_ID):
+        return
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+    words = text.split(maxsplit=1)
+    name = words[0].split("@", 1)[0]
+    argument = words[1].strip() if len(words) > 1 else ""
+    if name == "/add":
+        add_page(argument)
+    elif name == "/pages":
         show_pages()
-    elif text.startswith("/status"):
+    elif name == "/status":
         show_status()
-    elif text.startswith("/help") or text.startswith("/start"):
-        send("👀 متابع صفحات العروض\n\n/add رابط | اسم العرض — إضافة صفحة\n/pages — الصفحات والأزرار\n/status — حالة الفحص\n\nمثال\n/add https://www.amazon.sa/promotion/psp/… | وفر 15٪ عند شراء 100 ريال")
+    elif name in {"/help", "/start"}:
+        send("👀 متابع صفحات العروض\\n\\n/add رابط | اسم العرض — إضافة صفحة\\n/pages — الصفحات والأزرار\\n/status — حالة الفحص")
 
 
 def show_status():
@@ -184,29 +210,73 @@ def show_status():
     for page_id,url,active,checked,error,started in rows:
         present,total = count_map.get(page_id,(0,0))
         state = "يفحص الآن" if started else ("مفعّل" if active else "متوقف")
-        last = checked.strftime("%Y-%m-%d %H:%M UTC") if checked else "لم يفحص بعد"
+        last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M بتوقيت الرياض") if checked else "لم يفحص بعد"
         issue = f"\nآخر خطأ: {error}" if error else ""
         lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\n{url}")
     send("\n\n".join(lines))
 
 
 def callback(update):
-    q = update.get("callback_query", {})
-    msg = q.get("message", {})
-    if str((msg.get("chat") or {}).get("id")) != CHAT_ID:
+    global SCAN_REQUESTED
+    query = update.get("callback_query", {})
+    message = query.get("message", {})
+    if str((message.get("chat") or {}).get("id")) != CHAT_ID:
         return
+    data = str(query.get("data") or "")
+    parts = data.split(":")
+    if len(parts) >= 3 and parts[0] == "product":
+        asin = parts[2]
+        if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+            tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "بيانات المنتج غير صالحة", "show_alert": True})
+            return
+        action = parts[1]
+        if action == "block" and len(parts) == 4:
+            try:
+                blocked_price = float(parts[3])
+                if not 0 < blocked_price < 10000000:
+                    raise ValueError
+            except ValueError:
+                tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "السعر غير صالح", "show_alert": True})
+                return
+            resume_price = round(blocked_price * 0.95, 2)
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO green_deal_product_blocks(asin,blocked_price,resume_price) VALUES (%s,%s,%s) "
+                    "ON CONFLICT(asin) DO UPDATE SET blocked_price=excluded.blocked_price,resume_price=excluded.resume_price,created_at=now()",
+                    (asin, blocked_price, resume_price),
+                )
+            answer_text = f"تم الحجب حتى يصل السعر إلى {resume_price:.2f} ريال"
+        elif action in {"favorite", "mute"}:
+            column = "favorite" if action == "favorite" else "muted"
+            with db() as conn:
+                conn.execute("INSERT INTO green_deal_product_preferences(asin) VALUES (%s) ON CONFLICT DO NOTHING", (asin,))
+                row = conn.execute(f"UPDATE green_deal_product_preferences SET {column}=NOT {column},updated_at=now() WHERE asin=%s RETURNING {column}", (asin,)).fetchone()
+            state = bool(row[0]) if row else False
+            answer_text = "أضيف للمفضلة ⭐" if action == "favorite" and state else "أزيل من المفضلة" if action == "favorite" else "تم إيقاف تنبيه المنتج 🔕" if state else "تمت إعادة تنبيهات المنتج 🔔"
+        else:
+            tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "الإجراء غير معروف", "show_alert": True})
+            return
+        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": answer_text})
+        return
+
     try:
-        _, action, raw_id = q.get("data", "").split(":")
+        _, action, raw_id = data.split(":")
         page_id = int(raw_id)
     except (ValueError, TypeError):
-        tg("answerCallbackQuery", {"callback_query_id": q["id"], "text": "الزر غير صالح"})
+        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "الزر غير صالح"})
+        return
+    if action == "show":
+        with db() as conn:
+            row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
+        tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": row[0] if row else "الصفحة غير موجودة"})
         return
     with db() as conn:
         if action in {"pause", "resume"}:
             conn.execute("UPDATE green_deal_pages SET active=%s WHERE id=%s", (action == "resume", page_id))
+            SCAN_REQUESTED = action == "resume"
         elif action == "delete":
             conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
-    tg("answerCallbackQuery", {"callback_query_id": q["id"], "text": "تم"})
+    tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "تم"})
     show_pages()
 
 
@@ -221,6 +291,35 @@ def handle_updates(offset):
     return offset
 
 
+
+def parse_expiry_date(text):
+    value = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    normalized = (text or "").translate(value).lower()
+    months = {
+        "يناير": 1, "فبراير": 2, "مارس": 3, "ابريل": 4, "أبريل": 4,
+        "مايو": 5, "يونيو": 6, "يوليو": 7, "أغسطس": 8, "اغسطس": 8,
+        "سبتمبر": 9, "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11, "ديسمبر": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+        "june": 6, "july": 7, "august": 8, "september": 9,
+        "october": 10, "november": 11, "december": 12,
+    }
+    found = []
+    month_names = "|".join(re.escape(name) for name in months)
+    for match in re.finditer(rf"\b(\d{{1,2}})\s+({month_names})\s+(\d{{4}})\b", normalized, re.I):
+        day, month_name, year = match.groups()
+        try:
+            found.append(datetime(int(year), months[month_name.lower()], int(day)).date())
+        except ValueError:
+            pass
+    for match in re.finditer(rf"\b({month_names})\s+(\d{{1,2}}),?\s+(\d{{4}})\b", normalized, re.I):
+        month_name, day, year = match.groups()
+        try:
+            found.append(datetime(int(year), months[month_name.lower()], int(day)).date())
+        except ValueError:
+            pass
+    return max(found) if found else None
+
+
 def collect_products(url, on_product, on_offer_title):
     products = {}
     with sync_playwright() as p:
@@ -232,8 +331,8 @@ def collect_products(url, on_product, on_offer_title):
             print(f"Opened promotion page: status={response.status if response else 'unknown'} title={page.title()!r}")
             try:
                 offer_title = page.locator("h1").first.inner_text(timeout=2000).strip()
-                if offer_title:
-                    on_offer_title(offer_title)
+                page_text = page.locator("body").inner_text(timeout=3000)
+                on_offer_title(offer_title, page_text)
             except Exception:
                 pass
             for batch in range(100):
@@ -276,7 +375,8 @@ def collect_products(url, on_product, on_offer_title):
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
                     image_url = ""
                     try:
-                        image = card.locator("img").first
+                        image_locator = card.locator("img[src*=\'media-amazon.com\'], img[data-a-hires], img[data-a-dynamic-image]")
+                    image = image_locator.first if image_locator.count() else card.locator("img").first
                         image_candidates = []
                         for attribute in ("data-a-hires", "data-src", "src"):
                             candidate = image.get_attribute(attribute) or ""
@@ -359,52 +459,82 @@ def scan_page(page_id, url):
     promotion_title = page_row[0] if page_row else ""
     promotion = promotion_details(promotion_title)
 
-    def save_offer_title(value):
+    def save_offer_title(value, page_text):
         nonlocal promotion_title, promotion
+        expiry = parse_expiry_date(page_text)
         if not promotion_title and value:
             promotion_title = value[:200]
             promotion = promotion_details(promotion_title)
-            with db() as conn:
-                conn.execute("UPDATE green_deal_pages SET title=%s WHERE id=%s", (promotion_title, page_id))
+        with db() as conn:
+            conn.execute(
+                "UPDATE green_deal_pages SET title=CASE WHEN title='' THEN %s ELSE title END,"
+                "expires_on=COALESCE(%s,expires_on) WHERE id=%s",
+                (promotion_title, expiry, page_id),
+            )
 
     def save_product(asin, title, price, product_url, image_url):
-        percent = promotion['percent'] if promotion else None
-        buy_quantity = promotion['buy_quantity'] if promotion else None
-        discounted_quantity = promotion['discounted_quantity'] if promotion else None
         found[asin] = (title, price, product_url)
         with db() as conn:
             old = conn.execute(
-                "SELECT price,present FROM green_deal_products WHERE page_id=%s AND asin=%s FOR UPDATE",
+                "SELECT price,present,pending_alert,pending_url,pending_image_url "
+                "FROM green_deal_products WHERE page_id=%s AND asin=%s FOR UPDATE",
                 (page_id, asin),
             ).fetchone()
+            preference = conn.execute("SELECT muted FROM green_deal_product_preferences WHERE asin=%s", (asin,)).fetchone()
+            is_muted = bool(preference[0]) if preference else False
             event = None
-            if old is None:
-                event = f"🆕 منتج جديد\n{title}\nالسعر الحالي: {price:.2f} ريال"
+            block = conn.execute("SELECT resume_price FROM green_deal_product_blocks WHERE asin=%s", (asin,)).fetchone()
+            if block and price > float(block[0]):
+                event = None
+            elif block:
+                conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
+                event = f"🔓 انفك حجب المنتج\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
+            elif old is None:
+                event = f"🆕 منتج جديد\\n\\n📦 {title}\\n\\n💵 السعر الحالي: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\\n\\n📦 {title}\\n\\n💵 السعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\n{title}\nالسعر السابق: {float(old[0]):.2f} ريال\nالسعر الحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\\n\\n📦 {title}\\n\\nالسابق: {float(old[0]):.2f} ريال\\nالحالي: {price:.2f} ريال"
+
+            pending_alert = old[2] if old else None
+            was_pending = bool(pending_alert and not is_muted)
+            alert_url = old[3] if old and old[3] else product_url
+            alert_image = old[4] if old and old[4] else image_url
+            if was_pending:
+                event = pending_alert
             conn.execute("""
               INSERT INTO green_deal_products(page_id,asin,title,price,product_url,present,last_seen_at)
               VALUES (%s,%s,%s,%s,%s,true,now())
               ON CONFLICT(page_id,asin) DO UPDATE SET title=excluded.title,price=excluded.price,
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
-        if event:
-            if percent is not None:
-                if buy_quantity and discounted_quantity:
-                    discounted_unit = round(price * (1 - percent / 100), 2)
-                    bundle_total = round(price * (buy_quantity - discounted_quantity * percent / 100), 2)
-                    average_unit = round(bundle_total / buy_quantity, 2)
-                    event += f"\n🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال"
-                    event += f"\n🛍️ إجمالي {buy_quantity} قطع: {bundle_total:.2f} ريال"
-                    event += f"\n📊 متوسط القطعة: {average_unit:.2f} ريال"
-                else:
-                    discounted_unit = round(price * (1 - percent / 100), 2)
-                    event += f"\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
-                if promotion_title:
-                    event += f"\n📌 شرط العرض: {promotion_title}"
-            send_product_alert(event, product_url, image_url)
+            if event and not is_muted:
+                if percent is not None and not was_pending:
+                    if buy_quantity and discounted_quantity:
+                        discounted_unit = round(price * (1 - percent / 100), 2)
+                        bundle_total = round(price * (buy_quantity - discounted_quantity * percent / 100), 2)
+                        average_unit = round(bundle_total / buy_quantity, 2)
+                        event += f"\\n🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال"
+                        event += f"\\n🛍️ إجمالي {buy_quantity} قطع: {bundle_total:.2f} ريال"
+                        event += f"\\n📊 متوسط القطعة: {average_unit:.2f} ريال"
+                    else:
+                        discounted_unit = round(price * (1 - percent / 100), 2)
+                        event += f"\\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
+                    if promotion_title:
+                        event += f"\\n📌 شرط العرض: {promotion_title}"
+                conn.execute(
+                    "UPDATE green_deal_products SET pending_alert=%s,pending_url=%s,pending_image_url=%s "
+                    "WHERE page_id=%s AND asin=%s",
+                    (event, product_url, image_url, page_id, asin),
+                )
+        if event and not is_muted:
+            send_product_alert(event, alert_url, alert_image, asin, price)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL "
+                    "WHERE page_id=%s AND asin=%s",
+                    (page_id, asin),
+                )
 
     collect_products(url, save_product, save_offer_title)
     if not found:
@@ -415,11 +545,15 @@ def scan_page(page_id, url):
 
 
 def run(continuous):
+    global SCAN_REQUESTED
     init_db()
     offset = 0
     while True:
         offset = handle_updates(offset)
+        SCAN_REQUESTED = False
+        today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
         with db() as conn:
+            conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
             pages = conn.execute("SELECT id,url FROM green_deal_pages WHERE active=true ORDER BY id").fetchall()
         for page_id, url in pages:
             completed = False
@@ -447,6 +581,8 @@ def run(continuous):
         deadline = time.monotonic() + WAIT_SECONDS
         while time.monotonic() < deadline:
             offset = handle_updates(offset)
+            if SCAN_REQUESTED:
+                break
 
 
 if __name__ == "__main__":
