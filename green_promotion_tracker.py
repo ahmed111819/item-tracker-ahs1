@@ -159,62 +159,245 @@ def add_page(value):
     send(f"تمت إضافة صفحة العرض للمتابعة ✅\n{title or 'سيُقرأ اسم العرض في أول فحص'}\n{url}")
 
 
-def show_pages():
-    with db() as conn:
-        rows = conn.execute("SELECT id,url,active,title,expires_on,last_checked_at FROM green_deal_pages ORDER BY id").fetchall()
-    if not rows:
-        send("ما فيه صفحات عروض مضافة حاليًا.")
+MENU_SIZE = 5
+PRODUCT_MENUS = {
+    "favorites": ("⭐ المفضلة", "إزالة من المفضلة", "favorite"),
+    "blocked": ("🚫 المنتجات المحجوبة", "فك الحجب", None),
+    "muted": ("🔕 التنبيهات الموقوفة", "استئناف التنبيه", "muted"),
+}
+
+
+def menu_button(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def menu_message(lines, buttons, message=None):
+    text = "\n\n".join(lines)
+    markup = {"inline_keyboard": buttons}
+    if message is None:
+        send(text, markup, parse_mode="HTML", disable_preview=True)
         return
-    lines = ["صفحات العروض المتابعة:"]
+
+    try:
+        tg("editMessageText", {
+            "chat_id": CHAT_ID,
+            "message_id": message["message_id"],
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is None or response.status_code != 400:
+            raise
+        if "message is not modified" not in response.json().get("description", ""):
+            raise
+
+
+def menu_navigation(view, page, has_next):
+    arrows = []
+    if page:
+        arrows.append(menu_button("⬅️ السابق", f"menu:{view}:{page - 1}"))
+    if has_next:
+        arrows.append(menu_button("التالي ➡️", f"menu:{view}:{page + 1}"))
+    back = [menu_button("🏠 القائمة الرئيسية", "menu:help:0")]
+    return [arrows, back] if arrows else [back]
+
+
+def compact_text(value, limit):
+    value = " ".join((value or "").split())
+    return value[:limit - 1] + "…" if len(value) > limit else value
+
+
+def show_help(message=None):
+    menu_message([
+        "<b>👀 مراقبة صفحات العروض</b>",
+        "<b>إدارة الصفحات</b>\n"
+        "/add رابط | اسم العرض — إضافة صفحة\n"
+        "/pages — الصفحات المتابعة\n"
+        "/status — حالة الفحص",
+        "<b>إدارة المنتجات</b>\n"
+        "/favorites — المفضلة\n"
+        "/blocked — المنتجات المحجوبة\n"
+        "/muted — التنبيهات الموقوفة",
+    ], [
+        [menu_button("📋 الصفحات", "menu:pages:0"), menu_button("🔎 حالة الفحص", "menu:status:0")],
+        [menu_button("⭐ المفضلة", "menu:favorites:0"), menu_button("🚫 المحجوبات", "menu:blocked:0")],
+        [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0")],
+    ], message)
+
+
+def show_product_menu(view, page=0, message=None):
+    heading, action, preference = PRODUCT_MENUS[view]
+    if preference is None:
+        saved = "SELECT asin, resume_price FROM green_deal_product_blocks"
+    else:
+        saved = f"SELECT asin, NULL AS resume_price FROM green_deal_product_preferences WHERE {preference}"
+    query = f"""
+        SELECT saved.asin, product.title, product.product_url, saved.resume_price
+        FROM ({saved}) AS saved
+        LEFT JOIN LATERAL (
+            SELECT title, product_url FROM green_deal_products
+            WHERE asin=saved.asin ORDER BY last_seen_at DESC, page_id DESC LIMIT 1
+        ) AS product ON true
+        ORDER BY saved.asin LIMIT %s OFFSET %s
+    """
+    with db() as conn:
+        rows = conn.execute(query, (MENU_SIZE + 1, page * MENU_SIZE)).fetchall()
+        if not rows and page:
+            page = 0
+            rows = conn.execute(query, (MENU_SIZE + 1, 0)).fetchall()
+
+    lines = [f"<b>{heading}</b>"]
     buttons = []
-    for position, (page_id, url, active, title, expiry, checked) in enumerate(rows, start=1):
-        status = "تعمل" if active else "متوقفة"
-        end = expiry.isoformat() if expiry else "غير محدد"
-        lines.append(f"{page_id}. {title or 'اسم العرض'} • {status} • النهاية: {end}\n{url}")
-        buttons.append([{"text": str(position), "callback_data": f"page:show:{page_id}"}, {"text": "⏸" if active else "▶️", "callback_data": f"page:{'pause' if active else 'resume'}:{page_id}"}])
-        buttons.append([{"text": f"حذف #{page_id}", "callback_data": f"page:delete:{page_id}"}])
-    send("\n\n".join(lines), {"inline_keyboard": buttons})
+    if not rows:
+        lines.append("القائمة فارغة.")
+    for number, (asin, title, url, resume_price) in enumerate(rows[:MENU_SIZE], start=page * MENU_SIZE + 1):
+        label = escape(compact_text(title, 140) or asin)
+        link = escape(url or f"https://www.amazon.sa/dp/{asin}", quote=True)
+        item = f'<b>{number}.</b> <a href="{link}">{label}</a>'
+        if resume_price is not None:
+            item += f"\nيفك الحجب تلقائيًا عند {resume_price:.2f} ريال أو أقل."
+        lines.append(item)
+        buttons.append([menu_button(f"{number}. {action}", f"manage:{view}:{page}:{asin}")])
+    menu_message(lines, buttons + menu_navigation(view, page, len(rows) > MENU_SIZE), message)
+
+
+def show_pages(view="pages", page=0, message=None):
+    query = """
+        SELECT p.id, p.url, p.active, p.title, p.expires_on, p.last_checked_at,
+               p.last_error, p.scan_started_at, products.present, products.total
+        FROM green_deal_pages AS p
+        LEFT JOIN LATERAL (
+            SELECT count(*) FILTER (WHERE present) AS present, count(*) AS total
+            FROM green_deal_products WHERE page_id=p.id
+        ) AS products ON true
+        ORDER BY p.id LIMIT %s OFFSET %s
+    """
+    with db() as conn:
+        rows = conn.execute(query, (MENU_SIZE + 1, page * MENU_SIZE)).fetchall()
+        if not rows and page:
+            page = 0
+            rows = conn.execute(query, (MENU_SIZE + 1, 0)).fetchall()
+
+    status_view = view == "status"
+    lines = ["<b>🔎 حالة الفحص</b>" if status_view else "<b>📋 الصفحات المتابعة</b>"]
+    buttons = []
+    if not rows:
+        lines.append("ما فيه صفحات عروض مضافة حاليًا.\nأضف صفحة بأمر /add.")
+    else:
+        lines.append("الأوقات بتوقيت الرياض." if status_view else "اضغط رقم الصفحة لإدارتها.")
+    for number, row in enumerate(rows[:MENU_SIZE], start=page * MENU_SIZE + 1):
+        page_id, url, active, title, expiry, checked, error, started, present, total = row
+        label = escape(compact_text(title, 120) or "بانتظار اسم العرض")
+        state = "⏸ متوقفة" if not active else "🔄 يجري الفحص" if started else "🟢 مفعّلة"
+        item = f'<b>{number}. {label}</b>\n{state}'
+        if status_view:
+            last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%d-%m-%Y %I:%M %p") if checked else "لم تُفحص بعد"
+            item += f"\nآخر فحص: {last}\nالمنتجات الظاهرة: {present}/{total}"
+            if error:
+                item += f"\n⚠️ {escape(compact_text(error, 160))}"
+        else:
+            end = expiry.strftime("%d-%m-%Y") if expiry else "غير محدد"
+            item += f'\nنهاية العرض: {end}\n<a href="{escape(url, quote=True)}">رابط العرض</a>'
+            buttons.append([menu_button(str(number), f"page:details:{page_id}:{page}")])
+        lines.append(item)
+    menu_message(lines, buttons + menu_navigation(view, page, len(rows) > MENU_SIZE), message)
+
+
+def show_page_details(page_id, page, message, confirm=False):
+    with db() as conn:
+        row = conn.execute("SELECT title,url,active FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
+    back = [menu_button("⬅️ الصفحات", f"menu:pages:{page}")]
+    if not row:
+        menu_message(["الصفحة غير موجودة."], [back], message)
+        return
+    title, url, active = row
+    label = escape(compact_text(title, 120) or "صفحة عرض")
+    if confirm:
+        buttons = [[menu_button("🗑 تأكيد الحذف", f"page:remove:{page_id}:{page}"), menu_button("إلغاء", f"page:details:{page_id}:{page}")]]
+        lines = [f"<b>{label}</b>", "حذف الصفحة من المتابعة؟"]
+    else:
+        action = "stop" if active else "enable"
+        toggle = "⏸ إيقاف المتابعة" if active else "▶️ استئناف المتابعة"
+        buttons = [[menu_button(toggle, f"page:{action}:{page_id}:{page}"), menu_button("🗑 حذف", f"page:confirm:{page_id}:{page}")]]
+        lines = [f"<b>{label}</b>", "🟢 مفعّلة" if active else "⏸ متوقفة", f'<a href="{escape(url, quote=True)}">رابط العرض</a>']
+    menu_message(lines, buttons + [back], message)
 
 
 def command(update):
     message = update.get("message", {})
-    chat = message.get("chat") or {}
-    if str(chat.get("id", "")) != CHAT_ID:
+    if str((message.get("chat") or {}).get("id", "")) != CHAT_ID:
         return
     if THREAD_ID and message.get("message_thread_id") not in (None, THREAD_ID):
         return
-    text = (message.get("text") or "").strip()
-    if not text:
+    words = (message.get("text") or "").split(maxsplit=1)
+    if not words:
         return
-    words = text.split(maxsplit=1)
     name = words[0].split("@", 1)[0]
     argument = words[1].strip() if len(words) > 1 else ""
     if name == "/add":
-        add_page(argument)
-    elif name == "/pages":
-        show_pages()
-    elif name == "/status":
-        show_status()
+        if argument:
+            add_page(argument)
+        else:
+            send("أرسل /add متبوعًا برابط صفحة العرض.\nتقدر تضيف الاسم بعد علامة |.")
+    elif name in {"/pages", "/status"}:
+        show_pages(name[1:])
+    elif name.startswith("/") and name[1:] in PRODUCT_MENUS:
+        show_product_menu(name[1:])
     elif name in {"/help", "/start"}:
-        send("👀 متابع صفحات العروض\n\n/add رابط | اسم العرض — إضافة صفحة\n/pages — الصفحات والأزرار\n/status — حالة الفحص")
+        show_help()
 
 
-def show_status():
-    with db() as conn:
-        rows = conn.execute("SELECT id,url,active,last_checked_at,last_error,scan_started_at FROM green_deal_pages ORDER BY id").fetchall()
-        counts = conn.execute("SELECT page_id,count(*) FILTER (WHERE present),count(*) FROM green_deal_products GROUP BY page_id").fetchall()
-    count_map = {row[0]: (row[1], row[2]) for row in counts}
-    if not rows:
-        send("ما فيه صفحات مضافة.")
-        return
-    lines = ["حالة فحص الصفحات:"]
-    for page_id,url,active,checked,error,started in rows:
-        present,total = count_map.get(page_id,(0,0))
-        state = "يفحص الآن" if started else ("مفعّل" if active else "متوقف")
-        last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %I:%M %p بتوقيت الرياض") if checked else "لم يفحص بعد"
-        issue = f"\nآخر خطأ: {error}" if error else ""
-        lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\n{url}")
-    send("\n\n".join(lines))
+def menu_callback(query, message, data):
+    global SCAN_REQUESTED
+    selection = re.fullmatch(r"menu:([a-z]+):([0-9]{1,6})", data)
+    manage = re.fullmatch(r"manage:([a-z]+):([0-9]{1,6}):([A-Z0-9]{10})", data)
+    page_action = re.fullmatch(r"page:(details|confirm|stop|enable|remove):([0-9]{1,18}):([0-9]{1,6})", data)
+    answer = {"callback_query_id": query["id"]}
+    if selection:
+        view, raw_page = selection.groups()
+        page = int(raw_page)
+        tg("answerCallbackQuery", answer)
+        if view == "help":
+            show_help(message)
+        elif view in {"pages", "status"}:
+            show_pages(view, page, message)
+        elif view in PRODUCT_MENUS:
+            show_product_menu(view, page, message)
+    elif manage and manage[1] in PRODUCT_MENUS:
+        view, raw_page, asin = manage.groups()
+        preference = PRODUCT_MENUS[view][2]
+        with db() as conn:
+            if preference is None:
+                conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
+            else:
+                conn.execute(
+                    f"UPDATE green_deal_product_preferences SET {preference}=false,updated_at=now() WHERE asin=%s",
+                    (asin,),
+                )
+        tg("answerCallbackQuery", {**answer, "text": "تم التحديث"})
+        show_product_menu(view, int(raw_page), message)
+    elif page_action:
+        action, raw_page_id, raw_page = page_action.groups()
+        page_id, page = int(raw_page_id), int(raw_page)
+        if action in {"stop", "enable", "remove"}:
+            with db() as conn:
+                if action == "remove":
+                    conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
+                else:
+                    conn.execute("UPDATE green_deal_pages SET active=%s WHERE id=%s", (action == "enable", page_id))
+            if action == "enable":
+                SCAN_REQUESTED = True
+        tg("answerCallbackQuery", answer)
+        if action == "remove":
+            show_pages("pages", page, message)
+        else:
+            show_page_details(page_id, page, message, confirm=action == "confirm")
+    else:
+        return False
+    return True
 
 
 def callback(update):
@@ -224,6 +407,8 @@ def callback(update):
     if str((message.get("chat") or {}).get("id")) != CHAT_ID:
         return
     data = str(query.get("data") or "")
+    if menu_callback(query, message, data):
+        return
     parts = data.split(":")
     if len(parts) >= 3 and parts[0] == "product":
         asin = parts[2]
