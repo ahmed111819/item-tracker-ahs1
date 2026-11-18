@@ -698,8 +698,8 @@ def scan_page(page_id, url):
                 event = f"🆕 منتج جديد\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif not old[1]:
                 event = f"↩️ عاد المنتج للظهور\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
-            elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغيّر سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
+            elif old[0] is not None and price < float(old[0]):
+                event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
             was_pending = bool(pending_alert and not is_muted)
