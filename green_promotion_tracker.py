@@ -36,7 +36,7 @@ def init_db():
           id bigserial PRIMARY KEY, url text UNIQUE NOT NULL,
           active boolean NOT NULL DEFAULT true, expires_on date,
           added_at timestamptz NOT NULL DEFAULT now(),
-          last_checked_at timestamptz, last_error text
+          last_checked_at timestamptz, last_error text, scan_started_at timestamptz
         );
         CREATE TABLE IF NOT EXISTS green_deal_products (
           page_id bigint NOT NULL REFERENCES green_deal_pages(id) ON DELETE CASCADE,
@@ -46,6 +46,7 @@ def init_db():
           PRIMARY KEY(page_id, asin)
         );
         """)
+        conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS scan_started_at timestamptz")
 
 
 def tg(method, payload):
@@ -106,8 +107,28 @@ def command(update):
         add_page(text[len("/add"):].strip())
     elif text.startswith("/pages"):
         show_pages()
+    elif text.startswith("/status"):
+        show_status()
     elif text.startswith("/help") or text.startswith("/start"):
         send("أوامر متابع صفحات العروض\n/add رابط الصفحة — إضافة صفحة\n/pages — عرض الصفحات وإدارتها")
+
+
+def show_status():
+    with db() as conn:
+        rows = conn.execute("SELECT id,url,active,last_checked_at,last_error,scan_started_at FROM green_deal_pages ORDER BY id").fetchall()
+        counts = conn.execute("SELECT page_id,count(*) FILTER (WHERE present),count(*) FROM green_deal_products GROUP BY page_id").fetchall()
+    count_map = {row[0]: (row[1], row[2]) for row in counts}
+    if not rows:
+        send("ما فيه صفحات مضافة.")
+        return
+    lines = ["حالة فحص الصفحات:"]
+    for page_id,url,active,checked,error,started in rows:
+        present,total = count_map.get(page_id,(0,0))
+        state = "يفحص الآن" if started else ("مفعّل" if active else "متوقف")
+        last = checked.strftime("%Y-%m-%d %H:%M UTC") if checked else "لم يفحص بعد"
+        issue = f"\\nآخر خطأ: {error}" if error else ""
+        lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\\n{url}")
+    send("\\n\\n".join(lines))
 
 
 def callback(update):
@@ -141,7 +162,7 @@ def handle_updates(offset):
     return offset
 
 
-def collect_products(url):
+def collect_products(url, on_product):
     products = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -167,7 +188,9 @@ def collect_products(url):
                 except Exception:
                     pass
                 if price is not None:
-                    products[asin] = (title[:300], price, "https://www.amazon.sa" + link if link.startswith("/") else link)
+                    product = (title[:300], price, "https://www.amazon.sa" + link if link.startswith("/") else link)
+                    products[asin] = product
+                    on_product(asin, *product)
             more = page.get_by_role("button", name=re.compile("إظهار المزيد|show more", re.I))
             if not more.count() or not more.first.is_enabled():
                 break
@@ -181,32 +204,37 @@ def collect_products(url):
 
 
 def scan_page(page_id, url):
-    found = collect_products(url)
-    if not found:
-        raise RuntimeError("No products could be read. Treating this scan as incomplete.")
-    with db() as conn:
-        for asin, (title, price, product_url) in found.items():
+    found = {}
+
+    def save_product(asin, title, price, product_url):
+        found[asin] = (title, price, product_url)
+        with db() as conn:
             old = conn.execute(
                 "SELECT price,present FROM green_deal_products WHERE page_id=%s AND asin=%s FOR UPDATE",
                 (page_id, asin),
             ).fetchone()
             event = None
             if old is None:
-                event = f"🆕 منتج جديد\n{title}\nالسعر: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\\n{title}\\nالسعر: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\n{title}\nالسابق: {float(old[0]):.2f} ريال\nالحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\\n{title}\\nالسابق: {float(old[0]):.2f} ريال\\nالحالي: {price:.2f} ريال"
             conn.execute("""
               INSERT INTO green_deal_products(page_id,asin,title,price,product_url,present,last_seen_at)
               VALUES (%s,%s,%s,%s,%s,true,now())
               ON CONFLICT(page_id,asin) DO UPDATE SET title=excluded.title,price=excluded.price,
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
-            if event:
-                send(f"{event}\n{product_url}")
+        if event:
+            send(f"{event}\\n{product_url}")
+
+    collect_products(url, save_product)
+    if not found:
+        raise RuntimeError("No products could be read. Treating this scan as incomplete.")
+    with db() as conn:
         conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s)", (page_id, list(found)))
-        conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL WHERE id=%s", (page_id,))
+        conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
 
 
 def run(continuous):
@@ -218,10 +246,12 @@ def run(continuous):
             pages = conn.execute("SELECT id,url FROM green_deal_pages WHERE active=true ORDER BY id").fetchall()
         for page_id, url in pages:
             try:
+                with db() as conn:
+                    conn.execute("UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s", (page_id,))
                 scan_page(page_id, url)
             except Exception as exc:
                 with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=%s WHERE id=%s", (type(exc).__name__, page_id))
+                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=%s,scan_started_at=NULL WHERE id=%s", (type(exc).__name__, page_id))
                 print(f"Page {page_id} scan failed: {type(exc).__name__}")
             offset = handle_updates(offset)
         if not continuous:
