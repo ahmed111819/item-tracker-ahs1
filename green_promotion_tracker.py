@@ -9,6 +9,9 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from html import escape
 from io import BytesIO
@@ -19,7 +22,7 @@ from urllib.parse import urlparse
 
 import psycopg
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 TOKEN = os.environ["GREEN_DEALS_TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["GREEN_DEALS_TELEGRAM_CHAT_ID"]
@@ -622,10 +625,10 @@ def parse_amazon_price(value):
     return float(f"{whole}.{fraction}") if fraction else float(whole)
 
 
-def collect_products(url, on_product, on_offer_title):
+def collect_products(url, on_product, on_offer_title, browser_channel=None):
     products = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, channel=browser_channel)
         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -766,7 +769,7 @@ class ScanStopped(Exception):
     """The page was paused or removed during a scan."""
 
 
-def scan_page(page_id, url):
+def scan_page(page_id, url, browser_channel=None):
     found = {}
     with db() as conn:
         page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
@@ -858,7 +861,7 @@ def scan_page(page_id, url):
                     (page_id, asin),
                 )
 
-    collect_products(url, save_product, save_offer_title)
+    collect_products(url, save_product, save_offer_title, browser_channel)
     if not found:
         raise RuntimeError("No products could be read. Treating this scan as incomplete.")
     with db() as conn:
@@ -866,7 +869,7 @@ def scan_page(page_id, url):
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
 
 
-def scan_loop(continuous):
+def scan_loop(continuous, browser_channel=None):
     while True:
         SCAN_REQUESTED.clear()
         today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
@@ -884,7 +887,7 @@ def scan_loop(continuous):
                         if not updated.rowcount:
                             break
                     print(f"Starting page {page_id}, attempt {attempt}/4")
-                    scan_page(page_id, url)
+                    scan_page(page_id, url, browser_channel)
                     break
                 except ScanStopped:
                     with db() as conn:
@@ -905,13 +908,35 @@ def scan_loop(continuous):
         SCAN_REQUESTED.wait(WAIT_SECONDS)
 
 
-def run(continuous):
+def prepare_browser():
+    if shutil.which("google-chrome") or shutil.which("google-chrome-stable"):
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(channel="chrome", headless=True, timeout=10000)
+                browser.close()
+        except PlaywrightError:
+            print("Runner Chrome could not start; preparing Playwright Chromium.")
+        else:
+            print("Using the runner's preinstalled Chrome.")
+            return "chrome"
+
+    print("Preparing Chromium headless shell while Telegram handles commands.")
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "--with-deps", "--only-shell", "chromium"],
+        check=True,
+        timeout=300,
+    )
+    return None
+
+
+def run(continuous, prepare=False):
     init_db()
     stop = Event()
     worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
     worker.start()
     try:
-        scan_loop(continuous)
+        browser_channel = prepare_browser() if prepare else None
+        scan_loop(continuous, browser_channel)
     finally:
         stop.set()
 
@@ -919,4 +944,6 @@ def run(continuous):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--continuous", action="store_true")
-    run(parser.parse_args().continuous)
+    parser.add_argument("--prepare-browser", action="store_true")
+    args = parser.parse_args()
+    run(args.continuous, args.prepare_browser)
