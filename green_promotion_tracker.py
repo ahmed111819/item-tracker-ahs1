@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+from html import escape
 from io import BytesIO
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -69,8 +70,10 @@ def tg(method, payload):
     return data["result"]
 
 
-def send(text, markup=None):
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False}
+def send(text, markup=None, *, parse_mode=None, disable_preview=False):
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": disable_preview}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if THREAD_ID:
         payload["message_thread_id"] = THREAD_ID
     if markup:
@@ -81,14 +84,14 @@ def send(text, markup=None):
 
 def send_product_alert(caption, product_url, image_url, asin, price):
     markup = {"inline_keyboard": [
-        [{"text": "🛒 فتح المنتج", "url": product_url}],
         [
             {"text": "⭐ المفضلة", "callback_data": f"product:favorite:{asin}"},
             {"text": "🚫 حجب مؤقت", "callback_data": f"product:block:{asin}:{price:.2f}"},
         ],
         [{"text": "🔕 إيقاف تنبيه المنتج", "callback_data": f"product:mute:{asin}"}],
     ]}
-    message_text = caption
+    link = f'<a href="{escape(product_url, quote=True)}">رابط المنتج</a>'
+    message_text = f"{escape(caption[:1000].rstrip())}\n\n{link}"
 
     if image_url:
         try:
@@ -108,7 +111,8 @@ def send_product_alert(caption, product_url, image_url, asin, price):
 
             data = {
                 "chat_id": CHAT_ID,
-                "caption": message_text[:1000],
+                "caption": message_text,
+                "parse_mode": "HTML",
                 "reply_markup": json.dumps(markup, ensure_ascii=False),
             }
             if THREAD_ID:
@@ -127,7 +131,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             print(f"Product photo upload failed: {type(exc).__name__}: {exc}")
             raise RuntimeError("تعذر رفع صورة المنتج إلى تيليجرام") from exc
 
-    send(message_text, markup)
+    send(message_text, markup, parse_mode="HTML", disable_preview=True)
 
 
 def valid_url(value):
