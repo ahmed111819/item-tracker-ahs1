@@ -100,14 +100,39 @@ def send(text, markup=None, *, parse_mode=None, disable_preview=False):
 
 
 
-def send_product_alert(caption, product_url, image_url, asin, price):
-    markup = {"inline_keyboard": [
-        [
-            {"text": "⭐ المفضلة", "callback_data": f"product:favorite:{asin}"},
-            {"text": "🚫 حجب مؤقت", "callback_data": f"product:block:{asin}:{price:.2f}"},
-        ],
-        [{"text": "🔕 إيقاف تنبيه المنتج", "callback_data": f"product:mute:{asin}"}],
+def product_keyboard(asin, price, favorite, muted, blocked):
+    suffix = f":{price:.2f}" if price is not None else ""
+    favorite_action = "unfavorite" if favorite else "favorite"
+    mute_action = "unmute" if muted else "mute"
+    favorite_label = "⭐ إزالة من المفضلة" if favorite else "☆ إضافة للمفضلة"
+    mute_label = "🔔 استئناف التنبيه" if muted else "🔕 إيقاف التنبيه"
+    main_row = [menu_button(favorite_label, f"deal:{favorite_action}:{asin}{suffix}")]
+    if blocked:
+        main_row.append(menu_button("✅ فك الحجب", f"deal:unblock:{asin}{suffix}"))
+    elif price is not None:
+        main_row.append(menu_button("🚫 حجب مؤقت", f"deal:block:{asin}{suffix}"))
+    return {"inline_keyboard": [
+        main_row,
+        [menu_button(mute_label, f"deal:{mute_action}:{asin}{suffix}")],
     ]}
+
+
+def get_product_controls(conn, asin):
+    row = conn.execute("""
+        SELECT COALESCE(pref.favorite,false), COALESCE(pref.muted,false),
+               EXISTS(SELECT 1 FROM green_deal_product_blocks WHERE asin=product.asin)
+        FROM (VALUES (%s::text)) AS product(asin)
+        LEFT JOIN green_deal_product_preferences AS pref ON pref.asin=product.asin
+    """, (asin,)).fetchone()
+    return tuple(row)
+
+
+def send_product_alert(caption, product_url, image_url, asin, price):
+    with db() as conn:
+        favorite, muted, blocked = get_product_controls(conn, asin)
+    if muted or blocked:
+        return
+    markup = product_keyboard(asin, price, favorite, muted, blocked)
     link = f'<a href="{escape(product_url, quote=True)}">رابط المنتج</a>'
     message_text = f"{escape(caption[:1000].rstrip())}\n\n{link}"
 
@@ -416,6 +441,79 @@ def menu_callback(query, message, data):
     return True
 
 
+def product_callback(query, message, parts):
+    answer = {"callback_query_id": query["id"]}
+    actions = {"block", "unblock", "favorite", "unfavorite", "mute", "unmute"}
+    if len(parts) not in (3, 4) or parts[1] not in actions or not re.fullmatch(r"[A-Z0-9]{10}", parts[2]):
+        answer_callback({**answer, "text": "بيانات الزر غير صالحة", "show_alert": True})
+        return
+
+    version, action, asin = parts[:3]
+    price = None
+    if len(parts) == 4:
+        try:
+            price = float(parts[3])
+        except ValueError:
+            pass
+        if price is None or not 0 < price < 10000000:
+            answer_callback({**answer, "text": "السعر غير صالح", "show_alert": True})
+            return
+    if action == "block" and price is None:
+        answer_callback({**answer, "text": "السعر غير موجود في التنبيه", "show_alert": True})
+        return
+
+    with db() as conn:
+        favorite, muted, _ = get_product_controls(conn, asin)
+        if action == "block":
+            resume_price = round(price * 0.95, 2)
+            row = conn.execute("""
+                INSERT INTO green_deal_product_blocks(asin,blocked_price,resume_price)
+                VALUES (%s,%s,%s) ON CONFLICT(asin) DO NOTHING RETURNING resume_price
+            """, (asin, price, resume_price)).fetchone()
+            confirmation = f"تم الحجب حتى {row[0]:.2f} ريال" if row else "المنتج محجوب بالفعل"
+        elif action == "unblock":
+            conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
+            confirmation = "تم فك الحجب ✅"
+        else:
+            column = "favorite" if action in {"favorite", "unfavorite"} else "muted"
+            if version == "product" and action in {"favorite", "mute"}:
+                active = not (favorite if column == "favorite" else muted)
+            else:
+                active = action in {"favorite", "mute"}
+            conn.execute(f"""
+                INSERT INTO green_deal_product_preferences(asin,{column}) VALUES (%s,%s)
+                ON CONFLICT(asin) DO UPDATE SET {column}=excluded.{column},updated_at=now()
+            """, (asin, active))
+            if column == "favorite":
+                confirmation = "أضيف للمفضلة ⭐" if active else "أزيل من المفضلة"
+            else:
+                confirmation = "تم إيقاف التنبيه 🔕" if active else "تم استئناف التنبيه 🔔"
+
+        favorite, muted, blocked = get_product_controls(conn, asin)
+        if price is None:
+            row = conn.execute("""
+                SELECT price FROM green_deal_products
+                WHERE asin=%s AND price > 0 ORDER BY last_seen_at DESC, page_id DESC LIMIT 1
+            """, (asin,)).fetchone()
+            if row:
+                price = float(row[0])
+
+    answer_callback({**answer, "text": confirmation})
+    try:
+        tg("editMessageReplyMarkup", {
+            "chat_id": CHAT_ID,
+            "message_id": message["message_id"],
+            "reply_markup": product_keyboard(asin, price, favorite, muted, blocked),
+        })
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is None or response.status_code != 400:
+            raise
+        description = response.json().get("description", "").lower()
+        if "message is not modified" not in description:
+            raise
+
+
 def callback(update):
     query = update.get("callback_query", {})
     message = query.get("message", {})
@@ -425,39 +523,8 @@ def callback(update):
     if menu_callback(query, message, data):
         return
     parts = data.split(":")
-    if len(parts) >= 3 and parts[0] == "product":
-        asin = parts[2]
-        if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-            answer_callback({"callback_query_id": query["id"], "text": "بيانات المنتج غير صالحة", "show_alert": True})
-            return
-        action = parts[1]
-        if action == "block" and len(parts) == 4:
-            try:
-                blocked_price = float(parts[3])
-                if not 0 < blocked_price < 10000000:
-                    raise ValueError
-            except ValueError:
-                answer_callback({"callback_query_id": query["id"], "text": "السعر غير صالح", "show_alert": True})
-                return
-            resume_price = round(blocked_price * 0.95, 2)
-            with db() as conn:
-                conn.execute(
-                    "INSERT INTO green_deal_product_blocks(asin,blocked_price,resume_price) VALUES (%s,%s,%s) "
-                    "ON CONFLICT(asin) DO UPDATE SET blocked_price=excluded.blocked_price,resume_price=excluded.resume_price,created_at=now()",
-                    (asin, blocked_price, resume_price),
-                )
-            answer_text = f"تم الحجب حتى يصل السعر إلى {resume_price:.2f} ريال"
-        elif action in {"favorite", "mute"}:
-            column = "favorite" if action == "favorite" else "muted"
-            with db() as conn:
-                conn.execute("INSERT INTO green_deal_product_preferences(asin) VALUES (%s) ON CONFLICT DO NOTHING", (asin,))
-                row = conn.execute(f"UPDATE green_deal_product_preferences SET {column}=NOT {column},updated_at=now() WHERE asin=%s RETURNING {column}", (asin,)).fetchone()
-            state = bool(row[0]) if row else False
-            answer_text = "أضيف للمفضلة ⭐" if action == "favorite" and state else "أزيل من المفضلة" if action == "favorite" else "تم إيقاف تنبيه المنتج 🔕" if state else "تمت إعادة تنبيهات المنتج 🔔"
-        else:
-            answer_callback({"callback_query_id": query["id"], "text": "الإجراء غير معروف", "show_alert": True})
-            return
-        answer_callback({"callback_query_id": query["id"], "text": answer_text})
+    if parts[0] in {"deal", "product"}:
+        product_callback(query, message, parts)
         return
 
     try:
@@ -749,7 +816,7 @@ def scan_page(page_id, url):
                 event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
-            was_pending = bool(pending_alert and not is_muted)
+            was_pending = bool(pending_alert and not is_muted and block is None)
             alert_url = old[3] if old and old[3] else product_url
             alert_image = old[4] if old and old[4] else image_url
             if was_pending:
