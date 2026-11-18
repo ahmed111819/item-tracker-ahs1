@@ -119,12 +119,13 @@ def send_product_alert(caption, product_url, image_url, asin, price):
                 files={"photo": ("product.jpg", BytesIO(image_bytes), "image/jpeg")},
                 timeout=45,
             )
-                result = response.json()
-                if not response.ok or not result.get("ok"):
-                    raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
+            result = response.json()
+            if not response.ok or not result.get("ok"):
+                raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
             return
         except Exception as exc:
             print(f"Product photo upload failed: {type(exc).__name__}: {exc}")
+            raise RuntimeError("تعذر رفع صورة المنتج إلى تيليجرام") from exc
 
     send(message_text, markup)
 
@@ -484,13 +485,13 @@ def scan_page(page_id, url):
                 event = None
             elif block:
                 conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
-                event = f"🔓 انفك حجب المنتج\n{title}\nالسعر الحالي: {price:.2f} ريال"
+                event = f"🔓 انفك حجب المنتج\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif old is None:
-                event = f"🆕 منتج جديد\n{title}\nالسعر الحالي: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\n{title}\nالسعر السابق: {float(old[0]):.2f} ريال\nالسعر الحالي: {price:.2f} ريال"
+                event = f"💰 تغيّر سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
             was_pending = bool(pending_alert and not is_muted)
