@@ -22,7 +22,9 @@ from urllib.parse import urlparse
 
 import psycopg
 import requests
-from playwright.sync_api import Error as PlaywrightError, sync_playwright
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 TOKEN = os.environ["GREEN_DEALS_TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["GREEN_DEALS_TELEGRAM_CHAT_ID"]
@@ -625,6 +627,65 @@ def parse_amazon_price(value):
     return float(f"{whole}.{fraction}") if fraction else float(whole)
 
 
+READ_PRODUCT_CARDS = r"""
+cards => cards.flatMap(card => {
+    const asin = (card.getAttribute("data-asin") || "").trim();
+    if (!/^[A-Z0-9]{10}$/.test(asin)) return [];
+    const title = card.querySelector("h2, [data-cy='title-recipe-title'], .a-size-base-plus");
+    const link = card.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
+    const price = card.querySelector(".a-price");
+    const image = card.querySelector("img[data-a-hires], img[data-a-dynamic-image], img[data-src]")
+        || card.querySelector("img");
+    return [{
+        asin,
+        title: title?.innerText?.trim() || title?.textContent?.trim() || "",
+        link: link?.getAttribute("href") || "",
+        fullPrice: price?.querySelector(".a-offscreen")?.textContent || "",
+        whole: price?.querySelector(".a-price-whole")?.textContent || "",
+        fraction: price?.querySelector(".a-price-fraction")?.textContent || "",
+        fallbackPrice: card.innerText || "",
+        images: ["data-a-hires", "data-src", "src"].map(attr => image?.getAttribute(attr)),
+        dynamicImage: image?.getAttribute("data-a-dynamic-image") || "",
+    }];
+})
+"""
+
+
+def read_card_price(card):
+    price = parse_amazon_price(card["fullPrice"])
+    if price is not None:
+        return price
+
+    arabic_digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    whole = re.sub(r"\D", "", card["whole"].translate(arabic_digits))
+    fraction = re.sub(r"\D", "", card["fraction"].translate(arabic_digits))
+    if whole:
+        return parse_amazon_price(f"{whole}.{fraction[:2]}" if fraction else whole)
+
+    text = card["fallbackPrice"].translate(arabic_digits)
+    amount = r"([0-9][0-9,٬]*(?:[.٫][0-9]{1,2})?)"
+    currency = r"(?:SAR|ر\s*ي\s*ا\s*ل)"
+    match = re.search(rf"{currency}\s*{amount}|{amount}\s*{currency}", text, re.I)
+    return parse_amazon_price(match.group(1) or match.group(2)) if match else None
+
+
+def read_card_image(card):
+    candidates = card["images"]
+    if card["dynamicImage"]:
+        try:
+            images = json.loads(card["dynamicImage"])
+            if isinstance(images, dict):
+                candidates = [*candidates, *images]
+        except ValueError:
+            pass
+    for candidate in candidates:
+        if candidate and candidate.startswith("https://"):
+            host = (urlparse(candidate).hostname or "").lower()
+            if host.endswith(("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")):
+                return candidate
+    return ""
+
+
 def collect_products(url, on_product, on_offer_title, browser_channel=None):
     products = {}
     with sync_playwright() as p:
@@ -632,88 +693,34 @@ def collect_products(url, on_product, on_offer_title, browser_channel=None):
         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3500)
             print(f"Opened promotion page: status={response.status if response else 'unknown'} title={page.title()!r}")
+            cards = page.locator("[data-asin]")
             try:
-                offer_title = page.locator("h1").first.inner_text(timeout=2000).strip()
-                page_text = page.locator("body").inner_text(timeout=3000)
-                on_offer_title(offer_title, page_text)
-            except Exception:
-                pass
+                page.locator("[data-asin]:not([data-asin='']) .a-price").first.wait_for(state="attached", timeout=4000)
+            except PlaywrightTimeout:
+                pass  # Read the available cards or report the page error below.
+
+            offer_title, page_text = page.evaluate(
+                "() => [document.querySelector('h1')?.innerText?.trim() || '', document.body?.innerText || '']"
+            )
+            on_offer_title(offer_title, page_text)
             for batch in range(100):
-                cards = page.locator("[data-asin]").all()
-                print(f"Promotion batch {batch + 1}: {len(cards)} ASIN elements")
-                for card in cards:
-                    asin = (card.get_attribute("data-asin") or "").strip()
-                    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-                        continue
-                    title = ""
-                    link = ""
-                    price = None
-                    try:
-                        title_node = card.locator("h2, [data-cy='title-recipe-title'], .a-size-base-plus").first
-                        title = title_node.inner_text(timeout=800).strip()
-                    except Exception:
-                        pass
-                    try:
-                        link = card.locator("a[href*='/dp/'], a[href*='/gp/product/']").first.get_attribute("href") or ""
-                    except Exception:
-                        pass
-                    try:
-                        price_node = card.locator(".a-price").first
-                        offscreen = price_node.locator(".a-offscreen").first
-                        if offscreen.count():
-                            price = parse_amazon_price(offscreen.inner_text(timeout=800))
-                        if price is None:
-                            whole_node = price_node.locator(".a-price-whole").first
-                            whole_text = whole_node.inner_text(timeout=800) if whole_node.count() else ""
-                            fraction_node = price_node.locator(".a-price-fraction").first
-                            fraction_text = fraction_node.inner_text(timeout=800) if fraction_node.count() else ""
-                            whole = re.sub(r"\D", "", whole_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
-                            fraction = re.sub(r"\D", "", fraction_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
-                            if whole:
-                                price = parse_amazon_price(f"{whole}.{fraction[:2]}" if fraction else whole)
-                    except Exception:
-                        pass
-                    if price is None:
-                        try:
-                            card_text = card.inner_text(timeout=800).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-                            match = re.search(r"(?:SAR|ر\s*ي\s*ا\s*ل|ريال)\s*([0-9][0-9,]*(?:[.٫][0-9]{1,2})?)|([0-9][0-9,]*(?:[.٫][0-9]{1,2})?)\s*(?:SAR|ريال)", card_text, re.I)
-                            if match:
-                                price = parse_amazon_price(match.group(1) or match.group(2))
-                        except Exception:
-                            pass
+                batch_start = time.monotonic()
+                snapshots = cards.evaluate_all(READ_PRODUCT_CARDS)
+                print(f"Promotion batch {batch + 1}: {len(snapshots)} product cards read "
+                      f"in {time.monotonic() - batch_start:.2f}s")
+                for card in snapshots:
+                    asin = card["asin"]
+                    price = read_card_price(card)
                     if price is None or price <= 0:
                         continue
+                    link = card["link"]
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
-                    image_url = ""
-                    try:
-                        image_locator = card.locator("img[data-a-hires], img[data-a-dynamic-image], img[data-src]")
-                        image = image_locator.first if image_locator.count() else card.locator("img").first
-                        image_candidates = []
-                        for attribute in ("data-a-hires", "data-src", "src"):
-                            candidate = image.get_attribute(attribute) or ""
-                            if candidate.startswith("https://"):
-                                candidate_host = (urlparse(candidate).hostname or "").lower()
-                                if candidate_host.endswith(("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")):
-                                    image_candidates.append(candidate)
-                        dynamic_image = image.get_attribute("data-a-dynamic-image") or ""
-                        if dynamic_image:
-                            dimensions = json.loads(dynamic_image)
-                            image_candidates.extend(
-                                candidate for candidate in dimensions
-                                if candidate.startswith("https://")
-                                and (urlparse(candidate).hostname or "").lower().endswith(
-                                    ("media-amazon.com", "images-amazon.com", "ssl-images-amazon.com")
-                                )
-                            )
-                        image_url = image_candidates[0] if image_candidates else ""
-                    except Exception:
-                        pass
-                    product = (title[:300] or asin, price, product_url, image_url)
+                    product = (card["title"][:300] or asin, price, product_url, read_card_image(card))
                     if products.get(asin) != product:
                         products[asin] = product
                         on_product(asin, *product)
+                print(f"Promotion batch {batch + 1} processed in {time.monotonic() - batch_start:.2f}s")
 
                 more = page.get_by_text(re.compile(r"^\s*(إظهار المزيد|Show more|Load more)\s*$", re.I)).last
                 if more.count() == 0:
@@ -723,7 +730,7 @@ def collect_products(url, on_product, on_offer_title, browser_channel=None):
                     if not more.is_visible() or not more.is_enabled():
                         print("'Show more' control is hidden or disabled.")
                         break
-                    before_count = len(page.locator("[data-asin]").all())
+                    before_count = cards.count()
                     more.scroll_into_view_if_needed(timeout=3000)
                     more.click(timeout=8000)
                     page.wait_for_function(
@@ -770,8 +777,13 @@ class ScanStopped(Exception):
 
 
 def scan_page(page_id, url, browser_channel=None):
-    found = {}
     with db() as conn:
+        scan_page_with_connection(conn, page_id, url, browser_channel)
+
+
+def scan_page_with_connection(conn, page_id, url, browser_channel):
+    found = {}
+    with conn.transaction():
         page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
     promotion_title = page_row[0] if page_row else ""
     promotion = promotion_details(promotion_title)
@@ -782,7 +794,7 @@ def scan_page(page_id, url, browser_channel=None):
         if not promotion_title and value:
             promotion_title = value[:200]
             promotion = promotion_details(promotion_title)
-        with db() as conn:
+        with conn.transaction():
             conn.execute(
                 "UPDATE green_deal_pages SET title=CASE WHEN title='' THEN %s ELSE title END,"
                 "expires_on=COALESCE(%s,expires_on) WHERE id=%s",
@@ -791,24 +803,30 @@ def scan_page(page_id, url, browser_channel=None):
 
     def save_product(asin, title, price, product_url, image_url):
         found[asin] = (title, price, product_url)
-        with db() as conn:
+        with conn.transaction():
             page_active = conn.execute(
                 "SELECT active FROM green_deal_pages WHERE id=%s FOR SHARE", (page_id,)
             ).fetchone()
             if not page_active or not page_active[0]:
                 raise ScanStopped()
-            old = conn.execute(
-                "SELECT price,present,pending_alert,pending_url,pending_image_url "
-                "FROM green_deal_products WHERE page_id=%s AND asin=%s FOR UPDATE",
-                (page_id, asin),
-            ).fetchone()
-            preference = conn.execute("SELECT muted FROM green_deal_product_preferences WHERE asin=%s", (asin,)).fetchone()
-            is_muted = bool(preference[0]) if preference else False
+            state = conn.execute("""
+                SELECT saved.price, saved.present, saved.pending_alert, saved.pending_url,
+                       saved.pending_image_url, COALESCE(pref.muted,false), block.resume_price
+                FROM (VALUES (%s::text)) AS product(asin)
+                LEFT JOIN LATERAL (
+                    SELECT price,present,pending_alert,pending_url,pending_image_url
+                    FROM green_deal_products WHERE page_id=%s AND asin=product.asin
+                    FOR UPDATE
+                ) AS saved ON true
+                LEFT JOIN green_deal_product_preferences AS pref ON pref.asin=product.asin
+                LEFT JOIN green_deal_product_blocks AS block ON block.asin=product.asin
+            """, (asin, page_id)).fetchone()
+            old = state[:5] if state[1] is not None else None
+            is_muted, resume_price = state[5:]
             event = None
-            block = conn.execute("SELECT resume_price FROM green_deal_product_blocks WHERE asin=%s", (asin,)).fetchone()
-            if block and price > float(block[0]):
+            if resume_price is not None and price > float(resume_price):
                 event = None
-            elif block:
+            elif resume_price is not None:
                 conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
                 event = f"🔓 انفك حجب المنتج\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif old is None:
@@ -819,7 +837,7 @@ def scan_page(page_id, url, browser_channel=None):
                 event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
-            was_pending = bool(pending_alert and not is_muted and block is None)
+            was_pending = bool(pending_alert and not is_muted and resume_price is None)
             alert_url = old[3] if old and old[3] else product_url
             alert_image = old[4] if old and old[4] else image_url
             if was_pending:
@@ -854,7 +872,7 @@ def scan_page(page_id, url, browser_channel=None):
                 )
         if event and not is_muted:
             send_product_alert(event, alert_url, alert_image, asin, price)
-            with db() as conn:
+            with conn.transaction():
                 conn.execute(
                     "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL "
                     "WHERE page_id=%s AND asin=%s",
@@ -864,7 +882,7 @@ def scan_page(page_id, url, browser_channel=None):
     collect_products(url, save_product, save_offer_title, browser_channel)
     if not found:
         raise RuntimeError("No products could be read. Treating this scan as incomplete.")
-    with db() as conn:
+    with conn.transaction():
         conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s)", (page_id, list(found)))
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
 
