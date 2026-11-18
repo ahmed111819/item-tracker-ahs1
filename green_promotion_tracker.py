@@ -251,10 +251,25 @@ def collect_products(url, on_product):
     return products
 
 
+
+def promotion_percent(title):
+    digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    normalized = (title or "").translate(digits).replace("٪", "%")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%", normalized)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value if 0 < value < 100 else None
+
+
 def scan_page(page_id, url):
     found = {}
-
+    with db() as conn:
+        page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
+    promotion_title = page_row[0] if page_row else ""
+    discount = promotion_percent(promotion_title)
     def save_product(asin, title, price, product_url):
+        discounted = round(price * (1 - discount / 100), 2) if discount is not None else None
         found[asin] = (title, price, product_url)
         with db() as conn:
             old = conn.execute(
@@ -263,11 +278,11 @@ def scan_page(page_id, url):
             ).fetchone()
             event = None
             if old is None:
-                event = f"🆕 منتج جديد\n{title}\nالسعر: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif not old[1]:
                 event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\n{title}\nالسابق: {float(old[0]):.2f} ريال\nالحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\n{title}\nالسعر السابق: {float(old[0]):.2f} ريال\nالسعر الحالي: {price:.2f} ريال"
             conn.execute("""
               INSERT INTO green_deal_products(page_id,asin,title,price,product_url,present,last_seen_at)
               VALUES (%s,%s,%s,%s,%s,true,now())
@@ -275,6 +290,10 @@ def scan_page(page_id, url):
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
         if event:
+            if discounted is not None:
+                event += f"\nالسعر بعد خصم {discount:g}%: {discounted:.2f} ريال"
+                if promotion_title:
+                    event += f"\nشرط العرض: {promotion_title}"
             send(f"{event}\n🔗 {product_url}")
 
     collect_products(url, save_product)
