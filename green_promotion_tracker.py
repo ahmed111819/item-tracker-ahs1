@@ -68,6 +68,26 @@ def send(text, markup=None):
     tg("sendMessage", payload)
 
 
+
+def send_product_alert(caption, product_url, image_url):
+    markup = {"inline_keyboard": [[{"text": "🛒 فتح المنتج", "url": product_url}]]}
+    if image_url:
+        payload = {
+            "chat_id": CHAT_ID,
+            "photo": image_url,
+            "caption": caption[:1000],
+            "reply_markup": markup,
+        }
+        if THREAD_ID:
+            payload["message_thread_id"] = THREAD_ID
+        try:
+            tg("sendPhoto", payload)
+            return
+        except Exception as exc:
+            print(f"Product image could not be sent ({type(exc).__name__}); sending text alert.")
+    send(caption + f"\\n🔗 {product_url}", markup)
+
+
 def valid_url(value):
     parsed = urlparse(value)
     return parsed.scheme == "https" and parsed.netloc.endswith("amazon.sa") and "/promotion/psp/" in parsed.path
@@ -224,7 +244,13 @@ def collect_products(url, on_product, on_offer_title):
                     if price is None or price <= 0:
                         continue
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
-                    product = (title[:300] or asin, price, product_url)
+                    image_url = ""
+                    try:
+                        image = card.locator("img").first
+                        image_url = image.get_attribute("data-a-hires") or image.get_attribute("src") or image.get_attribute("data-src") or ""
+                    except Exception:
+                        pass
+                    product = (title[:300] or asin, price, product_url, image_url)
                     if products.get(asin) != product:
                         products[asin] = product
                         on_product(asin, *product)
@@ -282,7 +308,7 @@ def scan_page(page_id, url):
             with db() as conn:
                 conn.execute("UPDATE green_deal_pages SET title=%s WHERE id=%s", (promotion_title, page_id))
 
-    def save_product(asin, title, price, product_url):
+    def save_product(asin, title, price, product_url, image_url):
         discounted = round(price * (1 - discount / 100), 2) if discount is not None else None
         found[asin] = (title, price, product_url)
         with db() as conn:
