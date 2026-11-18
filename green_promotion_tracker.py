@@ -34,7 +34,7 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS green_deal_pages (
           id bigserial PRIMARY KEY, url text UNIQUE NOT NULL,
-          active boolean NOT NULL DEFAULT true, expires_on date,
+          active boolean NOT NULL DEFAULT true, title text NOT NULL DEFAULT '', expires_on date,
           added_at timestamptz NOT NULL DEFAULT now(),
           last_checked_at timestamptz, last_error text, scan_started_at timestamptz
         );
@@ -47,6 +47,7 @@ def init_db():
         );
         """)
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS scan_started_at timestamptz")
+        conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS title text NOT NULL DEFAULT ''")
 
 
 def tg(method, payload):
@@ -72,27 +73,35 @@ def valid_url(value):
     return parsed.scheme == "https" and parsed.netloc.endswith("amazon.sa") and "/promotion/psp/" in parsed.path
 
 
-def add_page(url):
+def add_page(value):
+    parts = [part.strip() for part in value.split("|", 1)]
+    url = parts[0]
+    title = parts[1] if len(parts) > 1 else ""
     if not valid_url(url):
         send("أرسل رابط صفحة عرض صالحة من Amazon.sa.")
         return
     with db() as conn:
-        conn.execute("INSERT INTO green_deal_pages(url) VALUES (%s) ON CONFLICT(url) DO UPDATE SET active=true", (url,))
-    send("تمت إضافة صفحة العرض للمتابعة ✅\n" + url)
+        conn.execute(
+            "INSERT INTO green_deal_pages(url,title) VALUES (%s,%s) "
+            "ON CONFLICT(url) DO UPDATE SET active=true,"
+            "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
+            (url, title),
+        )
+    send(f"تمت إضافة صفحة العرض للمتابعة ✅\\n{title or 'سيُقرأ اسم العرض في أول فحص'}\\n{url}")
 
 
 def show_pages():
     with db() as conn:
-        rows = conn.execute("SELECT id,url,active,expires_on,last_checked_at FROM green_deal_pages ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id,url,active,title,expires_on,last_checked_at FROM green_deal_pages ORDER BY id").fetchall()
     if not rows:
         send("ما فيه صفحات عروض مضافة حاليًا.")
         return
     lines = ["صفحات العروض المتابعة:"]
     buttons = []
-    for page_id, url, active, expiry, checked in rows:
+    for page_id, url, active, title, expiry, checked in rows:
         status = "تعمل" if active else "متوقفة"
         end = expiry.isoformat() if expiry else "غير محدد"
-        lines.append(f"#{page_id} • {status} • النهاية: {end}\n{url}")
+        lines.append(f"{page_id}. {title or 'اسم العرض'} • {status} • النهاية: {end}\\n{url}")
         buttons.append([{"text": f"إيقاف #{page_id}" if active else f"استئناف #{page_id}", "callback_data": f"page:{'pause' if active else 'resume'}:{page_id}"}])
         buttons.append([{"text": f"حذف #{page_id}", "callback_data": f"page:delete:{page_id}"}])
     send("\n\n".join(lines), {"inline_keyboard": buttons})
