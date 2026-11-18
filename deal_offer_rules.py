@@ -1,7 +1,7 @@
 """Parse each explicit offer independently and calculate its cost basis.
 
 No stacking is inferred. Basket estimates assume equal-priced eligible units;
-unclear eligibility, caps, banking and membership terms require review.
+unverified eligibility, banking and membership terms require review.
 """
 from __future__ import annotations
 
@@ -22,6 +22,27 @@ COUPON = r"(?:coupon|voucher|(?:ال)?قسيم[ةه]|كوبون)"
 CURRENCY = r"(?:SAR|ريال(?:ا)?|ر\.س\.?)"
 UNVERIFIED_TERMS = re.compile(r"\b(?:up to|maximum|max\.?|bank|cardholders?|subscribe|subscription|cashback|prime|selected|eligible|different|cheapest|lowest)\b|حتى|بحد\s*(?:اقصى|أقصى)|بنك|بطاقة|اشتراك|استرداد|برايم|مختار|مؤهل|الارخص|الأرخص|الاقل|الأقل", re.I)
 _REPORTED = set()
+PARTIAL_QUANTITY = (
+    rf'^{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?[,،]?\s*(?:and\s+)?'
+    rf'(?:save|get|وفر|و?احصل(?:\s+عل[ىي])?)\s*(?:خصم\s*)?(?P<rate>{NUM})\s*%'
+    rf'\s*(?:off\s*)?(?:on|على)\s*(?:the\s+)?(?:(?:cheapest|lowest-priced)\s+)?'
+    rf'(?:(?P<discounted>\d+)\s*(?:{ITEM})?|(?:one|قطعة\s+واحدة|القطعة\s+الأرخص|القطعة\s+الارخص|cheapest\s+item))'
+    r'(?:\s+(?P<same>of the same (?:item|product)|من نفس المنتج))?'
+    r'(?:\s+(?:cheapest|lowest-priced|الأرخص|الارخص))?\s*\.?$'
+)
+CAPPED_QUANTITY = (
+    rf'^(?:save|وفر|خصم)\s*(?P<rate>{NUM})\s*%\s*(?:on|على)\s*'
+    rf'(?P<q>\d+)\s*(?:\+|or\s+more|أو\s*أكثر|او\s*اكثر)\s*(?:{ITEM})?'
+    r'(?:\s*(?:from\s+(?:the\s+)?)?(?:UAE|UK|Germany|America|USA|الإمارات|الامارات|ألمانيا|المانيا|أمريكا|امريكا|بريطانيا))?'
+    rf'\s*[,،]?\s*(?:up\s+to|maximum(?:\s+savings\s+of)?|بحد\s*أقصى|بحد\s*اقصى|حتى)\s*'
+    rf'(?:{CURRENCY}\s*(?P<cap_a>{AMOUNT})|(?P<cap_b>{AMOUNT})\s*{CURRENCY})\s*\.?$'
+)
+SPEND_TIER = (
+    rf'(?:save\s+(?P<en>{NUM})\s*%\s+when\s+you\s+(?:buy|spend)\s+'
+    rf'{CURRENCY}\s*(?P<spend_en>{AMOUNT})(?:\s+or\s+more)?\s+(?:of|on)\s+(?:select|selected|eligible)\s+{ITEM}'
+    rf'|خصم\s*(?:بنسبة\s*)?(?P<ar>{NUM})\s*%\s*(?:على\s*أي|عند\s*شراء\s*ب(?:قيمة|مبلغ))\s*'
+    rf'(?P<spend_ar>{AMOUNT})\s*{CURRENCY})'
+)
 
 
 def number(value):
@@ -83,7 +104,9 @@ def classify_offers(current_price, reference_price, card_text):
 
     def add(candidate):
         if candidate and not any((x['type'],x['quantity'],x['pay_price'],x['stated_discount_percent']) ==
-                                 (candidate['type'],candidate['quantity'],candidate['pay_price'],candidate['stated_discount_percent']) for x in offers):
+                                 (candidate['type'],candidate['quantity'],candidate['pay_price'],candidate['stated_discount_percent']) and
+                                 x.get('minimum_spend') == candidate.get('minimum_spend') and
+                                 x.get('maximum_saving') == candidate.get('maximum_saving') for x in offers):
             offers.append(candidate)
 
     for text in clauses:
@@ -92,21 +115,68 @@ def classify_offers(current_price, reference_price, card_text):
         occupied = []
         review_start = len(unknown)
 
-        def scan(pattern, factory):
+        def scan(pattern, factory, *, reviewed_terms=False):
             for match in re.finditer(pattern, text, re.I):
                 if any(match.start() < b and match.end() > a for a,b in occupied):
                     continue
                 occupied.append(match.span())
                 # Restrictions alter the equation or eligibility: never infer
                 # them from an unrelated displayed unit price.
-                if UNVERIFIED_TERMS.search(text):
+                if not reviewed_terms and UNVERIFIED_TERMS.search(text):
                     unknown.append(dict(text=text[:500], reason='conditional_or_capped_offer'))
                     continue
                 candidate = factory(match)
-                if candidate:
+                if candidate and 'review_reason' in candidate:
+                    unknown.append(dict(text=text[:500], reason=candidate['review_reason'],
+                                        maximum_basket_discount_percent=candidate['maximum_basket_discount_percent']))
+                elif candidate:
                     add(candidate)
                 else:
                     unknown.append(dict(text=match.group(0)[:500], reason='missing_price_or_invalid_equation'))
+
+        def partial_quantity(match):
+            quantity = int(match['q'])
+            discounted = int(match['discounted'] or 1)
+            rate = number(match['rate'])
+            if not rate or rate > 100 or not 0 < discounted < quantity:
+                return None
+            upper_bound = rate * discounted / quantity
+            if not match['same']:
+                return dict(review_reason='cheapest_items_require_basket_prices',
+                            maximum_basket_discount_percent=money(upper_bound))
+            return calculated('partial_quantity_promotion', match[0], current_price, quantity,
+                              percent=upper_bound, stated=rate)
+
+        def capped_quantity(match):
+            rate = number(match['rate'])
+            cap = number(match['cap_a'] or match['cap_b'])
+            price = number(current_price)
+            quantity = int(match['q'])
+            if not price or not rate or rate > 100 or not cap or not 2 <= quantity <= 1000:
+                return None
+            saving = min(price * quantity * rate / 100, cap)
+            result = calculated('capped_quantity_promotion', match[0], price, quantity,
+                                amount=saving, stated=rate)
+            if result:
+                result['maximum_saving'] = money(cap)
+            return result
+
+        def spend_tier(match):
+            # A clean clause may contain several tiers separated by commas.
+            # Extra terms could change eligibility or cap the saving.
+            remainder = re.sub(SPEND_TIER, '', text, flags=re.I).strip(' .,،')
+            if remainder:
+                return None
+            rate = number(match['en'] or match['ar'])
+            spend = number(match['spend_en'] or match['spend_ar'])
+            result = calculated('spend_tier_promotion', match[0], spend, percent=rate)
+            if result:
+                result['minimum_spend'] = money(spend)
+            return result
+
+        scan(PARTIAL_QUANTITY, partial_quantity, reviewed_terms=True)
+        scan(CAPPED_QUANTITY, capped_quantity, reviewed_terms=True)
+        scan(SPEND_TIER, spend_tier, reviewed_terms=True)
 
         # X items for the price of Y items (the Y is not a currency amount).
         scan(rf'(?:{BUY}\s*)?(?P<q>\d+)\s*(?:{ITEM}\s*)?(?:for\s+(?:the\s+)?price\s+of|بسعر|بثمن)\s*(?P<p>\d+)(?![\d.])(?:\s*{ITEM})?(?!\s*{CURRENCY})',
@@ -155,10 +225,12 @@ def classify_offers(current_price, reference_price, card_text):
              lambda m: calculated('cash_coupon',m[0],current_price,amount=m['a'] or m['b']))
 
         # Percent applies to all N items, in either word order.
-        qty = rf'(?:on\s+(?:any\s+(?:of\s+)?)?|when\s+you\s+buy\s+|عند\s*شراء\s*|على\s*(?:أي\s*(?:من\s*)?)?)(?P<q>\d+)\s*(?:{ITEM})?\s*(?:or\s+more|أو\s*أكثر|او\s*اكثر)?'
+        qty = rf'(?:on\s+(?:any\s+(?:of\s+)?)?|when\s+you\s+buy\s+|عند\s*شراء\s*|على\s*(?:أي\s*(?:من\s*)?)?)(?P<q>\d+)(?![\d,.]|\s*{CURRENCY})\s*(?:{ITEM})?\s*(?:or\s+more|أو\s*أكثر|او\s*اكثر)?'
         scan(rf'(?P<rate>{NUM})\s*%\s*(?:off\s*)?{qty}',
-             lambda m: calculated('quantity_promotion',m[0],current_price,int(m['q']),percent=m['rate']))
-        scan(rf'{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?(?:[,،]\s*)?(?:and\s*)?(?:get|save|واحصل(?:\s+عل[ىي])?|تحصل(?:\s+عل[ىي])?)\s*(?:a\s*)?(?:discount\s*(?:of\s*)?|خصم\s*)?(?P<rate>{NUM})\s*%',
+             lambda m: calculated('quantity_promotion',m[0],current_price,int(m['q']),percent=m['rate'])
+             if int(m['q']) >= 2 else None)
+        scan(rf'{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?(?:[,،]\s*)?(?:and\s*)?(?:get|save|واحصل(?:\s+عل[ىي])?|تحصل(?:\s+عل[ىي])?)\s*(?:a\s*)?(?:discount\s*(?:of\s*)?|خصم\s*)?(?P<rate>{NUM})\s*%'
+             r'(?!\s*(?:off\s*)?(?:on|for|على|the\b|\d))',
              lambda m: calculated('quantity_promotion',m[0],current_price,int(m['q']),percent=m['rate']))
 
         scan(rf'(?:save|خصم|وفر)\s*(?P<rate>{NUM})\s*%\s*(?:off\s*)?(?:at\s+checkout|عند\s*(?:الدفع|إتمام\s*الشراء|اتمام\s*الشراء))\s*$',
@@ -191,6 +263,22 @@ def select_qualifying_offer(deals, coupon_threshold, promotion_threshold):
     eligible = [o for o in deals.get('offers',[]) if o['discount_percent'] >=
                 (coupon_threshold if 'coupon' in o['type'] else promotion_threshold)]
     return max(eligible,key=lambda o:o['discount_percent'],default=None)
+
+
+def reviewed_promotion_details(offer):
+    """Return separate eligibility and discount lines for reviewed basket offers."""
+    kind = offer['type']
+    if kind == 'spend_tier_promotion':
+        return (f"🛒 الحد الأدنى للمنتجات المؤهلة: {offer['minimum_spend']:.2f} SAR\n"
+                f"🏷️ خصم هذه الشريحة: {offer['discount_percent']:.2f}%\n")
+    if kind == 'capped_quantity_promotion':
+        return (f"🛒 الكمية المؤهلة: {offer['quantity']} قطع أو أكثر\n"
+                f"💵 سقف التوفير: {offer['maximum_saving']:.2f} SAR\n"
+                f"🏷️ خصم {offer['quantity']} من هذا المنتج بعد السقف: {offer['discount_percent']:.2f}%\n")
+    if kind == 'partial_quantity_promotion':
+        return (f"🏷️ نسبة الخصم على القطع المشمولة: {offer['stated_discount_percent']:.2f}%\n"
+                f"🛒 التوفير على الإجمالي: {offer['discount_percent']:.2f}%\n")
+    return ""
 
 
 def record_unrecognized(asin, bot_id, deals):

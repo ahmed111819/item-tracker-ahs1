@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from deal_parser_v2 import classify_deals, extract_reference_price, parse_price
-from deal_offer_rules import select_qualifying_offer
+from deal_offer_rules import select_qualifying_offer, reviewed_promotion_details
 from scan_link_report import classify_card_for_report, new_page_metrics
 
 
@@ -37,6 +37,7 @@ def handler(bot, suppressed=False):
             classify_card_for_report=classify_card_for_report,
             extract_reference_price=extract_reference_price,
             select_qualifying_offer=select_qualifying_offer,
+            reviewed_promotion_details=reviewed_promotion_details,
             record_unrecognized=lambda *args:None,
             print=lambda *args:None,save_tracking=lambda:None,
             VERBOSE_PRODUCT_LOGS=False,STORAGE_BACKEND='postgres',
@@ -111,3 +112,20 @@ class ScannerIntegrationTests(unittest.TestCase):
                         dict(type='product_block_release', blocked_price=25))
                 self.assertIn('وقت الحجب: 25.00 SAR', caption)
                 self.assertIn('الحالي: 20.00 SAR', caption)
+
+    def test_reviewed_promotion_caption_keeps_condition_and_actual_percentage(self):
+        cases = (
+            ('Buy 2, save 80% on 1 of the same item', '80.00%', 'التوفير على الإجمالي: 40.00%'),
+            ('Save 60% on 3+ UK, up to SAR 30.00', 'سقف التوفير: 30.00 SAR', 'بعد السقف: 50.00%'),
+            ('Save 45% when you buy SAR 80.00 of select items', '80.00 SAR', 'خصم هذه الشريحة: 45.00%'),
+        )
+        for bot in (1, 2, 3):
+            ns, _ = handler(bot)
+            for wording, condition, percentage in cases:
+                with self.subTest(bot=bot, wording=wording):
+                    deals = classify_deals(current_price=20, reference_price=None, card_text=wording)
+                    offer = select_qualifying_offer(deals, 40, 40)
+                    caption = ns['build_telegram_caption']('Example product', 'B012345678', 20, offer)
+                    self.assertIn(wording, caption)
+                    self.assertIn(condition, caption)
+                    self.assertIn(percentage, caption)

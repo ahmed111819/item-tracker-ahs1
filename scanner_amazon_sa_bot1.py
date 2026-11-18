@@ -31,7 +31,7 @@ from datetime import datetime
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from telegram_product_buttons import edit_product_keyboard, product_keyboard
-from deal_offer_rules import select_qualifying_offer, record_unrecognized
+from deal_offer_rules import select_qualifying_offer, record_unrecognized, reviewed_promotion_details
 from scan_link_report import classify_card_for_report, new_page_metrics, record_event
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
@@ -926,7 +926,10 @@ def build_telegram_caption(title, asin, price, offer):
             str(offer.get("description") or "عرض ترويجي")[:120]
         )
         caption = f"🎁 <b>{description}</b>\n" + product_line + price_line
-        if discount is not None:
+        details = reviewed_promotion_details(offer)
+        if details:
+            caption += details
+        elif discount is not None:
             caption += f"🏷️ نسبة الخصم: {float(discount):.2f}%\n"
 
     caption += f'\n🔗 <a href="{html.escape(product_url, quote=True)}">رابط المنتج</a>'

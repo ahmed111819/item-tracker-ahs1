@@ -145,5 +145,40 @@ class OfferRulesTests(unittest.TestCase):
         self.assertFalse(d['offers'])
 
 
+class ReviewedBasketOffersTests(unittest.TestCase):
+    def test_partial_quantity_uses_basket_rate_and_requires_prices(self):
+        mixed = read('Buy 2, save 20% on 1.')
+        self.assertFalse(mixed['offers'])
+        self.assertEqual(mixed['unrecognized'][0]['maximum_basket_discount_percent'], 10)
+        high_mixed = read('Buy 2, save 100% on 1.')
+        self.assertIsNone(select_qualifying_offer(high_mixed, 40, 40))
+        self.assertEqual(high_mixed['unrecognized'][0]['maximum_basket_discount_percent'], 50)
+        high_same = read('Buy 2, save 80% on 1 of the same item')
+        offer = select_qualifying_offer(high_same, 40, 40)
+        self.assertEqual((offer['discount_percent'], offer['stated_discount_percent']), (40, 80))
+
+    def test_capped_quantity_uses_cap_before_threshold(self):
+        actual = 'Save 10% on 3+ from the UAE, up to SAR 15.00'
+        offer = read(actual, 100)['promotion']
+        self.assertEqual((offer['saving'], offer['discount_percent']), (15, 5))
+        high = 'Save 60% on 3+ UK, up to SAR 30.00'
+        self.assertIsNone(select_qualifying_offer(read(high, 30), 40, 40))
+        self.assertEqual(select_qualifying_offer(read(high, 20), 40, 40)['discount_percent'], 50)
+
+    def test_spend_tiers_keep_conditions_and_test_threshold(self):
+        d = read('خصم بنسبة 8% على أي 40.00 ريال، خصم بنسبة 20% على أي 200.00 ريال')
+        self.assertEqual([(o['discount_percent'], o['minimum_spend']) for o in d['offers']],
+                         [(8, 40), (20, 200)])
+        self.assertIsNone(select_qualifying_offer(d, 40, 40))
+        offer = select_qualifying_offer(read('Save 45% when you buy SAR 80.00 of select items'), 40, 40)
+        self.assertEqual((offer['discount_percent'], offer['minimum_spend']), (45, 80))
+        self.assertFalse(read('Save 45% when you buy SAR 80.00 of select items, maximum SAR 10')['offers'])
+
+    def test_unhandled_later_item_is_never_an_all_items_offer(self):
+        d = read('Buy 4 and get 50% off the fifth item')
+        self.assertFalse(d['offers'])
+        self.assertTrue(d['unrecognized'])
+
+
 if __name__ == '__main__':
     unittest.main()
