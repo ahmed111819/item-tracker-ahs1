@@ -375,8 +375,8 @@ def collect_products(url, on_product, on_offer_title):
                     product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
                     image_url = ""
                     try:
-                        image_locator = card.locator("img[data-a-hires], img[data-a-dynamic-image], img[data-src]")
-                        image = image_locator.first if image_locator.count() else card.locator("img").first
+                        image_locator = card.locator("img[src*=\'media-amazon.com\'], img[data-a-hires], img[data-a-dynamic-image]")
+                    image = image_locator.first if image_locator.count() else card.locator("img").first
                         image_candidates = []
                         for attribute in ("data-a-hires", "data-src", "src"):
                             candidate = image.get_attribute(attribute) or ""
@@ -490,11 +490,11 @@ def scan_page(page_id, url):
                 conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
                 event = f"🔓 انفك حجب المنتج\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
             elif old is None:
-                event = f"🆕 منتج جديد\\n\\n📦 {title}\\n\\n💵 السعر الحالي: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\\n\\n📦 {title}\\n\\n💵 السعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\\n\\n📦 {title}\\n\\nالسابق: {float(old[0]):.2f} ريال\\nالحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\\n{title}\\nالسعر السابق: {float(old[0]):.2f} ريال\\nالسعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
             was_pending = bool(pending_alert and not is_muted)
