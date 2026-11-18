@@ -10,7 +10,7 @@ import json
 import os
 import re
 import time
-import tempfile
+from io import BytesIO
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -88,7 +88,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
         ],
         [{"text": "🔕 إيقاف تنبيه المنتج", "callback_data": f"product:mute:{asin}"}],
     ]}
-    message_text = caption + "\n👇 رابط فتح المنتج بالزر"
+    message_text = caption
 
     if image_url:
         try:
@@ -113,16 +113,12 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             }
             if THREAD_ID:
                 data["message_thread_id"] = str(THREAD_ID)
-            with tempfile.NamedTemporaryFile(suffix=".jpg") as saved_image:
-                saved_image.write(image_bytes)
-                saved_image.flush()
-                saved_image.seek(0)
-                response = HTTP.post(
-                    f"{API}/sendPhoto",
-                    data=data,
-                    files={"photo": ("product.jpg", saved_image, "image/jpeg")},
-                    timeout=45,
-                )
+            response = HTTP.post(
+                f"{API}/sendPhoto",
+                data=data,
+                files={"photo": ("product.jpg", BytesIO(image_bytes), "image/jpeg")},
+                timeout=45,
+            )
                 result = response.json()
                 if not response.ok or not result.get("ok"):
                     raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
@@ -195,7 +191,7 @@ def command(update):
     elif name == "/status":
         show_status()
     elif name in {"/help", "/start"}:
-        send("👀 متابع صفحات العروض\\n\\n/add رابط | اسم العرض — إضافة صفحة\\n/pages — الصفحات والأزرار\\n/status — حالة الفحص")
+        send("👀 متابع صفحات العروض\n\n/add رابط | اسم العرض — إضافة صفحة\n/pages — الصفحات والأزرار\n/status — حالة الفحص")
 
 
 def show_status():
@@ -210,7 +206,7 @@ def show_status():
     for page_id,url,active,checked,error,started in rows:
         present,total = count_map.get(page_id,(0,0))
         state = "يفحص الآن" if started else ("مفعّل" if active else "متوقف")
-        last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M بتوقيت الرياض") if checked else "لم يفحص بعد"
+        last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %I:%M %p بتوقيت الرياض") if checked else "لم يفحص بعد"
         issue = f"\nآخر خطأ: {error}" if error else ""
         lines.append(f"#{page_id} • {state} • المنتجات الظاهرة: {present}/{total} • آخر فحص: {last}{issue}\n{url}")
     send("\n\n".join(lines))
@@ -488,13 +484,13 @@ def scan_page(page_id, url):
                 event = None
             elif block:
                 conn.execute("DELETE FROM green_deal_product_blocks WHERE asin=%s", (asin,))
-                event = f"🔓 انفك حجب المنتج\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
+                event = f"🔓 انفك حجب المنتج\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif old is None:
-                event = f"🆕 منتج جديد\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
+                event = f"🆕 منتج جديد\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif not old[1]:
-                event = f"↩️ عاد المنتج للظهور\\n{title}\\nالسعر الحالي: {price:.2f} ريال"
+                event = f"↩️ عاد المنتج للظهور\n{title}\nالسعر الحالي: {price:.2f} ريال"
             elif old[0] is not None and float(old[0]) != price:
-                event = f"💰 تغير السعر\\n{title}\\nالسعر السابق: {float(old[0]):.2f} ريال\\nالسعر الحالي: {price:.2f} ريال"
+                event = f"💰 تغير السعر\n{title}\nالسعر السابق: {float(old[0]):.2f} ريال\nالسعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
             was_pending = bool(pending_alert and not is_muted)
@@ -517,14 +513,14 @@ def scan_page(page_id, url):
                         discounted_unit = round(price * (1 - percent / 100), 2)
                         bundle_total = round(price * (buy_quantity - discounted_quantity * percent / 100), 2)
                         average_unit = round(bundle_total / buy_quantity, 2)
-                        event += f"\\n🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال"
-                        event += f"\\n🛍️ إجمالي {buy_quantity} قطع: {bundle_total:.2f} ريال"
-                        event += f"\\n📊 متوسط القطعة: {average_unit:.2f} ريال"
+                        event += f"\n🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال"
+                        event += f"\n🛍️ إجمالي {buy_quantity} قطع: {bundle_total:.2f} ريال"
+                        event += f"\n📊 متوسط القطعة: {average_unit:.2f} ريال"
                     else:
                         discounted_unit = round(price * (1 - percent / 100), 2)
-                        event += f"\\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
+                        event += f"\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
                     if promotion_title:
-                        event += f"\\n📌 شرط العرض: {promotion_title}"
+                        event += f"\n📌 شرط العرض: {promotion_title}"
                 conn.execute(
                     "UPDATE green_deal_products SET pending_alert=%s,pending_url=%s,pending_image_url=%s "
                     "WHERE page_id=%s AND asin=%s",
