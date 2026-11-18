@@ -85,7 +85,7 @@ def send_product_alert(caption, product_url, image_url):
             return
         except Exception as exc:
             print(f"Product image could not be sent ({type(exc).__name__}); sending text alert.")
-    send(caption + f"\\n🔗 {product_url}", markup)
+    send(caption + f"\n🔗 {product_url}", markup)
 
 
 def valid_url(value):
@@ -283,14 +283,26 @@ def collect_products(url, on_product, on_offer_title):
 
 
 
-def promotion_percent(title):
+def promotion_details(title):
     digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-    normalized = (title or "").translate(digits).replace("٪", "%")
-    match = re.search(r"(\d+(?:\.\d+)?)\s*%", normalized)
-    if not match:
+    normalized = (title or "").translate(digits).replace("٪", "%").lower()
+    percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", normalized)
+    if not percent_match:
         return None
-    value = float(match.group(1))
-    return value if 0 < value < 100 else None
+    percent = float(percent_match.group(1))
+    if not 0 < percent < 100:
+        return None
+    buy_match = re.search(r"buy\s*(\d+)", normalized)
+    buy_quantity = int(buy_match.group(1)) if buy_match else None
+    on_match = re.search(r"\bon\s*(\d+)\b", normalized)
+    discounted_quantity = int(on_match.group(1)) if on_match and buy_quantity else buy_quantity
+    if buy_quantity and (discounted_quantity is None or discounted_quantity > buy_quantity):
+        discounted_quantity = buy_quantity
+    return {
+        "percent": percent,
+        "buy_quantity": buy_quantity,
+        "discounted_quantity": discounted_quantity,
+    }
 
 
 def scan_page(page_id, url):
@@ -298,18 +310,20 @@ def scan_page(page_id, url):
     with db() as conn:
         page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
     promotion_title = page_row[0] if page_row else ""
-    discount = promotion_percent(promotion_title)
+    promotion = promotion_details(promotion_title)
 
     def save_offer_title(value):
-        nonlocal promotion_title, discount
+        nonlocal promotion_title, promotion
         if not promotion_title and value:
             promotion_title = value[:200]
-            discount = promotion_percent(promotion_title)
+            promotion = promotion_details(promotion_title)
             with db() as conn:
                 conn.execute("UPDATE green_deal_pages SET title=%s WHERE id=%s", (promotion_title, page_id))
 
     def save_product(asin, title, price, product_url, image_url):
-        discounted = round(price * (1 - discount / 100), 2) if discount is not None else None
+        percent = promotion['percent'] if promotion else None
+        buy_quantity = promotion['buy_quantity'] if promotion else None
+        discounted_quantity = promotion['discounted_quantity'] if promotion else None
         found[asin] = (title, price, product_url)
         with db() as conn:
             old = conn.execute(
@@ -330,10 +344,19 @@ def scan_page(page_id, url):
                 product_url=excluded.product_url,present=true,last_seen_at=now()
             """, (page_id, asin, title, price, product_url))
         if event:
-            if discounted is not None:
-                event += f"\nالسعر بعد خصم {discount:g}%: {discounted:.2f} ريال"
+            if percent is not None:
+                if buy_quantity and discounted_quantity:
+                    discounted_unit = round(price * (1 - percent / 100), 2)
+                    bundle_total = round(price * (buy_quantity - discounted_quantity * percent / 100), 2)
+                    average_unit = round(bundle_total / buy_quantity, 2)
+                    event += f"\n🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال"
+                    event += f"\n🛍️ إجمالي {buy_quantity} قطع: {bundle_total:.2f} ريال"
+                    event += f"\n📊 متوسط القطعة: {average_unit:.2f} ريال"
+                else:
+                    discounted_unit = round(price * (1 - percent / 100), 2)
+                    event += f"\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
                 if promotion_title:
-                    event += f"\nشرط العرض: {promotion_title}"
+                    event += f"\n📌 شرط العرض: {promotion_title}"
             send(f"{event}\n🔗 {product_url}")
 
     collect_products(url, save_product, save_offer_title)
