@@ -176,39 +176,78 @@ def collect_products(url, on_product):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2500)
-        for _ in range(100):
-            cards = page.locator("div[data-asin]").all()
-            for card in cards:
-                asin = (card.get_attribute("data-asin") or "").strip()
-                if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-                    continue
-                title = ""
-                link = ""
-                price = None
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3500)
+            print(f"Opened promotion page: status={response.status if response else 'unknown'} title={page.title()!r}")
+            for batch in range(100):
+                cards = page.locator("[data-asin]").all()
+                print(f"Promotion batch {batch + 1}: {len(cards)} ASIN elements")
+                for card in cards:
+                    asin = (card.get_attribute("data-asin") or "").strip()
+                    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+                        continue
+                    title = ""
+                    link = ""
+                    price = None
+                    try:
+                        title_node = card.locator("h2, [data-cy='title-recipe-title'], .a-size-base-plus").first
+                        title = title_node.inner_text(timeout=800).strip()
+                    except Exception:
+                        pass
+                    try:
+                        link = card.locator("a[href*='/dp/'], a[href*='/gp/product/']").first.get_attribute("href") or ""
+                    except Exception:
+                        pass
+                    try:
+                        price_node = card.locator(".a-price .a-offscreen, .a-price-whole").first
+                        price_text = price_node.inner_text(timeout=800)
+                        match = re.search(r"([0-9][0-9,]*(?:\\.[0-9]{1,2})?)", price_text)
+                        if match:
+                            price = float(match.group(1).replace(",", ""))
+                    except Exception:
+                        pass
+                    if price is None:
+                        try:
+                            card_text = card.inner_text(timeout=800)
+                            match = re.search(r"(?:SAR|ر\\s*ي\\s*ال|ريال)\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\\.[0-9]{1,2})?)\\s*(?:SAR|ريال)", card_text, re.I)
+                            if match:
+                                price = float((match.group(1) or match.group(2)).replace(",", ""))
+                        except Exception:
+                            pass
+                    if price is None or price <= 0:
+                        continue
+                    product_url = ("https://www.amazon.sa" + link) if link.startswith("/") else (link or f"https://www.amazon.sa/dp/{asin}")
+                    product = (title[:300] or asin, price, product_url)
+                    if products.get(asin) != product:
+                        products[asin] = product
+                        on_product(asin, *product)
+
+                more = page.get_by_text(re.compile(r"^\\s*(إظهار المزيد|Show more|Load more)\\s*$", re.I)).last
+                if more.count() == 0:
+                    print("No visible 'show more' control was found.")
+                    break
                 try:
-                    title = card.locator("h2").first.inner_text(timeout=500)
-                    link = card.locator("h2 a").first.get_attribute("href") or ""
-                    price_text = card.locator(".a-price .a-offscreen").first.inner_text(timeout=500)
-                    match = re.search(r"([\d,]+(?:\.\d{1,2})?)", price_text)
-                    if match:
-                        price = float(match.group(1).replace(",", ""))
-                except Exception:
-                    pass
-                if price is not None:
-                    product = (title[:300], price, "https://www.amazon.sa" + link if link.startswith("/") else link)
-                    products[asin] = product
-                    on_product(asin, *product)
-            more = page.get_by_role("button", name=re.compile("إظهار المزيد|show more", re.I))
-            if not more.count() or not more.first.is_enabled():
-                break
-            before = len(products)
-            more.first.click(timeout=4000)
-            page.wait_for_timeout(1800)
-            if len(products) == before and not more.first.is_visible():
-                break
-        browser.close()
+                    if not more.is_visible() or not more.is_enabled():
+                        print("'Show more' control is hidden or disabled.")
+                        break
+                    before_count = len(page.locator("[data-asin]").all())
+                    more.scroll_into_view_if_needed(timeout=3000)
+                    more.click(timeout=8000)
+                    page.wait_for_function(
+                        "(previous) => document.querySelectorAll('[data-asin]').length > previous",
+                        arg=before_count,
+                        timeout=12000,
+                    )
+                    page.wait_for_timeout(700)
+                except Exception as exc:
+                    print(f"Could not load the next promotion batch: {type(exc).__name__}: {exc}")
+                    break
+            if not products:
+                body = (page.locator("body").inner_text(timeout=3000) or "")[:500]
+                raise RuntimeError(f"No priced ASIN products were parsed. Page title={page.title()!r}; body preview={body!r}")
+        finally:
+            browser.close()
     return products
 
 
@@ -260,8 +299,8 @@ def run(continuous):
                 scan_page(page_id, url)
             except Exception as exc:
                 with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=%s,scan_started_at=NULL WHERE id=%s", (type(exc).__name__, page_id))
-                print(f"Page {page_id} scan failed: {type(exc).__name__}")
+                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=%s,scan_started_at=NULL WHERE id=%s", (f"{type(exc).__name__}: {str(exc)[:300]}", page_id))
+                print(f"Page {page_id} scan failed: {type(exc).__name__}: {exc}")
             offset = handle_updates(offset)
         if not continuous:
             break
