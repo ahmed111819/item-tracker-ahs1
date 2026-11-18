@@ -317,6 +317,17 @@ def parse_expiry_date(text):
     return max(found) if found else None
 
 
+def parse_amazon_price(value):
+    normalized = str(value or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    normalized = normalized.replace("٫", ".").replace("٬", ",")
+    match = re.search(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?", normalized)
+    if not match:
+        return None
+    whole = match.group(1).replace(",", "")
+    fraction = match.group(2) or ""
+    return float(f"{whole}.{fraction}") if fraction else float(whole)
+
+
 def collect_products(url, on_product, on_offer_title):
     products = {}
     with sync_playwright() as p:
@@ -352,19 +363,27 @@ def collect_products(url, on_product, on_offer_title):
                     except Exception:
                         pass
                     try:
-                        price_node = card.locator(".a-price .a-offscreen, .a-price-whole").first
-                        price_text = price_node.inner_text(timeout=800)
-                        match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
-                        if match:
-                            price = float(match.group(1).replace(",", ""))
+                        price_node = card.locator(".a-price").first
+                        offscreen = price_node.locator(".a-offscreen").first
+                        if offscreen.count():
+                            price = parse_amazon_price(offscreen.inner_text(timeout=800))
+                        if price is None:
+                            whole_node = price_node.locator(".a-price-whole").first
+                            whole_text = whole_node.inner_text(timeout=800) if whole_node.count() else ""
+                            fraction_node = price_node.locator(".a-price-fraction").first
+                            fraction_text = fraction_node.inner_text(timeout=800) if fraction_node.count() else ""
+                            whole = re.sub(r"\D", "", whole_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+                            fraction = re.sub(r"\D", "", fraction_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+                            if whole:
+                                price = parse_amazon_price(f"{whole}.{fraction[:2]}" if fraction else whole)
                     except Exception:
                         pass
                     if price is None:
                         try:
-                            card_text = card.inner_text(timeout=800)
-                            match = re.search(r"(?:SAR|ر\s*ي\s*ال|ريال)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:SAR|ريال)", card_text, re.I)
+                            card_text = card.inner_text(timeout=800).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+                            match = re.search(r"(?:SAR|ر\s*ي\s*ا\s*ل|ريال)\s*([0-9][0-9,]*(?:[.٫][0-9]{1,2})?)|([0-9][0-9,]*(?:[.٫][0-9]{1,2})?)\s*(?:SAR|ريال)", card_text, re.I)
                             if match:
-                                price = float((match.group(1) or match.group(2)).replace(",", ""))
+                                price = parse_amazon_price(match.group(1) or match.group(2))
                         except Exception:
                             pass
                     if price is None or price <= 0:
@@ -519,7 +538,7 @@ def scan_page(page_id, url):
                         event += f"\n📊 متوسط القطعة: {average_unit:.2f} ريال"
                     else:
                         discounted_unit = round(price * (1 - percent / 100), 2)
-                        event += f"\n🎁 السعر التقديري بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
+                        event += f"\n🎁 السعر بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"
                     if promotion_title:
                         event += f"\n📌 شرط العرض: {promotion_title}"
                 conn.execute(
