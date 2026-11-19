@@ -800,6 +800,18 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
 def promotion_details(title):
     digits = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬٪", "01234567890123456789.,%")
     normalized = re.sub(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", (title or "").translate(digits).lower())
+    free = re.search(
+        r"(?:\bbuy\b|(?:اشتر(?:ي)?|إشتر(?:ي)?))\s*(?P<paid>[0-9]+)\s*"
+        r"(?:(?:items?|units?|pieces?|قطع|قطعة|منتجات)\s*)?[,،]?\s*"
+        r"(?:(?:and\s+)?get\b|و?\s*احصل\s+على|وخذ)\s*(?P<free>[0-9]+)\s*"
+        r"(?:(?:items?|units?|pieces?|قطع|قطعة|منتجات)\s*)?(?:free\b|مجان[ًاا]?|مجاني(?:ة)?)",
+        normalized,
+    )
+    if free:
+        paid, extra = int(free["paid"]), int(free["free"])
+        if paid > 0 and extra > 0:
+            return {"buy_quantity": paid + extra, "paid_quantity": paid}
+
     currency = r"(?:sar|sr|ريال(?:\s+سعودي)?|ر\.?\s*س\.?|﷼)"
     amount = r"(?P<total>[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)(?!(?:[0-9]|[.,][0-9]|\s*%))"
     fixed = re.search(
@@ -836,9 +848,10 @@ def promotion_details(title):
 
 def promotion_price_lines(promotion, price):
     quantity = promotion.get("buy_quantity")
-    if "bundle_total" in promotion:
-        original_total = Decimal(str(price)) * quantity
-        offer_total = promotion["bundle_total"]
+    if "bundle_total" in promotion or "paid_quantity" in promotion:
+        unit_price = Decimal(str(price))
+        original_total = unit_price * quantity
+        offer_total = promotion["bundle_total"] if "bundle_total" in promotion else unit_price * promotion["paid_quantity"]
         savings = max(Decimal(0), original_total - offer_total)
         return [
             f"🛒 إجمالي {quantity} قبل العرض: {original_total:.2f} ريال",
@@ -881,6 +894,8 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         nonlocal promotion_title, promotion
         expiry = parse_expiry_date(page_text)
         document_offer = re.sub(r"^Amazon\.sa\s*[:|–-]\s*|\s+promotion\s*$", "", document_title, flags=re.I)
+        document_offer = " ".join(document_offer.split())
+        value = " ".join(value.split())
         discovered_title = value
         discovered = promotion_details(value)
         if not discovered and document_offer:
@@ -889,8 +904,13 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 discovered_title = document_offer
         if discovered:
             promotion_title, promotion = discovered_title[:200], discovered
-        elif not promotion_title and value:
-            promotion_title = value[:200]
+        elif not promotion:
+            raw_title = value
+            if document_offer and document_offer.lower() not in {"amazon.sa", "amazon", "نعتذر"}:
+                if not raw_title or re.search(r"\bpromotion\s*$", document_title, re.I):
+                    raw_title = document_offer
+            if raw_title:
+                promotion_title = raw_title[:200]
         with conn.transaction():
             conn.execute(
                 "UPDATE green_deal_pages SET title=CASE WHEN title='' THEN %s ELSE title END,"
@@ -955,10 +975,9 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
             """, (page_id, asin, title, price, product_url))
             if event and not is_muted:
                 if promotion and not was_pending:
-                    lines = promotion_price_lines(promotion, price)
-                    if promotion_title:
-                        lines.append(f"📌 شرط العرض: {promotion_title}")
-                    event += "\n" + "\n".join(lines)
+                    event += "\n" + "\n".join(promotion_price_lines(promotion, price))
+                if promotion_title and "\n📌 شرط العرض:" not in event:
+                    event += f"\n📌 شرط العرض: {promotion_title}"
                 conn.execute(
                     "UPDATE green_deal_products SET pending_alert=%s,pending_url=%s,pending_image_url=%s "
                     "WHERE page_id=%s AND asin=%s",
