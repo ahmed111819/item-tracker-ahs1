@@ -14,6 +14,7 @@ LABELS = {
     "not_started": "لم يبدأ", "in_progress": "غير مكتمل", "failed": "توقف عند خطأ",
     "AMAZON_NEXT_DISABLED": "اكتمل", "CONFIRMED_EMPTY_END_PAGE": "اكتمل",
     "MAX_PAGES_SAFETY_CAP": "بلغ حد الصفحات",
+    "REPEATED_RESULT_PAGES": "توقّف بسبب تكرار النتائج",
 }
 
 

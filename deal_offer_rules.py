@@ -27,6 +27,11 @@ PRIME_PRICE = (
     r'|انضم\s+(?:إلى|الى)\s+(?:أمازون\s+|امازون\s+)?برايم\s+لشراء\s+هذا\s+المنتج\s+ب(?:سعر)?)\s*'
     rf'(?:{CURRENCY}\s*(?P<prime_a>{AMOUNT})|(?P<prime_b>{AMOUNT})\s*{CURRENCY})\s*\.?$'
 )
+QUANTITY_TIER = (
+    rf'{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?(?:and\s*)?'
+    rf'(?:get|save|وفر|و?احصل(?:\s+عل[ىي])?)\s*(?:خصم\s*)?'
+    rf'(?P<rate>{NUM})\s*%\s*(?:off\b)?'
+)
 SAVINGS_BADGE = re.compile(rf'^(?:save|وفر|خصم)\s*(?P<rate>{NUM})\s*%\s*\.?$', re.I)
 PARTIAL_QUANTITY = (
     rf'^{BUY}\s*(?P<q>\d+)\s*(?:{ITEM}\s*)?[,،]?\s*(?:and\s+)?'
@@ -45,7 +50,7 @@ CAPPED_QUANTITY = (
 )
 SPEND_TIER = (
     rf'(?:save\s+(?P<en>{NUM})\s*%\s+when\s+you\s+(?:buy|spend)\s+'
-    rf'{CURRENCY}\s*(?P<spend_en>{AMOUNT})(?:\s+or\s+more)?\s+(?:of|on)\s+(?:select|selected|eligible)\s+{ITEM}'
+    rf'{CURRENCY}\s*(?P<spend_en>{AMOUNT})(?:\s+or\s+more)?(?:\s+(?:of|on)\s+(?:select|selected|eligible)\s+{ITEM})?'
     rf'|خصم\s*(?:بنسبة\s*)?(?P<ar>{NUM})\s*%\s*(?:على\s*أي|عند\s*شراء\s*ب(?:قيمة|مبلغ))\s*'
     rf'(?P<spend_ar>{AMOUNT})\s*{CURRENCY})'
 )
@@ -136,6 +141,37 @@ def classify_offers(current_price, reference_price, card_text, *, regular_price_
                 add(offer)
             else:
                 unknown.append(dict(text=text[:500], reason='prime_regular_price_unverified'))
+            continue
+
+        tiers = list(re.finditer(QUANTITY_TIER, text, re.I))
+        if len(tiers) >= 2:
+            remainder = re.sub(QUANTITY_TIER, '', text, flags=re.I)
+            remainder = re.sub(r'(?:off\s+)?on\s+toys|على\s*(?:الالعاب|الألعاب)', '', remainder, flags=re.I)
+            if not remainder.strip(' ,،.') and not UNVERIFIED_TERMS.search(text):
+                candidates = [
+                    calculated('quantity_tier_promotion', text, current_price,
+                               int(tier['q']), percent=tier['rate'])
+                    for tier in tiers
+                ]
+                if all(candidates):
+                    for candidate in candidates:
+                        add(candidate)
+                else:
+                    unknown.append(dict(text=text[:500], reason='missing_price_or_invalid_equation'))
+            else:
+                unknown.append(dict(text=text[:500], reason='unverified_quantity_tiers'))
+            continue
+
+        extra = re.fullmatch(
+            rf'(?:buy\s*&?\s*get\s+(?:extra|additional)\s+|اشتر(?:ي)?\s*واحصل\s*على\s*خصم\s*إضافي\s*)'
+            rf'(?P<rate>{NUM})\s*%\s*(?:off)?', text, re.I
+        )
+        if extra:
+            candidate = calculated('checkout_promotion', text, current_price, percent=extra['rate'])
+            if candidate:
+                add(candidate)
+            else:
+                unknown.append(dict(text=text[:500], reason='missing_price_or_invalid_equation'))
             continue
 
         occupied = []
@@ -294,6 +330,9 @@ def select_qualifying_offer(deals, coupon_threshold, promotion_threshold):
 def reviewed_promotion_details(offer):
     """Return separate eligibility and discount lines for reviewed basket offers."""
     kind = offer['type']
+    if kind == 'quantity_tier_promotion':
+        return (f"🛒 الكمية المطلوبة للشريحة: {offer['quantity']} قطع\n"
+                f"🏷️ خصم الشريحة على الإجمالي: {offer['discount_percent']:.2f}%\n")
     if kind == 'spend_tier_promotion':
         return (f"🛒 الحد الأدنى للمنتجات المؤهلة: {offer['minimum_spend']:.2f} SAR\n"
                 f"🏷️ خصم هذه الشريحة: {offer['discount_percent']:.2f}%\n")
