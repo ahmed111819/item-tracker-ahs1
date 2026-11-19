@@ -213,5 +213,46 @@ class ReviewedBasketOffersTests(unittest.TestCase):
         self.assertTrue(d['unrecognized'])
 
 
+
+class QuantityAndSpendTierTests(unittest.TestCase):
+    def test_observed_toy_tiers_apply_to_the_whole_basket(self):
+        for text, expected in (
+            ('Buy 1 Get 10%, Buy 2 Get 15% Off on Toys', [(1, 10, 18), (2, 15, 34)]),
+            ('Buy 2 Get 5%, Buy 3 Get 10% Off on Toys', [(2, 5, 38), (3, 10, 54)]),
+        ):
+            with self.subTest(text=text):
+                deals = read(text, 20)
+                self.assertEqual([(o['quantity'], o['discount_percent'], o['pay_price'])
+                                  for o in deals['offers']], expected)
+                self.assertFalse(deals['unrecognized'])
+                self.assertIsNone(select_qualifying_offer(deals, 40, 40))
+
+    def test_qualifying_tier_keeps_the_required_quantity(self):
+        deals = read('Buy 1 Get 10%, Buy 3 Get 45% Off on Toys', 20)
+        offer = select_qualifying_offer(deals, 40, 40)
+        self.assertEqual((offer['quantity'], offer['pay_price']), (3, 33))
+        self.assertEqual(offer['type'], 'quantity_tier_promotion')
+
+    def test_partial_and_capped_tiers_require_review(self):
+        for text in ('Buy 1 Get 10%, Buy 3 Get 80% Off on 1',
+                     'Buy 1 Get 10%, Buy 3 Get 80% Off on Toys, maximum SAR 5'):
+            with self.subTest(text=text):
+                deals = read(text)
+                self.assertFalse(deals['offers'])
+                self.assertTrue(deals['unrecognized'])
+
+    def test_spend_threshold_and_extra_discount_variants(self):
+        for text, rate in (('Save 10% when you spend SAR 50.00', 10),
+                           ('Save 45% when you spend SAR 100.00', 45)):
+            offer = read(text)['promotion']
+            self.assertEqual(offer['discount_percent'], rate)
+            self.assertEqual(offer['minimum_spend'], 50 if rate == 10 else 100)
+        for text, rate in (('Buy & Get extra 15% Off', 15),
+                           ('Buy & Get extra 45% Off', 45)):
+            deals = read(text, 100)
+            self.assertEqual(deals['promotion']['pay_price'], 100 - rate)
+            self.assertFalse(deals['unrecognized'])
+        self.assertFalse(read('Save 50% when you spend SAR 50, with bank card')['offers'])
+
 if __name__ == '__main__':
     unittest.main()

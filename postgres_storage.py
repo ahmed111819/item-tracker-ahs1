@@ -11,6 +11,9 @@ import gzip
 import json
 import os
 import uuid
+import time
+from contextlib import contextmanager
+from threading import BoundedSemaphore
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,8 +31,28 @@ def _database_url() -> str:
     return url
 
 
+_CONNECTION_SLOTS = BoundedSemaphore(4)
+_CONNECT_RETRY_DELAYS = (2, 5, 10)
+
+
+@contextmanager
 def _connect():
-    return psycopg.connect(_database_url(), connect_timeout=15, row_factory=dict_row)
+    """Bound connection concurrency and retry only before a transaction starts."""
+    url = _database_url()
+    with _CONNECTION_SLOTS:
+        for attempt in range(len(_CONNECT_RETRY_DELAYS) + 1):
+            try:
+                connection = psycopg.connect(url, connect_timeout=15, row_factory=dict_row)
+                break
+            except psycopg.OperationalError as error:
+                sqlstate = getattr(error, "sqlstate", None) or ""
+                if sqlstate.startswith(("28", "3D")) or attempt == len(_CONNECT_RETRY_DELAYS):
+                    raise
+                delay = _CONNECT_RETRY_DELAYS[attempt]
+                print(f"PostgreSQL connection unavailable; retrying in {delay} seconds.")
+                time.sleep(delay)
+        with connection:
+            yield connection
 
 
 def load_state(bot_id: str) -> dict[str, Any]:

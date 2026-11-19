@@ -46,15 +46,7 @@ jobs:
           chmod 600 "$HOME/.ssh/oracle_pg_key"
           printf '%s %s %s\n' "84.13.143.171" "ssh-ed25519" "AAAAC3NzaC1lZDI1NTE5AAAAIJxRb/5/4wQhsBq5BS8lRPEQNsvS0cAqM52Y7f/fFW8S" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          ssh -f -N -M -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" \
-            -L 127.0.0.1:5432:127.0.0.1:5432 \
-            -o ExitOnForwardFailure=yes \
-            -o ServerAliveInterval=60 \
-            -o ServerAliveCountMax=3 \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -i "$HOME/.ssh/oracle_pg_key" \
-            coupon-tunnel@84.13.143.171
+          python -u ssh_tunnel.py start
       - name: Install dependencies
         run: python -m pip install --upgrade pip -r requirements.txt
       - name: Run all three bots concurrently
@@ -153,6 +145,7 @@ jobs:
       - name: Close SSH tunnel and remove key
         if: always()
         run: |
+          python ssh_tunnel.py stop
           ssh -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" -O exit coupon-tunnel@84.13.143.171 2>/dev/null || true
           rm -f "$HOME/.ssh/oracle_pg_key" "$HOME/.ssh/known_hosts" "$RUNNER_TEMP/oracle_pg_tunnel.sock"
 
@@ -182,15 +175,7 @@ jobs:
           chmod 600 "$HOME/.ssh/oracle_pg_key"
           printf '%s %s %s\n' "84.13.143.171" "ssh-ed25519" "AAAAC3NzaC1lZDI1NTE5AAAAIJxRb/5/4wQhsBq5BS8lRPEQNsvS0cAqM52Y7f/fFW8S" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          ssh -f -N -M -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" \
-            -L 127.0.0.1:5432:127.0.0.1:5432 \
-            -o ExitOnForwardFailure=yes \
-            -o ServerAliveInterval=60 \
-            -o ServerAliveCountMax=3 \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -i "$HOME/.ssh/oracle_pg_key" \
-            coupon-tunnel@84.13.143.171
+          python -u ssh_tunnel.py start
       - name: Install callback listener dependencies
         run: python -m pip install "requests>=2.32,<3" "psycopg[binary]>=3.2,<4"
       - name: Mark the start of the 10-minute rest
@@ -242,5 +227,6 @@ jobs:
       - name: Close SSH tunnel and remove key
         if: always()
         run: |
+          python ssh_tunnel.py stop
           ssh -S "$RUNNER_TEMP/oracle_pg_tunnel.sock" -O exit coupon-tunnel@84.13.143.171 2>/dev/null || true
           rm -f "$HOME/.ssh/oracle_pg_key" "$HOME/.ssh/known_hosts" "$RUNNER_TEMP/oracle_pg_tunnel.sock"

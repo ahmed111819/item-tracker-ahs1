@@ -34,6 +34,7 @@ from telegram_product_buttons import edit_product_keyboard, product_keyboard
 from deal_offer_rules import (
     offer_payable_details, record_unrecognized, reviewed_promotion_details, select_qualifying_offer,
 )
+from scan_pagination import RepeatedPages, next_page_url
 from scan_link_report import classify_card_for_report, new_page_metrics, record_event
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
@@ -1334,14 +1335,14 @@ async def process_card(snapshot, search_url, page_number, index, search_index, m
 # SCAN ONE PAGE
 # ------------------------------------------------------------
 
-async def _scan_one_page(context, search_url, page_number, search_index, metrics):
+async def _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override=None):
     """Scan one page. A disabled Next button is strong end-of-results evidence.
 
     A 503, CAPTCHA, error page, or unconfirmed empty page is never treated as
     end-of-results. Such pages are retried and, if still unresolved, remain
     resumable on the next run.
     """
-    page_url = build_page_url(search_url, page_number)
+    page_url = page_url_override or build_page_url(search_url, page_number)
     page = await context.new_page()
 
     def empty_result(success, empty=False, end_confirmed=False, total_pages=None):
@@ -1408,7 +1409,7 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
                 next_exists = False
                 if status == 200 and not likely_error_title:
                     try:
-                        next_button = page.locator("a.s-pagination-next").first
+                        next_button = page.locator(".s-pagination-next").first
                         if await next_button.count() > 0:
                             next_exists = True
                             next_class = (await next_button.get_attribute("class") or "").lower()
@@ -1505,6 +1506,7 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
                         "next_href": next_href,
                         "next_exists": next_exists,
                         "asins": asins,
+                        "listing_asins": {str(card["asin"]) for card in card_snapshots if card.get("asin")},
                         "total_pages": total_pages,
                         "products_saved": products_saved,
                         "alerts_sent": alerts_sent,
@@ -1568,14 +1570,14 @@ PAGE_SEMAPHORE = None
 PRODUCT_SEMAPHORE = None
 
 
-async def scan_one_page(context, search_url, page_number, search_index):
+async def scan_one_page(context, search_url, page_number, search_index, page_url_override=None):
     metrics = new_page_metrics()
     try:
         if PAGE_SEMAPHORE is None:
-            result = await _scan_one_page(context, search_url, page_number, search_index, metrics)
+            result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override)
         else:
             async with PAGE_SEMAPHORE:
-                result = await _scan_one_page(context, search_url, page_number, search_index, metrics)
+                result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override)
     except Exception:
         report_page(search_index, search_url, page_number, {}, metrics)
         raise
@@ -1607,6 +1609,8 @@ async def scan_one_search(context, search_url, search_index):
     alerts_sent = 0
     seen_asins = set()
     reported_total_pages = None
+    repeated_pages = RepeatedPages()
+    previous_next_url = None
 
     while page_number <= MAX_PAGES_PER_SEARCH:
         batch_end = min(
@@ -1620,7 +1624,8 @@ async def scan_one_search(context, search_url, search_index):
         )
         batch_results = await asyncio.gather(
             *[
-                scan_one_page(context, search_url, number, search_index)
+                scan_one_page(context, search_url, number, search_index,
+                              page_url_override=previous_next_url if number == page_number else None)
                 for number in batch_pages
             ],
             return_exceptions=True,
@@ -1628,6 +1633,21 @@ async def scan_one_search(context, search_url, search_index):
 
         stop_search = False
         for number, result in zip(batch_pages, batch_results):
+            listing_asins = result.get("listing_asins", result.get("asins", set())) if isinstance(result, dict) else set()
+            failed_page = isinstance(result, Exception) or not result.get("success")
+            used_next_url = previous_next_url if number == page_number else None
+            if previous_next_url and previous_next_url != used_next_url and (
+                failed_page or repeated_pages.repeated(listing_asins)
+            ):
+                print(f"Search {search_index}: retrying page {number} using Amazon's Next link.")
+                try:
+                    result = await scan_one_page(
+                        context, search_url, number, search_index, page_url_override=previous_next_url
+                    )
+                except Exception as error:
+                    result = error
+                listing_asins = result.get("listing_asins", result.get("asins", set())) if isinstance(result, dict) else set()
+
             if isinstance(result, Exception):
                 tracking_data["scan_state"][search_url] = {
                     "next_page": number,
@@ -1668,6 +1688,19 @@ async def scan_one_search(context, search_url, search_index):
                     "Actual end detection uses the Next button / confirmed empty page."
                 )
             seen_asins.update(result.get("asins", set()))
+            previous_next_url = next_page_url(search_url, result.get("next_href"), number + 1)
+            if repeated_pages.observe(listing_asins):
+                tracking_data["scan_state"][search_url] = {
+                    "next_page": number,
+                    "total_pages": reported_total_pages,
+                    "completed": False,
+                    "end_reason": "REPEATED_RESULT_PAGES",
+                    "last_error_at": datetime.now().isoformat(),
+                }
+                save_tracking()
+                print(f"Search {search_index}: three repeated result pages; stopping this link for this run.")
+                stop_search = True
+                break
 
             if result.get("end_confirmed"):
                 tracking_data["scan_state"][search_url] = {
