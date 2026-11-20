@@ -30,7 +30,7 @@ from psycopg.types.json import Jsonb
 
 from green_product_offers import (
     BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
-    format_offer_alert, green_offer_key, is_quiet_offer,
+    duplicates_green_spend, format_offer_alert, green_offer_key, has_notifiable_combination, is_quiet_offer,
     new_notifiable_offers, read_detail_offers, without_green_duplicate,
 )
 
@@ -118,6 +118,14 @@ def init_db():
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_alert text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_url text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_image_url text")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS green_deal_combination_alerts (
+                asin text PRIMARY KEY,
+                page_id bigint NOT NULL,
+                pending_revision bigint NOT NULL,
+                sent_at timestamptz
+            )
+        """)
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS offer_terms text NOT NULL DEFAULT ''")
         conn.execute("""
             ALTER TABLE green_deal_pages
@@ -213,7 +221,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
     with db() as conn:
         following, muted, blocked = get_product_controls(conn, asin)
     if muted or blocked or (caption.startswith(RETURN_ALERT) and not following):
-        return
+        return False
     markup = product_keyboard(asin, price, following, muted, blocked)
     link = f'<a href="{escape(product_url, quote=True)}">رابط المنتج</a>'
     message_text = f"{escape(caption.rstrip())}\n\n{link}"
@@ -253,12 +261,13 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             result = response.json()
             if not response.ok or not result.get("ok"):
                 raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
-            return
+            return True
         except Exception as exc:
             print(f"Product photo upload failed: {type(exc).__name__}")
             raise RuntimeError("تعذر رفع صورة المنتج إلى تيليجرام") from exc
 
     send(message_text, markup, parse_mode="HTML", disable_preview=True)
+    return True
 
 
 def valid_url(value):
@@ -1145,6 +1154,23 @@ def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize
               pending_only, prioritize_alerts, round_at)).fetchone()
 
 
+def reserve_combination_alert(conn, asin, page_id, revision):
+    return conn.execute("""
+        INSERT INTO green_deal_combination_alerts AS saved (asin,page_id,pending_revision)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (asin) DO UPDATE
+        SET page_id=excluded.page_id, pending_revision=excluded.pending_revision
+        WHERE saved.sent_at IS NULL AND (
+            saved.page_id=excluded.page_id OR NOT EXISTS (
+                SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                WHERE d.asin=saved.asin AND d.page_id=saved.page_id AND d.pending_alert IS NOT NULL
+                  AND d.pending_revision=saved.pending_revision AND d.present AND p.active
+            )
+        )
+        RETURNING asin
+    """, (asin, page_id, revision)).fetchone() is not None
+
+
 def record_product_detail(conn, claim, snapshot):
     page_id, asin, product_url, price, lease, _ = claim
     with conn.transaction():
@@ -1152,7 +1178,9 @@ def record_product_detail(conn, claim, snapshot):
             SELECT d.title,d.price,d.product_url,d.image_url,d.pending_alert,d.pending_url,
                    d.pending_image_url,d.pending_revision,d.pending_new_offers,d.detail_offers,
                    COALESCE(NULLIF(p.offer_terms,''),p.title),d.detail_green_terms,d.pending_price,
-                   (p.active AND d.present)
+                   (p.active AND d.present),
+                   NOT EXISTS (SELECT 1 FROM green_deal_product_preferences pref WHERE pref.asin=d.asin AND pref.muted)
+                   AND NOT EXISTS (SELECT 1 FROM green_deal_product_blocks block WHERE block.asin=d.asin)
             FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
             WHERE d.page_id=%s AND d.asin=%s AND d.detail_lease_until=%s
             FOR UPDATE OF d
@@ -1160,7 +1188,7 @@ def record_product_detail(conn, claim, snapshot):
         if not row:
             return None
         (title, current_price, current_url, image, pending, pending_url, pending_image, revision,
-         pending_keys, previous, green_title, previous_green, pending_price, active) = row
+         pending_keys, previous, green_title, previous_green, pending_price, active, can_announce) = row
         if not active or (current_url, current_price) != (product_url, price):
             conn.execute("""
                 UPDATE green_deal_products SET detail_lease_until=NULL,detail_due_at=now()
@@ -1172,13 +1200,20 @@ def record_product_detail(conn, claim, snapshot):
         green_key = green_offer_key(green_title) if green_title else ""
         if snapshot is not None:
             snapshot = without_green_duplicate(snapshot, green_title)
-            new = new_notifiable_offers(previous, snapshot)
+            new = {
+                key for key in new_notifiable_offers(previous, snapshot)
+                if not duplicates_green_spend(snapshot[key], green_title, green)
+            }
             if previous_green is not None and green_key and green_key != previous_green:
                 if not is_quiet_offer(green_title):
                     new.add("__green__")
             pending_keys = sorted(set(pending_keys or ()) | new)
-            if new and not pending:
-                pending = f"🆕 خصم جديد\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
+            first_combination = False
+            if can_announce and has_notifiable_combination(snapshot, green_key, green_title, green):
+                first_combination = reserve_combination_alert(conn, asin, page_id, revision if pending else revision + 1)
+            if (new or first_combination) and not pending:
+                title_line = "🆕 خصم جديد" if new else "🎁 أكثر من عرض على المنتج"
+                pending = f"{title_line}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
                 pending_url, pending_image, pending_price = product_url, image, price
                 revision += 1
             conn.execute("""
@@ -1205,10 +1240,10 @@ def record_product_detail(conn, claim, snapshot):
     return revision, (body, url, pending_image or image, asin, alert_price)
 
 
-def finish_product_detail(conn, claim, revision, round_at, delivered):
+def finish_product_detail(conn, claim, revision, round_at, handled, sent):
     page_id, asin, _, _, lease, _ = claim
     with conn.transaction():
-        conn.execute("""
+        updated = conn.execute("""
             UPDATE green_deal_products
             SET detail_lease_until=NULL,detail_attempt_round=NULL,detail_attempts=0,
                 detail_round_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN NULL ELSE %s END,
@@ -1219,7 +1254,12 @@ def finish_product_detail(conn, claim, revision, round_at, delivered):
                 pending_new_offers=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_new_offers END,
                 pending_price=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_price END
             WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
-        """, (revision, round_at, *((revision, delivered) * 5), page_id, asin, lease))
+        """, (revision, round_at, *((revision, handled) * 5), page_id, asin, lease))
+        if updated.rowcount and sent:
+            conn.execute("""
+                UPDATE green_deal_combination_alerts SET sent_at=now()
+                WHERE asin=%s AND page_id=%s AND pending_revision=%s AND sent_at IS NULL
+            """, (asin, page_id, revision))
 
 
 def defer_product_retry(conn, claim, round_at, attempt, delay):
@@ -1300,14 +1340,14 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                     return
                 continue
             revision, alert = result
-            delivered = False
+            handled = sent = False
             if alert and not stop.is_set():
                 try:
-                    send_product_alert(*alert)
-                    delivered = True
+                    sent = send_product_alert(*alert)
+                    handled = True
                 except Exception as exc:
                     print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
-            finish_product_detail(conn, claim, revision, round_at, delivered)
+            finish_product_detail(conn, claim, revision, round_at, handled, sent)
             if restart_browser or page.is_closed():
                 print("Reopening product browser after a load or browser failure.")
                 return

@@ -298,6 +298,23 @@ def conditional_percentage_offer(offer):
     return category, rate, cap
 
 
+def duplicates_green_spend(offer, green_title, green):
+    if not green or "percent" not in green or offer["category"] != "checkout" or offer["rate"] is None:
+        return False
+    minimum, cap, _ = pricing_terms(green_title)
+    if minimum is None or re.search(r"\bbuy\s*\d+\b", SPEND_LIMIT.sub("", normalize_text(green_title)), re.I):
+        return False
+    other_minimum, other_cap, _ = pricing_terms(offer["label"])
+    return (other_minimum == minimum and other_cap == cap
+            and Decimal(str(offer["rate"])) == Decimal(str(green["percent"])))
+
+
+def has_notifiable_combination(offers, green_key, green_title, green):
+    distinct = [offer for offer in offers.values() if not duplicates_green_spend(offer, green_title, green)]
+    return (len(distinct) + bool(green_key) >= 2
+            and any(not is_quiet_offer(offer["label"]) for offer in distinct))
+
+
 def offer_totals(price, green_title, green, additional):
     """Only combine offers whose conditions can be modelled on one basket."""
     unit = Decimal(str(price))
@@ -338,13 +355,9 @@ def offer_totals(price, green_title, green, additional):
     categories = {}
     for offer in additional.values():
         category = offer["category"]
-        if spend_only and category == "checkout" and offer["rate"] is not None:
-            other_minimum, other_cap, _ = pricing_terms(offer["label"])
-            if (other_minimum == minimum and other_cap == cap
-                    and Decimal(str(offer["rate"])) == Decimal(str(green["percent"]))):
-                # The detail view may publish the same basket promotion with its code.
-                # Keep it visible, but do not assume two identical basket tiers stack.
-                continue
+        if duplicates_green_spend(offer, green_title, green):
+            # Keep the code visible without counting the same basket tier twice.
+            continue
         conditional = conditional_percentage_offer(offer) if not offer["stackable_estimate"] else None
         cap = None
         rate = offer["rate"]
