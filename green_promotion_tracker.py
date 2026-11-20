@@ -27,10 +27,10 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
-TOKEN = os.environ["GREEN_DEALS_TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["GREEN_DEALS_TELEGRAM_CHAT_ID"]
+TOKEN = os.getenv("GREEN_DEALS_TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("GREEN_DEALS_TELEGRAM_CHAT_ID", "")
 THREAD_ID = int(os.getenv("GREEN_DEALS_TELEGRAM_MESSAGE_THREAD_ID", "0"))
-DB_URL = os.environ["GREEN_DEALS_DATABASE_URL"]
+DB_URL = os.getenv("GREEN_DEALS_DATABASE_URL", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
 HTTP = requests.Session()
@@ -1097,6 +1097,8 @@ def prepare_browser():
 
 
 def run(continuous, prepare=False):
+    if not all((TOKEN, CHAT_ID, DB_URL)):
+        raise RuntimeError("Missing required green tracker database or Telegram settings.")
     init_db()
     stop = Event()
     worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
