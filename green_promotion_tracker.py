@@ -55,14 +55,32 @@ class DetailRound:
         self.ready = Event()
         self.listings_done = Event()
         self.started_at = None
+        self.detail_at = None
+        self.paused = Event()
+        self.outcome_lock = Lock()
+        self.rejections = 0
 
-    def start(self, round_at, listings_done=False):
-        self.started_at = round_at
+    def start(self, round_at, detail_at, listings_done=False):
+        with self.outcome_lock:
+            self.started_at = round_at
+            self.detail_at = detail_at
+            self.rejections = 0
+            self.paused.clear()
         if listings_done:
             self.listings_done.set()
         else:
             self.listings_done.clear()
         self.ready.set()
+
+    def note_outcome(self, listings_round, rejected):
+        with self.outcome_lock:
+            if listings_round != self.started_at or self.paused.is_set():
+                return
+            self.rejections = self.rejections + 1 if rejected else 0
+            if self.rejections >= 3:
+                self.paused.set()
+                print("Amazon returned 3 consecutive rejection pages. Product details paused; "
+                      "remaining products and retry counts are kept.")
 
 
 def wait_for_amazon_slot():
@@ -126,6 +144,7 @@ def init_db():
                 sent_at timestamptz
             )
         """)
+        conn.execute("ALTER TABLE green_deal_scan_cycle ADD COLUMN IF NOT EXISTS detail_cycle_at timestamptz")
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS offer_terms text NOT NULL DEFAULT ''")
         conn.execute("""
             ALTER TABLE green_deal_pages
@@ -1124,7 +1143,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (page_id,))
 
 
-def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize_alerts):
+def claim_product_detail(conn, detail_at, listings_round, listings_done, pending_only, prioritize_alerts):
     with conn.transaction():
         return conn.execute("""
             WITH next_product AS (
@@ -1150,8 +1169,8 @@ def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize
             WHERE d.page_id=candidate.page_id AND d.asin=candidate.asin
             RETURNING d.page_id,d.asin,d.product_url,d.price,d.detail_lease_until,
                       CASE WHEN d.detail_attempt_round=%s THEN d.detail_attempts ELSE 0 END
-        """, (round_at, round_at, pending_only, round_at, listings_done, round_at,
-              pending_only, prioritize_alerts, round_at)).fetchone()
+        """, (detail_at, detail_at, pending_only, listings_round, listings_done, listings_round,
+              pending_only, prioritize_alerts, detail_at)).fetchone()
 
 
 def reserve_combination_alert(conn, asin, page_id, revision):
@@ -1304,19 +1323,30 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
         while not stop.is_set():
             if not detail_round.ready.wait(1):
                 continue
-            round_at = detail_round.started_at
+            if detail_round.paused.is_set():
+                stop.wait(2)
+                continue
+            listing_round = detail_round.started_at
+            round_at = detail_round.detail_at
             listing_finished = detail_round.listings_done.is_set()
-            claim = claim_product_detail(conn, round_at, listing_finished, pending_only, sequence % 4 != 3)
+            claim = claim_product_detail(conn, round_at, listing_round, listing_finished, pending_only, sequence % 4 != 3)
             if not claim:
                 stop.wait(2)
                 continue
             sequence += 1
             _, asin, url, price, _, previous_attempts = claim
-            if stop.is_set():
+            if stop.is_set() or detail_round.paused.is_set():
                 defer_product_retry(conn, claim, round_at, previous_attempts, 0)
-                return
+                continue
             attempt = previous_attempts + 1
+            print(f"Checking product {asin}, attempt {attempt}/4.")
             snapshot, reason, delay = read_product_attempt(page, url, asin, price, attempt)
+            rejected = bool(reason and any(label in reason for label in (
+                "HTTP 429", "HTTP 503", "صفحة تحقق من أمازون", "صفحة اعتذار من أمازون"
+            )))
+            detail_round.note_outcome(listing_round, rejected)
+            if snapshot is None and attempt < 4:
+                print(f"Product {asin} deferred after attempt {attempt}/4: {reason}.")
             restart_browser = page.is_closed() or should_restart_detail_browser(reason)
             if snapshot is None and attempt < 4:
                 defer_product_retry(conn, claim, round_at, attempt, delay)
@@ -1330,8 +1360,7 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                 print(f"Product offers unavailable for {asin} after 4/4 attempts: {reason}")
             else:
                 succeeded += 1
-                if succeeded == 1:
-                    print(f"First product detail scan succeeded: {asin}, {len(snapshot)} offer(s).")
+                print(f"Product {asin} read successfully: {len(snapshot)} offer(s).")
             if finished % 25 == 0:
                 print(f"Product detail progress: {succeeded}/{finished} pages read successfully.")
             result = record_product_detail(conn, claim, snapshot)
@@ -1376,11 +1405,13 @@ def product_detail_worker(stop, browser_channel, detail_round, pending_only):
                 stop.wait(5)
 
 
-def wait_for_product_round(stop, round_at, pending_only):
+def wait_for_product_round(stop, detail_round, round_at, pending_only):
     deadline = time.monotonic() + 60 if pending_only else None
-    next_report = time.monotonic() + 60
+    next_report = time.monotonic() + 30
     with db() as conn:
         while not stop.is_set() and (deadline is None or time.monotonic() < deadline):
+            if detail_round.paused.is_set():
+                return False
             with conn.transaction():
                 unfinished, waiting = conn.execute("""
                     SELECT count(*),count(*) FILTER (
@@ -1392,11 +1423,12 @@ def wait_for_product_round(stop, round_at, pending_only):
                       AND (NOT %s OR d.pending_alert IS NOT NULL)
                 """, (round_at, round_at, pending_only)).fetchone()
             if not unfinished:
-                return
+                return True
             if time.monotonic() >= next_report:
                 print(f"Product round remaining: {unfinished}, including {waiting} waiting for a retry.")
-                next_report = time.monotonic() + 60
+                next_report = time.monotonic() + 30
             stop.wait(5)
+    return False
 
 
 def scan_promotion_pages(browser_channel):
@@ -1456,12 +1488,12 @@ def begin_continuous_round(stop):
                 SET round_at=now(),listings_done=false,rest_until=NULL
                 WHERE green_deal_scan_cycle.rest_until<=now()
             """)
-            round_at, listings_done, rest_seconds = conn.execute("""
-                SELECT round_at,listings_done,EXTRACT(EPOCH FROM rest_until-now())
+            round_at, detail_at, listings_done, rest_seconds = conn.execute("""
+                SELECT round_at,COALESCE(detail_cycle_at, round_at),listings_done,EXTRACT(EPOCH FROM rest_until-now())
                 FROM green_deal_scan_cycle WHERE singleton
             """).fetchone()
         if rest_seconds is None:
-            return round_at, listings_done
+            return round_at, detail_at, listings_done
         if rest_seconds > 0:
             stop.wait(float(rest_seconds))
     return None
@@ -1469,11 +1501,15 @@ def begin_continuous_round(stop):
 
 def scan_loop(stop, detail_round, continuous, browser_channel=None):
     while not stop.is_set():
-        cycle = begin_continuous_round(stop) if continuous else (datetime.now(timezone.utc), False)
+        if continuous:
+            cycle = begin_continuous_round(stop)
+        else:
+            now = datetime.now(timezone.utc)
+            cycle = (now, now, False)
         if cycle is None:
             return
-        round_at, listings_done = cycle
-        detail_round.start(round_at, listings_done)
+        round_at, detail_at, listings_done = cycle
+        detail_round.start(round_at, detail_at, listings_done)
         if not listings_done:
             scan_promotion_pages(browser_channel)
             if continuous:
@@ -1483,17 +1519,19 @@ def scan_loop(stop, detail_round, continuous, browser_channel=None):
                         WHERE singleton AND round_at=%s
                     """, (round_at,))
             detail_round.listings_done.set()
-        print("Promotion listings ready. Waiting for all product scans and their retries.")
-        wait_for_product_round(stop, round_at, not continuous)
+        print("Promotion listings ready. Waiting for product scans or Amazon cooldown.")
+        completed = wait_for_product_round(stop, detail_round, detail_at, not continuous)
         detail_round.ready.clear()
         if not continuous or stop.is_set():
             return
         with db() as conn:
             conn.execute("""
-                UPDATE green_deal_scan_cycle SET rest_until=now()+make_interval(secs=>%s)
+                UPDATE green_deal_scan_cycle
+                SET rest_until=now()+make_interval(secs=>%s), detail_cycle_at=%s
                 WHERE singleton AND round_at=%s
-            """, (WAIT_SECONDS, round_at))
-        print(f"All product scans completed or exhausted their retries. Resting for {WAIT_SECONDS}s.")
+            """, (WAIT_SECONDS, None if completed else detail_at, round_at))
+        summary = "Product scan completed." if completed else "Product scan paused; the next round will resume remaining products."
+        print(f"{summary} Resting for {WAIT_SECONDS}s.")
 
 
 def prepare_browser():
