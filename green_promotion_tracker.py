@@ -803,6 +803,33 @@ class PromotionPageUnavailable(RuntimeError):
     """Amazon did not provide a usable promotion listing."""
 
 
+EMPTY_PROMOTION_SNAPSHOT = r"""
+expected => {
+    const promotion = document.querySelector('#queryModel_promotionId');
+    const list = document.querySelector('#productInfoList');
+    const empty = document.querySelector('#errorMessageWithoutSelection');
+    const more = document.querySelector('#showMoreBtnContainer');
+    const visible = node => node && node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden';
+    return promotion?.value === expected && list && visible(empty) && !visible(more)
+        && ![...list.querySelectorAll('[data-asin]')].some(card => /^[A-Z0-9]{10}$/.test(card.getAttribute('data-asin') || ''));
+}
+"""
+
+
+def confirmed_empty_promotion(page, url):
+    promotion = re.search(r"/promotion/psp/([A-Z0-9]+)(?:/|$)", urlparse(url).path, re.I)
+    if not promotion:
+        return False
+    try:
+        handle = page.wait_for_function(
+            EMPTY_PROMOTION_SNAPSHOT, arg=promotion[1].upper(), polling=200, timeout=4000,
+        )
+        handle.dispose()
+        return True
+    except PlaywrightTimeout:
+        return False
+
+
 def collect_products(url, on_batch, on_offer_title, browser_channel=None):
     products = {}
     with sync_playwright() as p:
@@ -881,7 +908,10 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
             if not products:
                 if snapshots:
                     raise PromotionPageUnavailable(f"أمازون عرض {len(snapshots)} بطاقة بدون أسعار قابلة للقراءة")
-                raise PromotionPageUnavailable("صفحة العرض فتحت بدون بطاقات منتجات")
+                if confirmed_empty_promotion(page, url):
+                    print("Amazon confirmed an empty promotion. Keeping this page active for the next scan.")
+                else:
+                    raise PromotionPageUnavailable("صفحة العرض فتحت بدون بطاقات منتجات ولم تؤكد أمازون أنها فارغة")
         finally:
             browser.close()
     return products
@@ -1079,10 +1109,9 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 save_product(asin, *product)
 
     collect_products(url, save_batch, save_offer_title, browser_channel)
-    if not found:
-        raise RuntimeError("No products could be read. Treating this scan as incomplete.")
+    # An empty result only reaches here after Amazon rendered its empty grid state.
     with conn.transaction():
-        conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s)", (page_id, list(found)))
+        conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s::text[])", (page_id, list(found)))
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (page_id,))
 
 
