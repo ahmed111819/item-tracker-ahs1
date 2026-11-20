@@ -323,23 +323,14 @@ def format_offer_alert(base, price, green_title, green, offers, new_keys=(), *, 
     count, original, subtotal, mission, complete, attempted = offer_totals(price, green_title, green, additional)
     basket = f" لـ{count} قطع" if count > 1 else ""
     final = max(Decimal(0), subtotal - mission)
-    saving = max(Decimal(0), original - final)
-    percent = cents(saving * 100 / original) if original else Decimal(0)
-    saving_label = "التوفير التقديري" if complete else "التوفير التقديري المحسوب"
     calculation = []
-    if count > 1:
-        calculation.append(f"🛒 إجمالي {count} قبل العروض: {original:.2f} ريال")
-    if attempted:
-        label = "السعر التقديري بعد العروض" if complete else "السعر التقديري بعد العروض القابلة للحساب"
-        calculation.append(f"🎁 {label}{basket}: {subtotal:.2f} ريال")
-    elif not complete:
-        calculation.append("تعذّر حساب بعض شروط العروض. تقدير المهام مبني على السعر الحالي.")
-    calculation.extend([
-        f"🎯 السعر التقديري بعد خصم المهام{basket}: {final:.2f} ريال",
-        f"خصم المهام: {mission:.2f} ريال (40% من السعر المعروض قبل العروض، بحد 40 ريال للسلة)",
-        f"💸 {saving_label}: {saving:.2f} ريال ({percent:.2f}%)",
-        "التقدير يفترض قبول الدمج وإكمال سلة المهام المؤهلة إلى 100 ريال.",
-    ])
+    if attempted and count > 1:
+        saving = max(Decimal(0), original - subtotal)
+        calculation.append(f"🛒 {count} قطع: قبل العرض {original:.2f}، بعده {subtotal:.2f}، التوفير {saving:.2f} ريال")
+    elif attempted and subtotal != original:
+        label = "بعد العروض" if complete else "بعد العروض المحسوبة"
+        calculation.append(f"🎁 السعر التقديري {label}: {subtotal:.2f} ريال")
+    calculation.append(f"🎯 السعر التقديري بعد خصم المهام{basket}: {final:.2f} ريال")
     footer = "\n".join(calculation)
     rows = []
     if green_title:
@@ -362,6 +353,4 @@ def format_offer_alert(base, price, green_title, green, offers, new_keys=(), *, 
         if len(visible) < len(rows):
             visible.append(f"• {len(rows) - len(visible)} عروض إضافية لم تتسع لها الرسالة")
         return text + "\n".join(visible) + "\n\n" + footer
-    if cached:
-        return f"{base}\n\nتعذّر التحقق من العروض الإضافية في آخر محاولة.\n\n{footer}"
     return f"{base}\n\n{footer}"

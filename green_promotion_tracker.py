@@ -15,7 +15,7 @@ import sys
 import time
 from html import escape
 from io import BytesIO
-from threading import Event, Thread, local
+from threading import Event, Lock, Thread, local
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -40,12 +40,47 @@ THREAD_ID = int(os.getenv("GREEN_DEALS_TELEGRAM_MESSAGE_THREAD_ID", "0"))
 DB_URL = os.getenv("GREEN_DEALS_DATABASE_URL", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
-DETAIL_REFRESH_SECONDS = 900
+AMAZON_PAGE_GAP = 2
+AMAZON_REJECTION_GAP = 8
 DETAIL_WORKERS = 2
 HTTP = requests.Session()
-SCAN_REQUESTED = Event()
+AMAZON_REQUEST_LOCK = Lock()
+NEXT_AMAZON_REQUEST = 0.0
 RETURN_ALERT = "↩️ عاد المنتج للظهور"
 TELEGRAM = local()
+
+
+class DetailRound:
+    def __init__(self):
+        self.ready = Event()
+        self.listings_done = Event()
+        self.started_at = None
+
+    def start(self, round_at, listings_done=False):
+        self.started_at = round_at
+        if listings_done:
+            self.listings_done.set()
+        else:
+            self.listings_done.clear()
+        self.ready.set()
+
+
+def wait_for_amazon_slot():
+    global NEXT_AMAZON_REQUEST
+    while True:
+        with AMAZON_REQUEST_LOCK:
+            now = time.monotonic()
+            delay = NEXT_AMAZON_REQUEST - now
+            if delay <= 0:
+                NEXT_AMAZON_REQUEST = now + AMAZON_PAGE_GAP
+                return
+        time.sleep(delay)
+
+
+def defer_amazon_requests():
+    global NEXT_AMAZON_REQUEST
+    with AMAZON_REQUEST_LOCK:
+        NEXT_AMAZON_REQUEST = max(NEXT_AMAZON_REQUEST, time.monotonic() + AMAZON_REJECTION_GAP)
 
 
 def db():
@@ -60,6 +95,11 @@ def init_db():
           active boolean NOT NULL DEFAULT true, title text NOT NULL DEFAULT '', expires_on date,
           added_at timestamptz NOT NULL DEFAULT now(),
           last_checked_at timestamptz, last_error text, scan_started_at timestamptz
+        );
+        CREATE TABLE IF NOT EXISTS green_deal_scan_cycle (
+          singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+          round_at timestamptz NOT NULL, listings_done boolean NOT NULL DEFAULT false,
+          rest_until timestamptz
         );
         CREATE TABLE IF NOT EXISTS green_deal_product_blocks (asin text PRIMARY KEY, blocked_price numeric NOT NULL, resume_price numeric NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS green_deal_product_preferences (asin text PRIMARY KEY, favorite boolean NOT NULL DEFAULT false, following boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now());
@@ -94,7 +134,8 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS pending_new_offers jsonb,
                 ADD COLUMN IF NOT EXISTS detail_green_terms text,
                 ADD COLUMN IF NOT EXISTS pending_price numeric,
-                ADD COLUMN IF NOT EXISTS detail_failure_count integer NOT NULL DEFAULT 0
+                ADD COLUMN IF NOT EXISTS detail_failure_count integer NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS detail_round_at timestamptz
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS green_deal_detail_due_idx
@@ -238,7 +279,6 @@ def add_page(value):
             "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
             (url, title),
         )
-    SCAN_REQUESTED.set()
     send(f"تمت إضافة صفحة العرض للمتابعة ✅\n{title or 'سيُقرأ اسم العرض في أول فحص'}\n{url}")
 
 
@@ -481,8 +521,6 @@ def menu_callback(query, message, data):
                     conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
                 else:
                     conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (action == "enable", page_id))
-            if action == "enable":
-                SCAN_REQUESTED.set()
         answer_callback(answer)
         if action == "remove":
             show_pages("pages", page, message)
@@ -595,8 +633,6 @@ def callback(update):
     with db() as conn:
         if action in {"pause", "resume"}:
             conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (action == "resume", page_id))
-            if action == "resume":
-                SCAN_REQUESTED.set()
         elif action == "delete":
             conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
     answer_callback({"callback_query_id": query["id"], "text": "تم"})
@@ -771,13 +807,17 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
         browser = p.chromium.launch(headless=True, channel=browser_channel)
         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
         try:
+            wait_for_amazon_slot()
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
             title = page.title()
             status = response.status if response else None
             print(f"Opened promotion page: status={status or 'unknown'} title={title!r}")
             if not response or not response.ok:
+                if status in {429, 503}:
+                    defer_amazon_requests()
                 raise PromotionPageUnavailable(f"أمازون ردّ بحالة HTTP {status or 'unknown'}")
             if re.fullmatch(r"(?:نعتذر|sorry|robot check)[!. ]*", title.strip(), re.I):
+                defer_amazon_requests()
                 raise PromotionPageUnavailable("أمازون عرض صفحة اعتذار أو تحقق")
             cards = page.locator("[data-asin]")
             try:
@@ -816,6 +856,7 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
                         print("No enabled 'show more' control; reached the end of the offer.")
                         break
                     previous = list({card["asin"] for card in snapshots})
+                    wait_for_amazon_slot()
                     more.click(timeout=5000)
                     page.wait_for_function(
                         """previous => {
@@ -996,7 +1037,8 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 conn.execute("""
                     UPDATE green_deal_products
                     SET pending_alert=%s,pending_url=%s,pending_image_url=%s,
-                        pending_revision=pending_revision + 1,pending_new_offers=NULL,pending_price=%s,detail_due_at=now()
+                        pending_revision=pending_revision + 1,pending_new_offers=NULL,pending_price=%s,
+                        detail_round_at=NULL,detail_due_at=now()
                     WHERE page_id=%s AND asin=%s
                 """, (event, product_url, image_url, price, page_id, asin))
 
@@ -1042,26 +1084,31 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (page_id,))
 
 
-def claim_product_detail(conn, pending_only, prioritize_alerts):
+def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize_alerts):
     with conn.transaction():
         return conn.execute("""
             WITH next_product AS (
                 SELECT d.page_id,d.asin
                 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
                 WHERE p.active AND d.present AND d.price>0
-                  AND d.detail_due_at<=now()
+                  AND d.detail_round_at IS DISTINCT FROM %s
+                  AND (%s OR EXISTS (
+                      SELECT 1 FROM green_deal_scan_cycle
+                      WHERE singleton AND round_at=%s AND rest_until IS NULL
+                  ))
+                  AND (%s OR d.last_seen_at>=%s)
                   AND (d.detail_lease_until IS NULL OR d.detail_lease_until<=now())
                   AND (NOT %s OR d.pending_alert IS NOT NULL)
                 ORDER BY (%s AND d.pending_alert IS NOT NULL) DESC,
-                         d.detail_due_at,d.page_id,d.asin
+                         d.detail_failure_count,d.detail_due_at,d.page_id,d.asin
                 LIMIT 1 FOR UPDATE OF d SKIP LOCKED
             )
             UPDATE green_deal_products d
-            SET detail_lease_until=now()+interval '3 minutes'
+            SET detail_lease_until=now()+interval '5 minutes'
             FROM next_product candidate
             WHERE d.page_id=candidate.page_id AND d.asin=candidate.asin
             RETURNING d.page_id,d.asin,d.product_url,d.price,d.detail_lease_until
-        """, (pending_only, prioritize_alerts)).fetchone()
+        """, (round_at, pending_only, round_at, listings_done, round_at, pending_only, prioritize_alerts)).fetchone()
 
 
 def record_product_detail(conn, claim, snapshot):
@@ -1071,7 +1118,7 @@ def record_product_detail(conn, claim, snapshot):
             SELECT d.title,d.price,d.product_url,d.image_url,d.pending_alert,d.pending_url,
                    d.pending_image_url,d.pending_revision,d.pending_new_offers,d.detail_offers,
                    COALESCE(NULLIF(p.offer_terms,''),p.title),d.detail_green_terms,d.pending_price,
-                   (p.active AND d.present),d.detail_failure_count
+                   (p.active AND d.present)
             FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
             WHERE d.page_id=%s AND d.asin=%s AND d.detail_lease_until=%s
             FOR UPDATE OF d
@@ -1079,7 +1126,7 @@ def record_product_detail(conn, claim, snapshot):
         if not row:
             return None
         (title, current_price, current_url, image, pending, pending_url, pending_image, revision,
-         pending_keys, previous, green_title, previous_green, pending_price, active, failures) = row
+         pending_keys, previous, green_title, previous_green, pending_price, active) = row
         if not active or (current_url, current_price) != (product_url, price):
             conn.execute("""
                 UPDATE green_deal_products SET detail_lease_until=NULL,detail_due_at=now()
@@ -1089,7 +1136,6 @@ def record_product_detail(conn, claim, snapshot):
 
         green = promotion_details(green_title) if not BANK_TERMS.search(green_title) else None
         green_key = green_offer_key(green_title) if green_title else ""
-        next_seconds = DETAIL_REFRESH_SECONDS if snapshot is not None else min(3600, 300 * 2 ** min(failures, 4))
         if snapshot is not None:
             snapshot = without_green_duplicate(snapshot, green_title)
             new = new_notifiable_offers(previous, snapshot)
@@ -1115,54 +1161,67 @@ def record_product_detail(conn, claim, snapshot):
                 WHERE page_id=%s AND asin=%s
             """, (page_id, asin))
     if not pending:
-        return revision, next_seconds, None
+        return revision, None
     alert_price = pending_price if pending_price is not None else price
     body = format_offer_alert(
         pending, alert_price, green_title, green, snapshot if snapshot is not None else previous or {},
         pending_keys or (), cached=snapshot is None,
     )
     url = amazon_product_url(pending_url or product_url, asin)
-    return revision, next_seconds, (body, url, pending_image or image, asin, alert_price)
+    return revision, (body, url, pending_image or image, asin, alert_price)
 
 
-def finish_product_detail(conn, claim, revision, next_seconds, delivered):
+def finish_product_detail(conn, claim, revision, round_at, delivered):
     page_id, asin, _, _, lease = claim
     with conn.transaction():
         conn.execute("""
             UPDATE green_deal_products
             SET detail_lease_until=NULL,
-                detail_due_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN now()
-                                   ELSE now()+make_interval(secs=>%s) END,
+                detail_round_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN NULL ELSE %s END,
+                detail_due_at=now(),
                 pending_alert=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_alert END,
                 pending_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_url END,
                 pending_image_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_image_url END,
                 pending_new_offers=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_new_offers END,
                 pending_price=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_price END
             WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
-        """, (revision, next_seconds, *((revision, delivered) * 5), page_id, asin, lease))
+        """, (revision, round_at, *((revision, delivered) * 5), page_id, asin, lease))
 
 
 def read_product_snapshot(stop, page, url, asin, price):
     reasons = []
     for attempt in range(1, 5):
         target = url if attempt == 1 else canonical_product_url(url, asin)
+        if stop.is_set():
+            return None
+        wait_for_amazon_slot()
         try:
             return read_detail_offers(page, target, asin, price)
         except (PlaywrightError, RuntimeError, ValueError) as exc:
             reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
             reasons.append(reason)
-            if attempt == 4 or page.is_closed() or stop.wait(2 ** (attempt - 1)):
+            rejected = isinstance(exc, ProductPageUnavailable) and any(
+                label in reason for label in ("HTTP 429", "HTTP 503", "صفحة اعتذار أو تحقق")
+            )
+            if rejected:
+                defer_amazon_requests()
+            delay = (5 if rejected else 1) * 2 ** (attempt - 1)
+            if attempt == 4 or page.is_closed() or stop.wait(delay):
                 print(f"Product offers unavailable for {asin} after {attempt}/4 attempts: "
                       + " | ".join(dict.fromkeys(reasons)))
                 return None
 
 
-def detail_worker_loop(stop, page, pending_only):
+def detail_worker_loop(stop, page, detail_round, pending_only):
     sequence = 0
     succeeded = 0
     with db() as conn:
         while not stop.is_set():
-            claim = claim_product_detail(conn, pending_only, sequence % 4 != 3)
+            if not detail_round.ready.wait(1):
+                continue
+            round_at = detail_round.started_at
+            listing_finished = detail_round.listings_done.is_set()
+            claim = claim_product_detail(conn, round_at, listing_finished, pending_only, sequence % 4 != 3)
             if not claim:
                 stop.wait(3)
                 continue
@@ -1178,7 +1237,7 @@ def detail_worker_loop(stop, page, pending_only):
             result = record_product_detail(conn, claim, snapshot)
             if result is None:
                 continue
-            revision, next_seconds, alert = result
+            revision, alert = result
             delivered = False
             if alert and not stop.is_set():
                 try:
@@ -1186,14 +1245,14 @@ def detail_worker_loop(stop, page, pending_only):
                     delivered = True
                 except Exception as exc:
                     print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
-                    next_seconds = 45
-            finish_product_detail(conn, claim, revision, next_seconds, delivered)
+            finish_product_detail(conn, claim, revision, round_at, delivered)
             if page.is_closed():
                 return
-            stop.wait(1)
+            if stop.is_set():
+                return
 
 
-def product_detail_worker(stop, browser_channel, pending_only):
+def product_detail_worker(stop, browser_channel, detail_round, pending_only):
     with requests.Session() as session:
         TELEGRAM.session = session
         while not stop.is_set():
@@ -1206,82 +1265,126 @@ def product_detail_worker(stop, browser_channel, pending_only):
                     ))
                     page = context.new_page()
                     print("Amazon product offer worker started.")
-                    detail_worker_loop(stop, page, pending_only)
+                    detail_worker_loop(stop, page, detail_round, pending_only)
             except Exception as exc:
                 # Do not log request URLs, as exceptions can contain credentials.
                 print(f"Amazon product offer worker restarting: {type(exc).__name__}")
                 stop.wait(5)
 
 
-def wait_for_pending_alerts(stop):
-    deadline = time.monotonic() + 60
+def wait_for_product_round(stop, round_at, pending_only):
+    deadline = time.monotonic() + 60 if pending_only else None
     with db() as conn:
-        while not stop.is_set() and time.monotonic() < deadline:
+        while not stop.is_set() and (deadline is None or time.monotonic() < deadline):
             with conn.transaction():
-                ready = conn.execute("""
+                unfinished = conn.execute("""
                     SELECT EXISTS(
                         SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
-                        WHERE p.active AND d.present AND d.pending_alert IS NOT NULL AND d.detail_due_at<=now()
+                        WHERE p.active AND d.present AND d.price>0
+                          AND d.detail_round_at IS DISTINCT FROM %s
+                          AND (NOT %s OR d.pending_alert IS NOT NULL)
                     )
-                """).fetchone()[0]
-            if not ready:
+                """, (round_at, pending_only)).fetchone()[0]
+            if not unfinished:
                 return
             stop.wait(2)
 
 
-def scan_loop(continuous, browser_channel=None):
-    while True:
-        SCAN_REQUESTED.clear()
-        round_started = time.monotonic()
-        today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
-        with db() as conn:
-            conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
-            pages = conn.execute("""
-                SELECT id,url FROM green_deal_pages WHERE active=true
-                  AND (scan_retry_after IS NULL OR scan_retry_after<=now())
-                ORDER BY scan_failures,id
-            """).fetchall()
-        for page_id, url in pages:
-            for attempt in range(1, 5):
-                try:
-                    with db() as conn:
-                        updated = conn.execute(
-                            "UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s AND active",
-                            (page_id,),
-                        )
-                        if not updated.rowcount:
-                            break
-                    print(f"Starting page {page_id}, attempt {attempt}/4")
-                    scan_page(page_id, url, browser_channel)
-                    break
-                except ScanStopped:
-                    with db() as conn:
-                        conn.execute("UPDATE green_deal_pages SET scan_started_at=NULL WHERE id=%s", (page_id,))
-                    break
-                except Exception as exc:
-                    detail = f"{type(exc).__name__}: {str(exc).replace(TOKEN, '[redacted]')[:300]}"
-                    print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
-                    with db() as conn:
-                        conn.execute("UPDATE green_deal_pages SET last_error=%s WHERE id=%s", (detail, page_id))
-                    if attempt < 4:
-                        time.sleep((10, 20, 40)[attempt - 1])
-            else:
+def scan_promotion_pages(browser_channel):
+    today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
+    with db() as conn:
+        conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
+        pages = conn.execute("""
+            SELECT id,url FROM green_deal_pages WHERE active=true
+              AND (scan_retry_after IS NULL OR scan_retry_after<=now())
+            ORDER BY scan_failures,id
+        """).fetchall()
+    for page_id, url in pages:
+        for attempt in range(1, 5):
+            try:
                 with db() as conn:
-                    row = conn.execute("""
-                        UPDATE green_deal_pages
-                        SET last_checked_at=now(),scan_started_at=NULL,
-                            scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
-                            scan_failures=scan_failures+1
-                        WHERE id=%s AND active
-                        RETURNING LEAST(30,5*scan_failures)
-                    """, (page_id,)).fetchone()
-                    if row:
-                        print(f"Page {page_id} will retry in {row[0]} minutes; saved availability was preserved.")
-        if not continuous:
-            break
-        print(f"Scan round finished in {time.monotonic() - round_started:.1f}s. "
-              f"Waiting up to {WAIT_SECONDS}s before the next round.")
-        SCAN_REQUESTED.wait(WAIT_SECONDS)
+                    updated = conn.execute(
+                        "UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s AND active",
+                        (page_id,),
+                    )
+                    if not updated.rowcount:
+                        break
+                print(f"Starting page {page_id}, attempt {attempt}/4")
+                scan_page(page_id, url, browser_channel)
+                break
+            except ScanStopped:
+                with db() as conn:
+                    conn.execute("UPDATE green_deal_pages SET scan_started_at=NULL WHERE id=%s", (page_id,))
+                break
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {str(exc).replace(TOKEN, '[redacted]')[:300]}"
+                print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
+                with db() as conn:
+                    conn.execute("UPDATE green_deal_pages SET last_error=%s WHERE id=%s", (detail, page_id))
+                if attempt < 4:
+                    time.sleep((10, 20, 40)[attempt - 1])
+        else:
+            with db() as conn:
+                row = conn.execute("""
+                    UPDATE green_deal_pages
+                    SET last_checked_at=now(),scan_started_at=NULL,
+                        scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
+                        scan_failures=scan_failures+1
+                    WHERE id=%s AND active
+                    RETURNING LEAST(30,5*scan_failures)
+                """, (page_id,)).fetchone()
+                if row:
+                    print(f"Page {page_id} will retry in {row[0]} minutes; saved availability was preserved.")
+
+
+def begin_continuous_round(stop):
+    while not stop.is_set():
+        with db() as conn:
+            conn.execute("""
+                INSERT INTO green_deal_scan_cycle(singleton,round_at)
+                VALUES (true,now())
+                ON CONFLICT (singleton) DO UPDATE
+                SET round_at=now(),listings_done=false,rest_until=NULL
+                WHERE green_deal_scan_cycle.rest_until<=now()
+            """)
+            round_at, listings_done, rest_seconds = conn.execute("""
+                SELECT round_at,listings_done,EXTRACT(EPOCH FROM rest_until-now())
+                FROM green_deal_scan_cycle WHERE singleton
+            """).fetchone()
+        if rest_seconds is None:
+            return round_at, listings_done
+        if rest_seconds > 0:
+            stop.wait(float(rest_seconds))
+    return None
+
+
+def scan_loop(stop, detail_round, continuous, browser_channel=None):
+    while not stop.is_set():
+        cycle = begin_continuous_round(stop) if continuous else (datetime.now(timezone.utc), False)
+        if cycle is None:
+            return
+        round_at, listings_done = cycle
+        detail_round.start(round_at, listings_done)
+        if not listings_done:
+            scan_promotion_pages(browser_channel)
+            if continuous:
+                with db() as conn:
+                    conn.execute("""
+                        UPDATE green_deal_scan_cycle SET listings_done=true
+                        WHERE singleton AND round_at=%s
+                    """, (round_at,))
+            detail_round.listings_done.set()
+        print("Promotion listings ready. Waiting for all product scans and their retries.")
+        wait_for_product_round(stop, round_at, not continuous)
+        detail_round.ready.clear()
+        if not continuous or stop.is_set():
+            return
+        with db() as conn:
+            conn.execute("""
+                UPDATE green_deal_scan_cycle SET rest_until=now()+make_interval(secs=>%s)
+                WHERE singleton AND round_at=%s
+            """, (WAIT_SECONDS, round_at))
+        print(f"All product scans completed or exhausted their retries. Resting for {WAIT_SECONDS}s.")
 
 
 def prepare_browser():
@@ -1311,20 +1414,19 @@ def run(continuous, prepare=False):
     init_db()
     stop = Event()
     detail_threads = []
+    detail_round = DetailRound()
     worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
     worker.start()
     try:
         browser_channel = prepare_browser() if prepare else None
         for index in range(DETAIL_WORKERS):
             detail = Thread(
-                target=product_detail_worker, args=(stop, browser_channel, not continuous),
+                target=product_detail_worker, args=(stop, browser_channel, detail_round, not continuous),
                 name=f"product-offers-{index + 1}", daemon=True,
             )
             detail.start()
             detail_threads.append(detail)
-        scan_loop(continuous, browser_channel)
-        if not continuous:
-            wait_for_pending_alerts(stop)
+        scan_loop(stop, detail_round, continuous, browser_channel)
     finally:
         stop.set()
         for detail in detail_threads:
