@@ -43,6 +43,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
 AMAZON_PAGE_GAP = 2
 AMAZON_REJECTION_GAP = 8
+AMAZON_REJECTION_STREAK_GAP = 12
 DETAIL_WORKERS = 2
 HTTP = requests.Session()
 AMAZON_REQUEST_LOCK = Lock()
@@ -59,7 +60,6 @@ class DetailRound:
         self.listings_done = Event()
         self.started_at = None
         self.detail_at = None
-        self.paused = Event()
         self.outcome_lock = Lock()
         self.rejections = 0
 
@@ -68,7 +68,6 @@ class DetailRound:
             self.started_at = round_at
             self.detail_at = detail_at
             self.rejections = 0
-            self.paused.clear()
         if listings_done:
             self.listings_done.set()
         else:
@@ -77,13 +76,14 @@ class DetailRound:
 
     def note_outcome(self, listings_round, rejected):
         with self.outcome_lock:
-            if listings_round != self.started_at or self.paused.is_set():
+            if listings_round != self.started_at:
                 return
             self.rejections = self.rejections + 1 if rejected else 0
-            if self.rejections >= 3:
-                self.paused.set()
-                print("Amazon returned 3 consecutive rejection pages. Product details paused; "
-                      "remaining products and retry counts are kept.")
+            if self.rejections == 3:
+                self.rejections = 0
+                defer_amazon_requests(AMAZON_REJECTION_STREAK_GAP)
+                print(f"Amazon rejected 3 consecutive detail requests. "
+                      f"Spacing the next request by {AMAZON_REJECTION_STREAK_GAP}s; continuing this round.")
 
 
 def wait_for_amazon_slot():
@@ -98,10 +98,10 @@ def wait_for_amazon_slot():
         time.sleep(delay)
 
 
-def defer_amazon_requests():
+def defer_amazon_requests(delay=AMAZON_REJECTION_GAP):
     global NEXT_AMAZON_REQUEST
     with AMAZON_REQUEST_LOCK:
-        NEXT_AMAZON_REQUEST = max(NEXT_AMAZON_REQUEST, time.monotonic() + AMAZON_REJECTION_GAP)
+        NEXT_AMAZON_REQUEST = max(NEXT_AMAZON_REQUEST, time.monotonic() + delay)
 
 
 def capture_amazon_challenge(page):
@@ -1343,9 +1343,7 @@ def read_product_attempt(page, url, asin, price, attempt):
         site_rejection = any(label in reason for label in ("HTTP 429", "HTTP 503", "صفحة تحقق من أمازون"))
         if site_rejection:
             defer_amazon_requests()
-        # Keep product-level apology pages from pausing requests for every other product.
-        apology = reason == "صفحة اعتذار من أمازون"
-        delay = (15 if site_rejection or apology else 5) * 2 ** (attempt - 1)
+        delay = (15 if site_rejection else 5) * 2 ** (attempt - 1)
         return None, reason, delay
 
 
@@ -1364,9 +1362,6 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
         while not stop.is_set():
             if not detail_round.ready.wait(1):
                 continue
-            if detail_round.paused.is_set():
-                stop.wait(2)
-                continue
             listing_round = detail_round.started_at
             round_at = detail_round.detail_at
             listing_finished = detail_round.listings_done.is_set()
@@ -1376,7 +1371,7 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                 continue
             sequence += 1
             _, asin, url, price, _, previous_attempts = claim
-            if stop.is_set() or detail_round.paused.is_set():
+            if stop.is_set():
                 defer_product_retry(conn, claim, round_at, previous_attempts, 0)
                 continue
             attempt = previous_attempts + 1
@@ -1446,13 +1441,11 @@ def product_detail_worker(stop, browser_channel, detail_round, pending_only):
                 stop.wait(5)
 
 
-def wait_for_product_round(stop, detail_round, round_at, pending_only):
+def wait_for_product_round(stop, round_at, pending_only):
     deadline = time.monotonic() + 60 if pending_only else None
     next_report = time.monotonic() + 30
     with db() as conn:
         while not stop.is_set() and (deadline is None or time.monotonic() < deadline):
-            if detail_round.paused.is_set():
-                return False
             with conn.transaction():
                 unfinished, waiting = conn.execute("""
                     SELECT count(*),count(*) FILTER (
@@ -1560,19 +1553,18 @@ def scan_loop(stop, detail_round, continuous, browser_channel=None):
                         WHERE singleton AND round_at=%s
                     """, (round_at,))
             detail_round.listings_done.set()
-        print("Promotion listings ready. Waiting for product scans or Amazon cooldown.")
-        completed = wait_for_product_round(stop, detail_round, detail_at, not continuous)
+        print("Promotion listings ready. Waiting for all product scans and their retries.")
+        completed = wait_for_product_round(stop, detail_at, not continuous)
         detail_round.ready.clear()
-        if not continuous or stop.is_set():
+        if not continuous or not completed or stop.is_set():
             return
         with db() as conn:
             conn.execute("""
                 UPDATE green_deal_scan_cycle
-                SET rest_until=now()+make_interval(secs=>%s), detail_cycle_at=%s
+                SET rest_until=now()+make_interval(secs=>%s), detail_cycle_at=NULL
                 WHERE singleton AND round_at=%s
-            """, (WAIT_SECONDS, None if completed else detail_at, round_at))
-        summary = "Product scan completed." if completed else "Product scan paused; the next round will resume remaining products."
-        print(f"{summary} Resting for {WAIT_SECONDS}s.")
+            """, (WAIT_SECONDS, round_at))
+        print(f"Product scan completed. Resting for {WAIT_SECONDS}s.")
 
 
 def prepare_browser():
