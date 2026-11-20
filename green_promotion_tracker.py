@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from hashlib import sha256
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -31,7 +32,8 @@ from psycopg.types.json import Jsonb
 
 from green_product_offers import (
     AMAZON_VERIFICATION_REASONS, BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
-    duplicates_green_spend, format_offer_alert, green_offer_key, has_notifiable_combination, is_quiet_offer,
+    duplicates_green_spend, format_offer_alert, free_bundle_signature, green_offer_key,
+    has_notifiable_combination, is_quiet_offer,
     new_notifiable_offers, read_detail_offers, without_green_duplicate,
 )
 
@@ -177,6 +179,16 @@ def init_db():
                 page_id bigint NOT NULL,
                 pending_revision bigint NOT NULL,
                 sent_at timestamptz
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS green_deal_offer_deliveries (
+                asin text NOT NULL,
+                offer_key text NOT NULL,
+                page_id bigint NOT NULL,
+                pending_revision bigint NOT NULL,
+                sent_at timestamptz,
+                PRIMARY KEY (asin, offer_key)
             )
         """)
         conn.execute("ALTER TABLE green_deal_scan_cycle ADD COLUMN IF NOT EXISTS detail_cycle_at timestamptz")
@@ -1041,6 +1053,10 @@ def scan_page(page_id, url, browser_channel=None):
         scan_page_with_connection(conn, page_id, url, browser_channel)
 
 
+def is_notifiable_price_drop(previous, current):
+    return previous is not None and previous > 0 and Decimal(str(current)) < Decimal(str(previous)) * Decimal("0.95")
+
+
 def scan_page_with_connection(conn, page_id, url, browser_channel):
     found = {}
     with conn.transaction():
@@ -1110,7 +1126,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
             elif not old[1]:
                 if following:
                     event = f"{RETURN_ALERT}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
-            elif old[0] is not None and price < float(old[0]):
+            elif is_notifiable_price_drop(old[0], price):
                 event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
@@ -1227,6 +1243,56 @@ def reserve_combination_alert(conn, asin, page_id, revision):
     """, (asin, page_id, revision)).fetchone() is not None
 
 
+def offer_delivery_keys(offers, green_title, green, green_key):
+    keys = {}
+    if green_key and not is_quiet_offer(green_title):
+        keys["__green__"] = offer_delivery_key(green_title, green_key)
+    for key, offer in offers.items():
+        label = offer["label"]
+        if not is_quiet_offer(label) and not duplicates_green_spend(offer, green_title, green):
+            normalized = green_offer_key(label)
+            identity = normalized if key.startswith("terms:") and normalized else key
+            keys[key] = offer_delivery_key(label, identity)
+    return keys
+
+
+def offer_delivery_key(label, identity):
+    bundle = free_bundle_signature(label)
+    if bundle:
+        identity = f"bundle:{bundle[0]}:{bundle[1]}"
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
+def available_offer_deliveries(conn, asin, page_id, revision, identities):
+    # Serialize reservations for the same ASIN across all tracked promotion pages.
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (f"green-deals:offers:{asin}",))
+    unavailable = conn.execute("""
+        SELECT saved.offer_key
+        FROM green_deal_offer_deliveries saved
+        WHERE saved.asin=%s AND saved.offer_key=ANY(%s::text[]) AND (
+            saved.sent_at IS NOT NULL OR (
+                (saved.page_id,saved.pending_revision)<>(%s,%s) AND EXISTS (
+                    SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                    WHERE d.asin=saved.asin AND d.page_id=saved.page_id
+                      AND d.pending_revision=saved.pending_revision AND d.pending_alert IS NOT NULL
+                      AND d.present AND p.active
+                )
+            )
+        )
+    """, (asin, sorted(identities), page_id, revision)).fetchall()
+    return identities - {row[0] for row in unavailable}
+
+
+def reserve_offer_deliveries(conn, asin, page_id, revision, identities):
+    conn.execute("""
+        INSERT INTO green_deal_offer_deliveries AS saved (asin,offer_key,page_id,pending_revision)
+        SELECT %s,key,%s,%s FROM unnest(%s::text[]) AS keys(key)
+        ON CONFLICT (asin,offer_key) DO UPDATE
+        SET page_id=excluded.page_id,pending_revision=excluded.pending_revision
+        WHERE saved.sent_at IS NULL
+    """, (asin, page_id, revision, sorted(identities)))
+
+
 def record_product_detail(conn, claim, snapshot):
     page_id, asin, product_url, price, lease, _ = claim
     with conn.transaction():
@@ -1254,42 +1320,68 @@ def record_product_detail(conn, claim, snapshot):
 
         green = promotion_details(green_title) if not BANK_TERMS.search(green_title) else None
         green_key = green_offer_key(green_title) if green_title else ""
+        offers = without_green_duplicate(snapshot if snapshot is not None else previous or {}, green_title)
+        keys = offer_delivery_keys(offers, green_title, green, green_key)
+        new = set()
         if snapshot is not None:
-            snapshot = without_green_duplicate(snapshot, green_title)
-            new = {
-                key for key in new_notifiable_offers(previous, snapshot)
-                if not duplicates_green_spend(snapshot[key], green_title, green)
-            }
-            if previous_green is not None and green_key and green_key != previous_green:
-                if not is_quiet_offer(green_title):
-                    new.add("__green__")
-            pending_keys = sorted(set(pending_keys or ()) | new)
-            first_combination = False
-            if can_announce and has_notifiable_combination(snapshot, green_key, green_title, green):
-                first_combination = reserve_combination_alert(conn, asin, page_id, revision if pending else revision + 1)
-            if (new or first_combination) and not pending:
+            new = new_notifiable_offers(previous, offers)
+            if previous_green is not None and green_key != previous_green:
+                new.add("__green__")
+        new = (new | set(pending_keys or ())) & keys.keys()
+        new_product = bool(pending and pending.startswith("🆕 منتج جديد"))
+        offer_alert = bool(pending and pending.startswith(("🆕 خصم جديد", "🎁 أكثر من عرض على المنتج")))
+        combination = snapshot is not None and has_notifiable_combination(offers, green_key, green_title, green)
+        first_combination = combination and previous is None
+        if can_announce and (pending or new or first_combination):
+            target_revision = revision if pending else revision + 1
+            product_key = keys.get("__green__", "__product__")
+            identities = set(keys.values())
+            if pending:
+                identities.add("__product__")
+            available = available_offer_deliveries(conn, asin, page_id, target_revision, identities)
+            new = {key for key in new if keys[key] in available}
+            additional_available = any(key != "__green__" and identity in available for key, identity in keys.items())
+
+            if not pending and (new or (first_combination and additional_available and reserve_combination_alert(
+                conn, asin, page_id, target_revision
+            ))):
                 title_line = "🆕 خصم جديد" if new else "🎁 أكثر من عرض على المنتج"
                 pending = f"{title_line}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
                 pending_url, pending_image, pending_price = product_url, image, price
-                revision += 1
-            conn.execute("""
-                UPDATE green_deal_products
-                SET detail_offers=%s,detail_green_terms=%s,pending_alert=%s,pending_url=%s,
-                    pending_image_url=%s,pending_revision=%s,pending_new_offers=%s,pending_price=%s,
-                    detail_failure_count=0
-                WHERE page_id=%s AND asin=%s
-            """, (Jsonb(snapshot), green_key, pending, pending_url, pending_image, revision,
-                  Jsonb(pending_keys) if pending_keys else None, pending_price, page_id, asin))
-        else:
-            conn.execute("""
-                UPDATE green_deal_products SET detail_failure_count=detail_failure_count+1
-                WHERE page_id=%s AND asin=%s
-            """, (page_id, asin))
+                revision = target_revision
+            elif new_product or offer_alert:
+                should_send = new or (new_product and product_key in available)
+                should_send = should_send or (
+                    pending.startswith("🎁") and additional_available
+                )
+                if not should_send:
+                    pending = pending_url = pending_image = pending_price = None
+
+            if pending:
+                if combination:
+                    reserve_combination_alert(conn, asin, page_id, revision)
+                if available:
+                    reserve_offer_deliveries(conn, asin, page_id, revision, available)
+        elif not can_announce:
+            pending = pending_url = pending_image = pending_price = None
+            new = set()
+        pending_keys = sorted(new) if pending else []
+        conn.execute("""
+            UPDATE green_deal_products
+            SET detail_offers=CASE WHEN %s THEN %s ELSE detail_offers END,
+                detail_green_terms=CASE WHEN %s THEN %s ELSE detail_green_terms END,
+                pending_alert=%s,pending_url=%s,pending_image_url=%s,pending_revision=%s,
+                pending_new_offers=%s,pending_price=%s,
+                detail_failure_count=CASE WHEN %s THEN 0 ELSE detail_failure_count+1 END
+            WHERE page_id=%s AND asin=%s
+        """, (snapshot is not None, Jsonb(offers), snapshot is not None, green_key,
+              pending, pending_url, pending_image, revision, Jsonb(pending_keys) if pending_keys else None,
+              pending_price, snapshot is not None, page_id, asin))
     if not pending:
         return revision, None
     alert_price = pending_price if pending_price is not None else price
     body = format_offer_alert(
-        pending, alert_price, green_title, green, snapshot if snapshot is not None else previous or {},
+        pending, alert_price, green_title, green, offers,
         pending_keys or (), cached=snapshot is None,
     )
     url = amazon_product_url(pending_url or product_url, asin)
@@ -1311,6 +1403,11 @@ def finish_product_detail(conn, claim, revision, round_at, handled, sent):
                 pending_price=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_price END
             WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
         """, (revision, round_at, *((revision, handled) * 5), page_id, asin, lease))
+        if sent:
+            conn.execute("""
+                UPDATE green_deal_offer_deliveries SET sent_at=now()
+                WHERE asin=%s AND page_id=%s AND pending_revision=%s AND sent_at IS NULL
+            """, (asin, page_id, revision))
         if updated.rowcount and sent:
             conn.execute("""
                 UPDATE green_deal_combination_alerts SET sent_at=now()
