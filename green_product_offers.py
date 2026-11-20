@@ -284,20 +284,6 @@ def pricing_terms(text):
     return minimum, cap, unresolved
 
 
-def conditional_percentage_offer(offer):
-    # Keep the stored fingerprints unchanged when a previously listed offer becomes calculable.
-    label = offer["label"]
-    minimum, cap, unresolved = pricing_terms(label)
-    rates = PERCENT.findall(normalize_text(label).replace("٪", "%"))
-    if minimum is None or unresolved or len(rates) != 1 or not OFFER_WORDS.search(label):
-        return None
-    rate = Decimal(rates[0])
-    if not 0 < rate <= 100 or BANK_TERMS.search(label):
-        return None
-    category = offer["category"] or ("coupon" if re.search(r"\b(?:coupon|voucher)\b|كوبون|قسيمة", label, re.I) else "checkout")
-    return category, rate, cap
-
-
 def duplicates_green_spend(offer, green_title, green):
     if not green or "percent" not in green or offer["category"] != "checkout" or offer["rate"] is None:
         return False
@@ -313,6 +299,44 @@ def has_notifiable_combination(offers, green_key, green_title, green):
     distinct = [offer for offer in offers.values() if not duplicates_green_spend(offer, green_title, green)]
     return (len(distinct) + bool(green_key) >= 2
             and any(not is_quiet_offer(offer["label"]) for offer in distinct))
+
+
+ADDITIONAL_QUANTITY = re.compile(
+    r"\b(?:when you )?buy\s+\d+(?:\s+or more)?(?:\s+(?:eligible|selected))?(?:\s+(?:items?|units?|pieces?))?"
+    r"|\b(?:on\s+any|when buying)\s+\d+(?:\s+(?:or more|and above)|\+)?"
+    r"(?:\s+(?:selected|eligible))?(?:\s+(?:items?|units?|pieces?))?"
+    r"|\bon\s+\d+(?:\s+(?:or more|and above)|\+)"
+    r"(?:\s+(?:selected|eligible))?(?:\s+(?:items?|units?|pieces?))?"
+    r"|(?:عند شراء|اشتر(?:ي)?|على)\s*(?:أي\s*)?\d+"
+    r"(?:\s*(?:قطع|قطعة|منتجات))?(?:\s*(?:أو أكثر|او اكثر|فأكثر))?",
+    re.I,
+)
+PARTIAL_ITEM_DISCOUNT = re.compile(
+    r"\b(?:cheapest|lowest(?:-priced)?|second|2nd|third|3rd|each eligible unit)\b"
+    r"|(?:الأرخص|الارخص|الثانية|الثالثة)|\bon\s+(?:one|1)(?:\s|$)", re.I,
+)
+
+
+def additional_percentage(offer):
+    """Model clear percentage offers as if the eligible quantity/basket is completed."""
+    text = normalize_text(offer["label"]).replace("٪", "%")
+    if BANK_TERMS.search(text) or PARTIAL_ITEM_DISCOUNT.search(text):
+        return None
+    matches = PERCENT.findall(text)
+    if len(matches) != 1:
+        return None
+    code = CODE.search(text)
+    quantity = ADDITIONAL_QUANTITY.search(text)
+    minimum, cap, _ = pricing_terms(text)
+    _, _, unsupported = pricing_terms(ADDITIONAL_QUANTITY.sub("", text))
+    if unsupported or not (offer["stackable_estimate"] or code or quantity or minimum is not None):
+        return None
+    rate = Decimal(matches[0])
+    if not 0 < rate <= 100:
+        return None
+    offer_code = (offer["code"] or (code[1] if code else "")).upper()
+    key = ("code", offer_code) if offer_code else ("terms", text.casefold().strip(" ."))
+    return key, rate, cap
 
 
 def offer_totals(price, green_title, green, additional):
@@ -352,37 +376,33 @@ def offer_totals(price, green_title, green, additional):
                 subtotal -= min(cap, discount) if cap is not None else discount
                 attempted = True
 
-    categories = {}
+    estimated_rates = set()
+    cash_by_category = {}
     for offer in additional.values():
+        if BANK_TERMS.search(offer["label"]) or duplicates_green_spend(offer, green_title, green):
+            # A mirrored checkout code remains visible and its basket tier is counted once.
+            continue
+        percentage = additional_percentage(offer)
+        if percentage:
+            key, rate, cap = percentage
+            if key not in estimated_rates:
+                discount = original * rate / 100
+                subtotal -= min(cap, discount) if cap is not None else discount
+                estimated_rates.add(key)
+                attempted = True
+            continue
+
         category = offer["category"]
-        if duplicates_green_spend(offer, green_title, green):
-            # Keep the code visible without counting the same basket tier twice.
-            continue
-        conditional = conditional_percentage_offer(offer) if not offer["stackable_estimate"] else None
-        cap = None
-        rate = offer["rate"]
-        if conditional:
-            category, rate, cap = conditional
-        if (not offer["stackable_estimate"] and not conditional) or (count > 1 and category == "coupon"):
+        if (not offer["stackable_estimate"] or offer["rate"] is not None or offer["amount"] is None
+                or category not in {"checkout", "coupon"} or (count > 1 and category == "coupon")):
             complete = False
         else:
-            categories.setdefault(category, []).append((offer, rate, cap))
-    for category in ("checkout", "coupon"):
-        offers = categories.get(category, [])
-        if len(offers) > 1 or (offers and category == "checkout" and green_title and not offers[0][0]["code"]):
+            cash_by_category.setdefault(category, []).append(offer)
+    for category, cash_offers in cash_by_category.items():
+        if len(cash_offers) != 1 or (category == "checkout" and green_title and not cash_offers[0]["code"]):
             complete = False
             continue
-        if not offers:
-            continue
-        offer, rate, cap = offers[0]
-        if rate is not None:
-            saving = subtotal * Decimal(str(rate)) / 100
-            subtotal -= min(cap, saving) if cap is not None else saving
-        elif offer["amount"] is not None:
-            subtotal -= Decimal(str(offer["amount"]))
-        else:
-            complete = False
-            continue
+        subtotal -= Decimal(str(cash_offers[0]["amount"]))
         attempted = True
 
     subtotal = cents(max(Decimal(0), subtotal))
@@ -405,7 +425,7 @@ def format_offer_alert(base, price, green_title, green, offers, new_keys=(), *, 
     calculation = []
     if attempted and count > 1:
         saving = max(Decimal(0), original - subtotal)
-        calculation.append(f"🛒 {count} قطع: قبل العرض {original:.2f}، بعده {subtotal:.2f}، التوفير {saving:.2f} ريال")
+        calculation.append(f"🛒 {count} قطع: قبل العرض {original:.2f}، بعده تقديريًا {subtotal:.2f}، التوفير {saving:.2f} ريال")
     elif attempted and subtotal != original:
         label = "بعد العروض" if complete else "بعد العروض المحسوبة"
         calculation.append(f"🎁 السعر التقديري {label}: {subtotal:.2f} ريال")
