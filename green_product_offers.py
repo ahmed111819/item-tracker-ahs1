@@ -121,6 +121,10 @@ PRODUCT_DETAIL_SNAPSHOT = r"""
     if (/^(نعتذر|sorry)[! .]*$/i.test(headerText) || /^(نعتذر|sorry)[! .]*$/i.test(document.title.trim())) {
         return {error: 'صفحة اعتذار من أمازون'};
     }
+    if (location.pathname === '/' || /^\/ref=/.test(location.pathname)
+        || document.querySelector('#gw-layout, #gw-content-grid, #gw-card-layout')) {
+        return {home: true};
+    }
     const title = (heading?.textContent || headerText
         || document.querySelector('meta[property="og:title"]')?.content || '').trim();
     const canonicalAsin = canonical.match(/\/(?:dp|gp\/product|gp\/aw\/d|product)\/([A-Z0-9]{10})(?=\/|[?#]|$)/i)?.[1];
@@ -190,8 +194,7 @@ def click_continue_shopping(page, asin, capture):
             capture(page, "after")
 
 
-def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=None):
-    url = amazon_product_url(product_url, asin)
+def open_detail_snapshot(page, url, asin):
     try:
         response = page.goto(url, wait_until="commit", timeout=12000)
     except PlaywrightTimeout as exc:
@@ -201,27 +204,36 @@ def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=
         raise ProductPageUnavailable(f"أمازون ردّ بحالة HTTP {code}")
 
     snapshot = wait_for_detail_snapshot(page, asin)
-    final = urlsplit(page.url)
-    if not is_amazon_detail_origin(final):
+    if not is_amazon_detail_origin(urlsplit(page.url)):
         raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
+    return snapshot
 
+
+def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=None):
+    url = amazon_product_url(product_url, asin)
+    snapshot = open_detail_snapshot(page, url, asin)
     continued = snapshot.get("error") == CONTINUE_SHOPPING and capture_continue is not None
+    reopened = False
     if continued:
         print(f"Amazon showed Continue Shopping for {asin}; checking its result.")
         try:
             snapshot = click_continue_shopping(page, asin, capture_continue)
             if snapshot is None:
                 raise ProductPageUnavailable(CONTINUE_SHOPPING)
+            if snapshot.get("home"):
+                reopened = True
+                print(f"Continue Shopping opened Amazon home for {asin}; reopening the direct product link once.")
+                snapshot = open_detail_snapshot(page, canonical_product_url(url, asin), asin)
         except PlaywrightTimeout as exc:
             print(f"Continue Shopping timed out for {asin}.")
             raise ProductPageUnavailable(CONTINUE_SHOPPING) from exc
         except ProductPageUnavailable as exc:
             print(f"Continue Shopping did not open {asin}: {exc}.")
             raise
-        final = urlsplit(page.url)
-
-    asin_match = PRODUCT_PAGE.search(final.path)
+    asin_match = PRODUCT_PAGE.search(urlsplit(page.url).path)
     reason = snapshot.get("error")
+    if snapshot.get("home"):
+        reason = "أمازون فتح الصفحة الرئيسية بدل المنتج"
     if not reason and ((asin_match and asin_match[1].upper() != asin)
                        or (not asin_match and snapshot["asin"] != asin)):
         reason = "تعذّر تأكيد رقم المنتج"
@@ -229,7 +241,9 @@ def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=
         if continued:
             print(f"Continue Shopping did not open {asin}: {reason}.")
         raise ProductPageUnavailable(reason)
-    if continued:
+    if reopened:
+        print(f"Reopened the requested product {asin} after Continue Shopping.")
+    elif continued:
         print(f"Continue Shopping opened the requested product {asin}.")
     return parse_detail_offers(snapshot["snippets"], unit_price)
 
