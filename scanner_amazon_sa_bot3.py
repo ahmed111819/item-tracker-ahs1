@@ -35,6 +35,7 @@ from deal_offer_rules import (
     offer_payable_details, record_unrecognized, reviewed_promotion_details, select_qualifying_offer,
 )
 from scan_pagination import RepeatedPages, next_page_url
+from promotion_digest import record_promotion_links
 from scan_link_report import classify_card_for_report, new_page_metrics, record_event
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
 
@@ -1022,6 +1023,8 @@ elements => elements.map(element => {
         title: titleElement ? titleElement.innerText : '',
         price_text: priceElement ? priceElement.innerText : '',
         reference_price_text: referencePriceElement ? referencePriceElement.innerText : '',
+        promotion_links: Array.from(element.querySelectorAll('a[href*="/promotion/psp/"]'),
+            link => link.href),
         image_url: imageUrl
     };
 })
@@ -1468,6 +1471,8 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
                         raise RuntimeError(
                             f"Could not extract product cards: {type(e).__name__}: {e}"
                         ) from e
+
+                    record_promotion_links(BOT_ID, card_snapshots)
 
                     async def process_page_product(index):
                         async with PRODUCT_SEMAPHORE:
