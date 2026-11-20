@@ -59,6 +59,12 @@ def amazon_product_url(value, asin):
     return f"https://www.amazon.sa/dp/{asin}"
 
 
+AMAZON_VERIFICATION_REASONS = frozenset({
+    "صفحة تحقق من أمازون",
+    "صفحة تابع التسوق من أمازون",
+})
+
+
 class ProductPageUnavailable(RuntimeError):
     """A safe, specific failure reason suitable for the workflow log."""
 
@@ -99,8 +105,19 @@ PRODUCT_DETAIL_SNAPSHOT = r"""
         } catch { return false; }
     });
     const headerText = (document.querySelector('h1')?.innerText || '').trim();
-    if (document.querySelector('form[action*="validateCaptcha"], #captchacharacters')
-        || /^robot check[! .]*$/i.test(headerText) || /^robot check[! .]*$/i.test(document.title.trim())) {
+    const verificationForm = document.querySelector('form[action*="validateCaptcha"]');
+    const challengeInput = document.querySelector('#captchacharacters')
+        || verificationForm?.querySelector('input[name="field-keywords"]:not([type="hidden"])');
+    const controls = [...(verificationForm?.querySelectorAll('button, input[type="submit"]') || [])];
+    const continueShopping = controls.some(control => {
+        const label = (control.innerText || control.value || '').trim().replace(/\s+/g, ' ');
+        return /^(continue shopping|تابع التسوق|متابعة التسوق)[!. ]*$/i.test(label);
+    });
+    if (!challengeInput && continueShopping) {
+        return {error: 'صفحة تابع التسوق من أمازون'};
+    }
+    if (verificationForm || challengeInput || /^robot check[! .]*$/i.test(headerText)
+        || /^robot check[! .]*$/i.test(document.title.trim())) {
         return {error: 'صفحة تحقق من أمازون'};
     }
     if (/^(نعتذر|sorry)[! .]*$/i.test(headerText) || /^(نعتذر|sorry)[! .]*$/i.test(document.title.trim())) {

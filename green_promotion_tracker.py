@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright
 from psycopg.types.json import Jsonb
 
 from green_product_offers import (
-    BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
+    AMAZON_VERIFICATION_REASONS, BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
     duplicates_green_spend, format_offer_alert, green_offer_key, has_notifiable_combination, is_quiet_offer,
     new_notifiable_offers, read_detail_offers, without_green_duplicate,
 )
@@ -115,13 +115,11 @@ def capture_amazon_challenge(page):
             if urlparse(page.url).hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}:
                 return
             form = page.locator("form[action*='validateCaptcha']").first
-            if form.is_visible():
-                form.screenshot(path=str(path), timeout=5000)
-            elif re.fullmatch(r"robot check[!. ]*", page.title().strip(), re.I):
-                page.screenshot(path=str(path), full_page=False, timeout=5000)
-            else:
+            if not form.is_visible() and not re.fullmatch(r"robot check[!. ]*", page.title().strip(), re.I):
                 return
-            print("Saved one Amazon verification screenshot for this run.")
+            fields = page.locator("input:not([type='submit']):not([type='button']), textarea")
+            page.screenshot(path=str(path), full_page=False, mask=[fields], timeout=5000)
+            print("Saved one Amazon verification screenshot, including page context.")
         except (PlaywrightError, ValueError, OSError) as exc:
             print(f"Could not save the Amazon verification screenshot: {type(exc).__name__}")
 
@@ -1338,9 +1336,10 @@ def read_product_attempt(page, url, asin, price, attempt):
         return read_detail_offers(page, target, asin, price), None, 0
     except (PlaywrightError, RuntimeError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
-        if isinstance(exc, ProductPageUnavailable) and reason == "صفحة تحقق من أمازون":
+        verification = reason in AMAZON_VERIFICATION_REASONS
+        if isinstance(exc, ProductPageUnavailable) and verification:
             capture_amazon_challenge(page)
-        site_rejection = any(label in reason for label in ("HTTP 429", "HTTP 503", "صفحة تحقق من أمازون"))
+        site_rejection = verification or any(label in reason for label in ("HTTP 429", "HTTP 503"))
         if site_rejection:
             defer_amazon_requests()
         delay = (15 if site_rejection else 5) * 2 ** (attempt - 1)
@@ -1377,9 +1376,9 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
             attempt = previous_attempts + 1
             print(f"Checking product {asin}, attempt {attempt}/4.")
             snapshot, reason, delay = read_product_attempt(page, url, asin, price, attempt)
-            rejected = bool(reason and any(label in reason for label in (
-                "HTTP 429", "HTTP 503", "صفحة تحقق من أمازون", "صفحة اعتذار من أمازون"
-            )))
+            rejected = reason in AMAZON_VERIFICATION_REASONS or bool(reason and any(
+                label in reason for label in ("HTTP 429", "HTTP 503", "صفحة اعتذار من أمازون")
+            ))
             detail_round.note_outcome(listing_round, rejected)
             if snapshot is None and attempt < 4:
                 print(f"Product {asin} deferred after attempt {attempt}/4: {reason}.")
