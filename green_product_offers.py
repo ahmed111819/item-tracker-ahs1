@@ -1,7 +1,9 @@
 """Read and estimate non-bank offers from Amazon.sa product pages."""
 import re
 from decimal import Decimal, ROUND_HALF_UP
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
+
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from deal_offer_rules import classify_offers, normalize_text
 
@@ -49,29 +51,100 @@ def amazon_product_url(value, asin):
     return f"https://www.amazon.sa/dp/{asin}"
 
 
+class ProductPageUnavailable(RuntimeError):
+    """A safe, specific failure reason suitable for the workflow log."""
+
+
+def canonical_product_url(value, asin):
+    """Drop referral parameters while preserving an explicitly selected seller."""
+    url = amazon_product_url(value, asin)
+    seller = [(key, item) for key, item in parse_qsl(urlsplit(url).query)
+              if key.lower() in {"m", "smid", "seller", "merchantid"}]
+    query = urlencode(seller)
+    return f"https://www.amazon.sa/dp/{asin}" + (f"?{query}" if query else "")
+
+
+PRODUCT_DETAIL_SNAPSHOT = r"""
+({regions, expected}) => {
+    if (document.readyState === 'loading') return false;
+    const heading = document.querySelector(
+        '#productTitle, #title_feature_div h1, #title_feature_div #title, '
+        + '#titleSection h1, h1#title, #title_feature_div [role="heading"], '
+        + 'h1[itemprop="name"], h1[data-feature-name="title"], #product-title'
+    );
+    const productLayout = document.querySelector(
+        '#dp, #dp-container, #centerCol, #buybox, #buybox_feature_div, '
+        + '#buyboxAccordion, #qualifiedBuybox, [itemtype$="/Product"]'
+    );
+    const metadata = document.querySelector('meta[property="og:type"]')?.content || '';
+    const canonical = document.querySelector('link[rel="canonical"]')?.href
+        || document.querySelector('meta[property="og:url"]')?.content || '';
+    const sku = document.querySelector(
+        'input#ASIN, #buybox input[name="ASIN"], #addToCart input[name="ASIN"]'
+    )?.value || '';
+    const jsonProduct = [...document.querySelectorAll('script[type="application/ld+json"]')].some(script => {
+        try {
+            const parsed = JSON.parse(script.textContent);
+            const roots = Array.isArray(parsed) ? parsed : [parsed];
+            return roots.flatMap(value => [value, ...(Array.isArray(value?.['@graph']) ? value['@graph'] : [])])
+                .some(value => [value?.['@type']].flat().includes('Product') && value.name);
+        } catch { return false; }
+    });
+    const headerText = (document.querySelector('h1')?.innerText || '').trim();
+    if (document.querySelector('form[action*="validateCaptcha"], #captchacharacters')
+        || /^(نعتذر|sorry[! .]*|robot check)$/i.test(headerText)
+        || /^(نعتذر|robot check)$/i.test(document.title.trim())) {
+        return {error: 'صفحة اعتذار أو تحقق من أمازون'};
+    }
+    const title = (heading?.textContent || headerText
+        || document.querySelector('meta[property="og:title"]')?.content || '').trim();
+    const canonicalAsin = canonical.match(/\/(?:dp|gp\/product|gp\/aw\/d|product)\/([A-Z0-9]{10})(?=\/|[?#]|$)/i)?.[1];
+    const asin = /^[A-Z0-9]{10}$/i.test(sku) ? sku.toUpperCase() : canonicalAsin?.toUpperCase();
+    if (asin && asin !== expected) return {error: 'أمازون فتح منتجًا مختلفًا'};
+    if (!(heading && title) && !jsonProduct && !(productLayout && (title || asin))
+        && !(title && (asin || /^product\b/i.test(metadata)))) return false;
+
+    const blocks = [...document.querySelectorAll(regions)];
+    const visible = blocks.filter(node => node.getClientRects().length
+        && getComputedStyle(node).visibility !== 'hidden');
+    return {asin: asin || null, snippets: visible.filter(node =>
+        !visible.some(other => other !== node && other.contains(node))
+    ).map(node => node.innerText.trim()).filter(Boolean)};
+}
+"""
+
+
 def read_detail_offers(page, product_url, asin, unit_price):
     url = amazon_product_url(product_url, asin)
-    response = page.goto(url, wait_until="domcontentloaded", timeout=12000)
+    try:
+        response = page.goto(url, wait_until="commit", timeout=12000)
+    except PlaywrightTimeout as exc:
+        raise ProductPageUnavailable("انتهت مهلة فتح رابط المنتج") from exc
+    if not response or not response.ok:
+        code = response.status if response else "unknown"
+        raise ProductPageUnavailable(f"أمازون ردّ بحالة HTTP {code}")
+
+    try:
+        handle = page.wait_for_function(
+            PRODUCT_DETAIL_SNAPSHOT, arg={"regions": DETAIL_REGIONS, "expected": asin},
+            polling=200, timeout=7500,
+        )
+        try:
+            snapshot = handle.json_value()
+        finally:
+            handle.dispose()
+    except PlaywrightTimeout as exc:
+        raise ProductPageUnavailable("انتهت مهلة ظهور بيانات المنتج بعد فتح الرابط") from exc
+
     final = urlsplit(page.url)
     asin_match = PRODUCT_PAGE.search(final.path)
-    if (not response or not response.ok or final.hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}
-            or (asin_match and asin_match[1].upper() != asin)):
-        raise RuntimeError(f"Product page unavailable (HTTP {response.status if response else 'unknown'}).")
-    page.wait_for_selector("#productTitle, #title_feature_div #title, #buybox", state="attached", timeout=3500)
-    actual_asin, snippets = page.evaluate(
-        """selector => {
-            const asin = document.querySelector('input#ASIN, input[name="ASIN"]')?.value;
-            const blocks = [...document.querySelectorAll(selector)];
-            const visible = blocks.filter(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
-            return [asin, visible.filter(node => !visible.some(other => other !== node && other.contains(node)))
-                .map(node => node.innerText.trim()).filter(Boolean)];
-        }""", DETAIL_REGIONS,
-    )
-    if actual_asin and re.fullmatch(r"[A-Z0-9]{10}", actual_asin, re.I) and actual_asin.upper() != asin:
-        raise RuntimeError("Product page returned a different ASIN.")
-    if not asin_match and (actual_asin or "").upper() != asin:
-        raise RuntimeError("Product page identity could not be confirmed.")
-    return parse_detail_offers(snippets, unit_price)
+    if final.scheme != "https" or final.hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}:
+        raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
+    if snapshot.get("error"):
+        raise ProductPageUnavailable(snapshot["error"])
+    if (asin_match and asin_match[1].upper() != asin) or (not asin_match and snapshot["asin"] != asin):
+        raise ProductPageUnavailable("تعذّر تأكيد رقم المنتج")
+    return parse_detail_offers(snapshot["snippets"], unit_price)
 
 
 def parse_detail_offers(snippets, price):
@@ -289,4 +362,6 @@ def format_offer_alert(base, price, green_title, green, offers, new_keys=(), *, 
         if len(visible) < len(rows):
             visible.append(f"• {len(rows) - len(visible)} عروض إضافية لم تتسع لها الرسالة")
         return text + "\n".join(visible) + "\n\n" + footer
+    if cached:
+        return f"{base}\n\nتعذّر التحقق من العروض الإضافية في آخر محاولة.\n\n{footer}"
     return f"{base}\n\n{footer}"

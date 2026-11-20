@@ -29,7 +29,8 @@ from playwright.sync_api import sync_playwright
 from psycopg.types.json import Jsonb
 
 from green_product_offers import (
-    BANK_TERMS, amazon_product_url, format_offer_alert, green_offer_key, is_quiet_offer,
+    BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
+    format_offer_alert, green_offer_key, is_quiet_offer,
     new_notifiable_offers, read_detail_offers, without_green_duplicate,
 )
 
@@ -79,6 +80,11 @@ def init_db():
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_image_url text")
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS offer_terms text NOT NULL DEFAULT ''")
         conn.execute("""
+            ALTER TABLE green_deal_pages
+                ADD COLUMN IF NOT EXISTS scan_failures integer NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS scan_retry_after timestamptz
+        """)
+        conn.execute("""
             ALTER TABLE green_deal_products
                 ADD COLUMN IF NOT EXISTS image_url text NOT NULL DEFAULT '',
                 ADD COLUMN IF NOT EXISTS detail_offers jsonb,
@@ -87,7 +93,8 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS pending_revision bigint NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS pending_new_offers jsonb,
                 ADD COLUMN IF NOT EXISTS detail_green_terms text,
-                ADD COLUMN IF NOT EXISTS pending_price numeric
+                ADD COLUMN IF NOT EXISTS pending_price numeric,
+                ADD COLUMN IF NOT EXISTS detail_failure_count integer NOT NULL DEFAULT 0
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS green_deal_detail_due_idx
@@ -227,7 +234,7 @@ def add_page(value):
     with db() as conn:
         conn.execute(
             "INSERT INTO green_deal_pages(url,title) VALUES (%s,%s) "
-            "ON CONFLICT(url) DO UPDATE SET active=true,"
+            "ON CONFLICT(url) DO UPDATE SET active=true,scan_failures=0,scan_retry_after=NULL,"
             "title=CASE WHEN excluded.title <> '' THEN excluded.title ELSE green_deal_pages.title END",
             (url, title),
         )
@@ -343,7 +350,7 @@ def show_product_menu(view, page=0, message=None):
 def show_pages(view="pages", page=0, message=None):
     query = """
         SELECT p.id, p.url, p.active, p.title, p.expires_on, p.last_checked_at,
-               p.last_error, p.scan_started_at, products.present, products.total
+               p.last_error, p.scan_started_at, products.present, products.total, p.scan_retry_after
         FROM green_deal_pages AS p
         LEFT JOIN LATERAL (
             SELECT count(*) FILTER (WHERE present) AS present, count(*) AS total
@@ -365,13 +372,17 @@ def show_pages(view="pages", page=0, message=None):
     else:
         lines.append("الأوقات بتوقيت الرياض." if status_view else "اضغط رقم الصفحة لإدارتها.")
     for number, row in enumerate(rows[:MENU_SIZE], start=page * MENU_SIZE + 1):
-        page_id, url, active, title, expiry, checked, error, started, present, total = row
+        page_id, url, active, title, expiry, checked, error, started, present, total, retry_at = row
         label = escape(compact_text(title, 120) or "بانتظار اسم العرض")
         state = "⏸ متوقفة" if not active else "🔄 يجري الفحص" if started else "🟢 مفعّلة"
+        if active and not started and retry_at and retry_at > datetime.now(timezone.utc):
+            state = "⏳ ينتظر إعادة المحاولة"
         item = f'<b>{number}. {label}</b>\n{state}'
         if status_view:
             last = checked.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%d-%m-%Y %I:%M %p") if checked else "لم تُفحص بعد"
             item += f"\nآخر فحص: {last}\nالمنتجات الظاهرة: {present}/{total}"
+            if retry_at and active and not started and retry_at > datetime.now(timezone.utc):
+                item += f"\nالمحاولة القادمة بعد: {retry_at.astimezone(ZoneInfo('Asia/Riyadh')).strftime('%I:%M %p')}"
             if error:
                 item += f"\n⚠️ {escape(compact_text(error, 160))}"
         else:
@@ -469,7 +480,7 @@ def menu_callback(query, message, data):
                 if action == "remove":
                     conn.execute("DELETE FROM green_deal_pages WHERE id=%s", (page_id,))
                 else:
-                    conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL WHERE id=%s", (action == "enable", page_id))
+                    conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (action == "enable", page_id))
             if action == "enable":
                 SCAN_REQUESTED.set()
         answer_callback(answer)
@@ -583,7 +594,7 @@ def callback(update):
         return
     with db() as conn:
         if action in {"pause", "resume"}:
-            conn.execute("UPDATE green_deal_pages SET active=%s WHERE id=%s", (action == "resume", page_id))
+            conn.execute("UPDATE green_deal_pages SET active=%s,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (action == "resume", page_id))
             if action == "resume":
                 SCAN_REQUESTED.set()
         elif action == "delete":
@@ -750,6 +761,10 @@ def show_more_button(page):
     return None
 
 
+class PromotionPageUnavailable(RuntimeError):
+    """Amazon did not provide a usable promotion listing."""
+
+
 def collect_products(url, on_batch, on_offer_title, browser_channel=None):
     products = {}
     with sync_playwright() as p:
@@ -757,7 +772,13 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            print(f"Opened promotion page: status={response.status if response else 'unknown'} title={page.title()!r}")
+            title = page.title()
+            status = response.status if response else None
+            print(f"Opened promotion page: status={status or 'unknown'} title={title!r}")
+            if not response or not response.ok:
+                raise PromotionPageUnavailable(f"أمازون ردّ بحالة HTTP {status or 'unknown'}")
+            if re.fullmatch(r"(?:نعتذر|sorry|robot check)[!. ]*", title.strip(), re.I):
+                raise PromotionPageUnavailable("أمازون عرض صفحة اعتذار أو تحقق")
             cards = page.locator("[data-asin]")
             try:
                 page.locator("[data-asin]:not([data-asin='']) .a-price").first.wait_for(state="attached", timeout=4000)
@@ -815,8 +836,9 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
             else:
                 raise RuntimeError("Pagination limit reached; scan is incomplete.")
             if not products:
-                body = (page.locator("body").inner_text(timeout=3000) or "")[:500]
-                raise RuntimeError(f"No priced ASIN products were parsed. Page title={page.title()!r}; body preview={body!r}")
+                if snapshots:
+                    raise PromotionPageUnavailable(f"أمازون عرض {len(snapshots)} بطاقة بدون أسعار قابلة للقراءة")
+                raise PromotionPageUnavailable("صفحة العرض فتحت بدون بطاقات منتجات")
         finally:
             browser.close()
     return products
@@ -1017,7 +1039,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         raise RuntimeError("No products could be read. Treating this scan as incomplete.")
     with conn.transaction():
         conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s)", (page_id, list(found)))
-        conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
+        conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (page_id,))
 
 
 def claim_product_detail(conn, pending_only, prioritize_alerts):
@@ -1049,7 +1071,7 @@ def record_product_detail(conn, claim, snapshot):
             SELECT d.title,d.price,d.product_url,d.image_url,d.pending_alert,d.pending_url,
                    d.pending_image_url,d.pending_revision,d.pending_new_offers,d.detail_offers,
                    COALESCE(NULLIF(p.offer_terms,''),p.title),d.detail_green_terms,d.pending_price,
-                   (p.active AND d.present)
+                   (p.active AND d.present),d.detail_failure_count
             FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
             WHERE d.page_id=%s AND d.asin=%s AND d.detail_lease_until=%s
             FOR UPDATE OF d
@@ -1057,7 +1079,7 @@ def record_product_detail(conn, claim, snapshot):
         if not row:
             return None
         (title, current_price, current_url, image, pending, pending_url, pending_image, revision,
-         pending_keys, previous, green_title, previous_green, pending_price, active) = row
+         pending_keys, previous, green_title, previous_green, pending_price, active, failures) = row
         if not active or (current_url, current_price) != (product_url, price):
             conn.execute("""
                 UPDATE green_deal_products SET detail_lease_until=NULL,detail_due_at=now()
@@ -1067,7 +1089,7 @@ def record_product_detail(conn, claim, snapshot):
 
         green = promotion_details(green_title) if not BANK_TERMS.search(green_title) else None
         green_key = green_offer_key(green_title) if green_title else ""
-        next_seconds = DETAIL_REFRESH_SECONDS if snapshot is not None else 180
+        next_seconds = DETAIL_REFRESH_SECONDS if snapshot is not None else min(3600, 300 * 2 ** min(failures, 4))
         if snapshot is not None:
             snapshot = without_green_duplicate(snapshot, green_title)
             new = new_notifiable_offers(previous, snapshot)
@@ -1082,10 +1104,16 @@ def record_product_detail(conn, claim, snapshot):
             conn.execute("""
                 UPDATE green_deal_products
                 SET detail_offers=%s,detail_green_terms=%s,pending_alert=%s,pending_url=%s,
-                    pending_image_url=%s,pending_revision=%s,pending_new_offers=%s,pending_price=%s
+                    pending_image_url=%s,pending_revision=%s,pending_new_offers=%s,pending_price=%s,
+                    detail_failure_count=0
                 WHERE page_id=%s AND asin=%s
             """, (Jsonb(snapshot), green_key, pending, pending_url, pending_image, revision,
                   Jsonb(pending_keys) if pending_keys else None, pending_price, page_id, asin))
+        else:
+            conn.execute("""
+                UPDATE green_deal_products SET detail_failure_count=detail_failure_count+1
+                WHERE page_id=%s AND asin=%s
+            """, (page_id, asin))
     if not pending:
         return revision, next_seconds, None
     alert_price = pending_price if pending_price is not None else price
@@ -1115,17 +1143,23 @@ def finish_product_detail(conn, claim, revision, next_seconds, delivered):
 
 
 def read_product_snapshot(stop, page, url, asin, price):
+    reasons = []
     for attempt in range(1, 5):
+        target = url if attempt == 1 else canonical_product_url(url, asin)
         try:
-            return read_detail_offers(page, url, asin, price)
+            return read_detail_offers(page, target, asin, price)
         except (PlaywrightError, RuntimeError, ValueError) as exc:
-            print(f"Product offers unavailable for {asin}, attempt {attempt}/4: {type(exc).__name__}")
+            reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
+            reasons.append(reason)
             if attempt == 4 or page.is_closed() or stop.wait(2 ** (attempt - 1)):
+                print(f"Product offers unavailable for {asin} after {attempt}/4 attempts: "
+                      + " | ".join(dict.fromkeys(reasons)))
                 return None
 
 
 def detail_worker_loop(stop, page, pending_only):
     sequence = 0
+    succeeded = 0
     with db() as conn:
         while not stop.is_set():
             claim = claim_product_detail(conn, pending_only, sequence % 4 != 3)
@@ -1135,12 +1169,18 @@ def detail_worker_loop(stop, page, pending_only):
             sequence += 1
             _, asin, url, price, _ = claim
             snapshot = read_product_snapshot(stop, page, url, asin, price)
+            if snapshot is not None:
+                succeeded += 1
+                if succeeded == 1:
+                    print(f"First product detail scan succeeded: {asin}, {len(snapshot)} offer(s).")
+            if sequence % 25 == 0:
+                print(f"Product detail progress: {succeeded}/{sequence} pages read successfully.")
             result = record_product_detail(conn, claim, snapshot)
             if result is None:
                 continue
             revision, next_seconds, alert = result
             delivered = False
-            if alert:
+            if alert and not stop.is_set():
                 try:
                     send_product_alert(*alert)
                     delivered = True
@@ -1196,7 +1236,11 @@ def scan_loop(continuous, browser_channel=None):
         today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
         with db() as conn:
             conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
-            pages = conn.execute("SELECT id,url FROM green_deal_pages WHERE active=true ORDER BY id").fetchall()
+            pages = conn.execute("""
+                SELECT id,url FROM green_deal_pages WHERE active=true
+                  AND (scan_retry_after IS NULL OR scan_retry_after<=now())
+                ORDER BY scan_failures,id
+            """).fetchall()
         for page_id, url in pages:
             for attempt in range(1, 5):
                 try:
@@ -1223,7 +1267,16 @@ def scan_loop(continuous, browser_channel=None):
                         time.sleep((10, 20, 40)[attempt - 1])
             else:
                 with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),scan_started_at=NULL WHERE id=%s", (page_id,))
+                    row = conn.execute("""
+                        UPDATE green_deal_pages
+                        SET last_checked_at=now(),scan_started_at=NULL,
+                            scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
+                            scan_failures=scan_failures+1
+                        WHERE id=%s AND active
+                        RETURNING LEAST(30,5*scan_failures)
+                    """, (page_id,)).fetchone()
+                    if row:
+                        print(f"Page {page_id} will retry in {row[0]} minutes; saved availability was preserved.")
         if not continuous:
             break
         print(f"Scan round finished in {time.monotonic() - round_started:.1f}s. "
