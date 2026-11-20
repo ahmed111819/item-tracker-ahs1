@@ -19,12 +19,20 @@ PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 OFFER_WORDS = re.compile(r"\b(?:coupon|voucher|save|off|discount|free|promotion|buy|get)\b|خصم|وفر|كوبون|قسيمة|مجان|اشتر", re.I)
 CONDITIONAL = re.compile(
     r"\b(?:subscribe|subscription|prime|first order|minimum|spend|up to|maximum|only|selected|eligible)\b"
-    r"|اشتراك|برايم|أول طلب|حد أدنى|بحد|حتى|عند شراء|مؤهل|مختار", re.I,
+    r"|\b(?:cannot|can't|may not|not to be)\s+(?:be\s+)?combined\b"
+    r"|اشتراك|برايم|أول طلب|حد أدنى|بحد|حتى|عند\s+(?:الشراء|شراء)|مؤهل|مختار|(?:غير قابل|لا يمكن)\s+للدمج", re.I,
 )
 AMOUNT = r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)"
 CURRENCY = r"(?:SAR|SR|ريال(?: سعودي)?|ر\.?\s*س\.?|﷼)"
 MONEY = rf"(?:{CURRENCY}\s*{AMOUNT}|{AMOUNT}\s*{CURRENCY})"
-SPEND_LIMIT = re.compile(rf"(?:when you (?:spend|buy)|minimum (?:order|spend)|عند شراء ب(?:قيمة|مبلغ)|حد أدنى)\s*{MONEY}", re.I)
+SPEND_LIMIT = re.compile(
+    rf"(?:when you (?:spend|buy)|when spending|minimum (?:order|spend)(?: of)?"
+    rf"|(?:عند|مع)\s+(?:شراء|الشراء|إنفاق|انفاق)\s*(?:ب(?:ـ|قيمة|مبلغ)?)?"
+    rf"|(?:على\s+)?(?:الطلبات|طلب)\s+بقيمة|(?:ب)?حد\s+أدنى(?:\s+للشراء)?)"
+    rf"\s*[:：]?\s*{MONEY}(?:\s*(?:or more|and above|أو أكثر|او اكثر|فأكثر))?"
+    rf"(?:\s+(?:of|on)\s+(?:select|selected|eligible)\s+(?:items|products))?",
+    re.I,
+)
 SAVING_CAP = re.compile(rf"(?:up to|maximum(?: savings of)?|بحد\s*(?:أقصى|اقصى)|حتى)\s*{MONEY}", re.I)
 PRODUCT_PAGE = re.compile(r"/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})(?=/|$)", re.I)
 DETAIL_REGIONS = (
@@ -252,6 +260,29 @@ def cents(value):
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def pricing_terms(text):
+    """Separate a stated basket minimum and saving cap from other eligibility terms."""
+    text = normalize_text(text).replace("٪", "%")
+    minimum = find_amount(SPEND_LIMIT, text)
+    cap = find_amount(SAVING_CAP, text)
+    unresolved = bool(CONDITIONAL.search(SAVING_CAP.sub("", SPEND_LIMIT.sub("", text))))
+    return minimum, cap, unresolved
+
+
+def conditional_percentage_offer(offer):
+    # Keep the stored fingerprints unchanged when a previously listed offer becomes calculable.
+    label = offer["label"]
+    minimum, cap, unresolved = pricing_terms(label)
+    rates = PERCENT.findall(normalize_text(label).replace("٪", "%"))
+    if minimum is None or unresolved or len(rates) != 1 or not OFFER_WORDS.search(label):
+        return None
+    rate = Decimal(rates[0])
+    if not 0 < rate <= 100 or BANK_TERMS.search(label):
+        return None
+    category = offer["category"] or ("coupon" if re.search(r"\b(?:coupon|voucher)\b|كوبون|قسيمة", label, re.I) else "checkout")
+    return category, rate, cap
+
+
 def offer_totals(price, green_title, green, additional):
     """Only combine offers whose conditions can be modelled on one basket."""
     unit = Decimal(str(price))
@@ -259,6 +290,13 @@ def offer_totals(price, green_title, green, additional):
     if BANK_TERMS.search(green_title):
         green_title, green = "", None
     count = (green.get("buy_quantity") or 1) if green else 1
+    minimum, cap, unsupported_terms = pricing_terms(green_title)
+    spend_only = (
+        green and "percent" in green and minimum is not None
+        and not re.search(r"\bbuy\s*\d+\b", SPEND_LIMIT.sub("", green_title), re.I)
+    )
+    if spend_only:
+        count = 1
     original = cents(unit * count)
     subtotal = original
     complete = True
@@ -273,13 +311,11 @@ def offer_totals(price, green_title, green, additional):
             subtotal = unit * green["paid_quantity"]
             attempted = True
         else:
-            minimum = find_amount(SPEND_LIMIT, green_title)
-            cap = find_amount(SAVING_CAP, green_title)
-            unsupported_terms = CONDITIONAL.search(SAVING_CAP.sub("", SPEND_LIMIT.sub("", green_title)))
-            if unsupported_terms or (minimum is not None and original < minimum):
+            # A known minimum can be met by the rest of the eligible basket.
+            if unsupported_terms:
                 complete = False
             else:
-                discount_count = green.get("discounted_quantity") or count
+                discount_count = 1 if spend_only else (green.get("discounted_quantity") or count)
                 discount = unit * discount_count * Decimal(str(green["percent"])) / 100
                 subtotal -= min(cap, discount) if cap is not None else discount
                 attempted = True
@@ -287,20 +323,26 @@ def offer_totals(price, green_title, green, additional):
     categories = {}
     for offer in additional.values():
         category = offer["category"]
-        if not offer["stackable_estimate"] or (count > 1 and category == "coupon"):
+        conditional = conditional_percentage_offer(offer) if not offer["stackable_estimate"] else None
+        cap = None
+        rate = offer["rate"]
+        if conditional:
+            category, rate, cap = conditional
+        if (not offer["stackable_estimate"] and not conditional) or (count > 1 and category == "coupon"):
             complete = False
         else:
-            categories.setdefault(category, []).append(offer)
+            categories.setdefault(category, []).append((offer, rate, cap))
     for category in ("checkout", "coupon"):
         offers = categories.get(category, [])
-        if len(offers) > 1 or (offers and category == "checkout" and green_title and not offers[0]["code"]):
+        if len(offers) > 1 or (offers and category == "checkout" and green_title and not offers[0][0]["code"]):
             complete = False
             continue
         if not offers:
             continue
-        offer = offers[0]
-        if offer["rate"] is not None:
-            subtotal *= 1 - Decimal(str(offer["rate"])) / 100
+        offer, rate, cap = offers[0]
+        if rate is not None:
+            saving = subtotal * Decimal(str(rate)) / 100
+            subtotal -= min(cap, saving) if cap is not None else saving
         elif offer["amount"] is not None:
             subtotal -= Decimal(str(offer["amount"]))
         else:
