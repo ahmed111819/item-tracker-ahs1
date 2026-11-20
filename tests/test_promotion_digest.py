@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,3 +54,28 @@ class PromotionDigestTests(unittest.TestCase):
         self.assertGreater(len(messages), 1)
         self.assertTrue(all(len(message) < 4000 for message in messages))
         self.assertEqual(sum(message.count("</a>") for message in messages), len(offers))
+
+    def test_amazon_titles_with_paid_quantity_can_qualify_for_overlap(self):
+        product = {"B0DWT7PWHN": ("Comfort", None)}
+        offers = {
+            "A1WSIDJI0UEOX0": Promotion(
+                "https://www.amazon.sa/promotion/psp/A1WSIDJI0UEOX0",
+                "Amazon.sa: Get Extra 20% off العرض", product,
+            ),
+            "A31IJHE1QWX79": Promotion(
+                "https://www.amazon.sa/promotion/psp/A31IJHE1QWX79",
+                "Get 2 for the price of 1.", product,
+            ),
+        }
+        [block] = overlap_blocks(offers)
+        self.assertIn("20.00٪", block)
+        self.assertIn("50.00٪", block)
+        self.assertNotIn("تقديري", block)
+        arabic_rate, _ = saving_for("احصل على 3 بسعر 2 العرض", None)
+        self.assertEqual(arabic_rate.quantize(Decimal("0.01")), Decimal("33.33"))
+
+    def test_no_eligible_overlap_still_sends_a_clear_result(self):
+        url = "https://www.amazon.sa/promotion/psp/A1WSIDJI0UEOX0"
+        messages = build_messages({"A1WSIDJI0UEOX0": Promotion(url, "Get Extra 20% off")}, "123")
+        self.assertIn("منتجات عليها أكثر من عرض (0)", messages[1])
+        self.assertIn("تعذر استكمال قراءة منتجات 1", messages[1])

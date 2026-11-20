@@ -27,6 +27,12 @@ CAPPED_RATE = re.compile(
     r"(?:save|get\s+extra)\s+(\d+(?:\.\d+)?)\s*%\s*(?:off\s+)?"
     r"up\s+to\s+SAR\s*(\d+(?:\.\d+)?)\.?", re.I
 )
+QUANTITY_FOR_PRICE = re.compile(
+    r"(?:(?:get|buy)\s+(?:any\s+)?|(?:احصل\s+على|اشتر(?:ي)?)\s*)?"
+    r"(\d+)\s*(?:(?:items?|قطع|قطعة)\s*)?"
+    r"(?:for\s+(?:the\s+)?price\s+of|بسعر)\s*(\d+)\s*\.?",
+    re.I,
+)
 MIN_RATE = Decimal(10)
 
 
@@ -118,28 +124,29 @@ def include_tracked_pages(promotions):
                              user="green_deals_bot", password=password, connect_timeout=8,
                              options="-c statement_timeout=15000") as conn:
             rows = conn.execute("""
-                SELECT p.url, p.title, product.asin, product.title, product.price
+                SELECT p.url, COALESCE(NULLIF(to_jsonb(p)->>'offer_terms', ''), p.title),
+                       product.asin, product.title, product.price,
+                       p.scan_started_at IS NULL AND p.last_error IS NULL
+                           AND p.last_checked_at >= now() - interval '3 hours'
                 FROM green_deal_pages AS p
                 LEFT JOIN green_deal_products AS product
                   ON product.page_id = p.id AND product.present
-                 AND product.last_seen_at <= p.last_checked_at
-                 AND product.last_seen_at >= p.last_checked_at - interval '3 hours'
-                 AND p.last_error IS NULL AND p.scan_started_at IS NULL
-                 AND p.last_checked_at >= now() - interval '3 hours'
+                 AND product.last_seen_at >= now() - interval '3 hours'
                 WHERE p.active AND (p.expires_on IS NULL OR
                     p.expires_on >= (now() AT TIME ZONE 'Asia/Riyadh')::date)
             """).fetchall()
     except psycopg.Error as error:
         print(f"Could not read tracked promotion pages ({type(error).__name__}).")
         return
-    for url, title, asin, product_title, price in rows:
+    for url, title, asin, product_title, price, completed in rows:
         offer = register(promotions, url)
         if offer:
             if title:
                 offer.title = title
             if asin:
-                offer.products[asin] = (product_title, price)
-                offer.complete = True
+                if asin not in offer.products or offer.products[asin][1] is None:
+                    offer.products[asin] = (product_title, price)
+                offer.complete |= bool(completed)
 
 
 def scan_page(url, output):
@@ -153,7 +160,7 @@ def scan_page(url, output):
             stream.flush()
 
         def remember_title(heading, body, title):
-            document_title = re.sub(r"^Amazon\.sa\s*[:|–-]\s*|\s+(?:promotion|العرض)\s*$", "", title, flags=re.I)
+            document_title = clean_offer_title(title)
             expiry = parse_expiry_date(body)
             today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
             offer_title = document_title if document_title and document_title.lower() != "amazon.sa" else heading
@@ -207,14 +214,24 @@ def complete_discoveries(promotions):
             promotions.pop(code, None)
 
 
+def clean_offer_title(title):
+    return re.sub(r"^Amazon\.sa\s*[:|–-]\s*|\s+(?:promotion|العرض)\s*$",
+                  "", normalize_text(title), flags=re.I).strip()
+
+
 def saving_for(title, price):
     """Return an effective basket percentage and whether it applies without a basket condition."""
-    title = normalize_text(title)
+    title = clean_offer_title(title)
     flat = FLAT_RATE.fullmatch(title)
     if flat:
         rate = number(flat[1])
         if rate and rate <= 100:
             return rate, True
+    quantity = QUANTITY_FOR_PRICE.fullmatch(title)
+    if quantity:
+        total, paid = map(Decimal, quantity.groups())
+        if 0 < paid < total <= 1000:
+            return (total - paid) / total * 100, False
     unit_price = number(price)
     if not unit_price:
         return None
@@ -246,7 +263,7 @@ def overlap_blocks(promotions):
         title = html.escape(" ".join(offers[0][1].split())[:120] or asin)
         lines = [f'<b><a href="https://www.amazon.sa/dp/{asin}">{title}</a></b>']
         for offer, _, _, rate, _ in offers:
-            lines.append(f"• {offer_anchor(offer)} · {rate:g}٪ على إجمالي العرض")
+            lines.append(f"• {offer_anchor(offer)} · {rate:.2f}٪ على إجمالي العرض")
         prices = {entry[2] for entry in offers}
         if len(prices) == 1 and None not in prices and all(entry[4] for entry in offers):
             remaining = Decimal(1)
@@ -290,9 +307,15 @@ def build_messages(promotions, run_number, partial_run=False):
     messages = paginate(f"📋 صفحات العروض ({len(offers)}){run_label}",
                         notes + (offers or ["لم تظهر روابط عروض في هذا التشغيل."]))
     overlaps = overlap_blocks(promotions)
-    if overlaps:
+    if promotions:
+        overlap_notes = ["الدمج مرهون بشروط أمازون."] if overlaps else [
+            "لم يظهر منتج في عرضين مختلفين بتوفير 10٪ أو أكثر لكل عرض ضمن النتائج المقروءة."
+        ]
         messages.extend(paginate(f"🎁 منتجات عليها أكثر من عرض ({len(overlaps)}){run_label}",
-                                 notes + ["الدمج مرهون بشروط أمازون."] + overlaps))
+                                 notes + overlap_notes + overlaps))
+    print(f"Promotion digest: {len(promotions)} pages, {coverage} incomplete, "
+          f"{sum(len(offer.products) for offer in promotions.values())} product-page matches, "
+          f"{len(overlaps)} eligible overlapping products.")
     return messages
 
 
