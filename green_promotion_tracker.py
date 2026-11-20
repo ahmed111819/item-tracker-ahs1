@@ -15,6 +15,7 @@ import sys
 import time
 from html import escape
 from io import BytesIO
+from pathlib import Path
 from threading import Event, Lock, Thread, local
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -45,6 +46,8 @@ AMAZON_REJECTION_GAP = 8
 DETAIL_WORKERS = 2
 HTTP = requests.Session()
 AMAZON_REQUEST_LOCK = Lock()
+CHALLENGE_CAPTURE_PATH = os.getenv("GREEN_DEALS_CHALLENGE_PATH", "")
+CHALLENGE_CAPTURE_LOCK = Lock()
 NEXT_AMAZON_REQUEST = 0.0
 RETURN_ALERT = "↩️ عاد المنتج للظهور"
 TELEGRAM = local()
@@ -99,6 +102,40 @@ def defer_amazon_requests():
     global NEXT_AMAZON_REQUEST
     with AMAZON_REQUEST_LOCK:
         NEXT_AMAZON_REQUEST = max(NEXT_AMAZON_REQUEST, time.monotonic() + AMAZON_REJECTION_GAP)
+
+
+def capture_amazon_challenge(page):
+    if not CHALLENGE_CAPTURE_PATH:
+        return
+    path = Path(CHALLENGE_CAPTURE_PATH)
+    with CHALLENGE_CAPTURE_LOCK:
+        if path.exists():
+            return
+        try:
+            if urlparse(page.url).hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}:
+                return
+            form = page.locator("form[action*='validateCaptcha']").first
+            if form.is_visible():
+                form.screenshot(path=str(path), timeout=5000)
+            elif re.fullmatch(r"robot check[!. ]*", page.title().strip(), re.I):
+                page.screenshot(path=str(path), full_page=False, timeout=5000)
+            else:
+                return
+            print("Saved one Amazon verification screenshot for this run.")
+        except (PlaywrightError, ValueError, OSError) as exc:
+            print(f"Could not save the Amazon verification screenshot: {type(exc).__name__}")
+
+
+def skip_detail_resource(request):
+    if request.resource_type in {"font", "media"}:
+        return True
+    if request.resource_type != "image":
+        return False
+    if CHALLENGE_CAPTURE_PATH:
+        path = urlparse(request.url).path.casefold()
+        if "/captcha/" in path:
+            return False
+    return True
 
 
 def db():
@@ -874,6 +911,8 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
                     defer_amazon_requests()
                 raise PromotionPageUnavailable(f"أمازون ردّ بحالة HTTP {status or 'unknown'}")
             if re.fullmatch(r"(?:نعتذر|sorry|robot check)[!. ]*", title.strip(), re.I):
+                if re.fullmatch(r"robot check[!. ]*", title.strip(), re.I):
+                    capture_amazon_challenge(page)
                 defer_amazon_requests()
                 raise PromotionPageUnavailable("أمازون عرض صفحة اعتذار أو تحقق")
             cards = page.locator("[data-asin]")
@@ -1299,6 +1338,8 @@ def read_product_attempt(page, url, asin, price, attempt):
         return read_detail_offers(page, target, asin, price), None, 0
     except (PlaywrightError, RuntimeError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
+        if isinstance(exc, ProductPageUnavailable) and reason == "صفحة تحقق من أمازون":
+            capture_amazon_challenge(page)
         site_rejection = any(label in reason for label in ("HTTP 429", "HTTP 503", "صفحة تحقق من أمازون"))
         if site_rejection:
             defer_amazon_requests()
@@ -1391,7 +1432,7 @@ def product_detail_worker(stop, browser_channel, detail_round, pending_only):
                     browser = playwright.chromium.launch(headless=True, channel=browser_channel)
                     context = browser.new_context(locale="en-US", timezone_id="Asia/Riyadh", service_workers="block")
                     context.route("**/*", lambda route: (
-                        route.abort() if route.request.resource_type in {"image", "font", "media"} else route.continue_()
+                        route.abort() if skip_detail_resource(route.request) else route.continue_()
                     ))
                     try:
                         page = context.new_page()

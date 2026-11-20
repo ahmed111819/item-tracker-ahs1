@@ -48,7 +48,17 @@ jobs:
       - name: Install tracker dependencies
         run: python -m pip install "playwright>=1.52,<2" "requests>=2.32,<3" "psycopg[binary]>=3.2,<4"
       - name: Run green promotion page tracker
+        env:
+          GREEN_DEALS_CHALLENGE_PATH: ${{ runner.temp }}/green-amazon-challenge.png
         run: python -u green_promotion_tracker.py --prepare-browser ${{ inputs.continuous && '--continuous' || '' }}
+      - name: Upload Amazon verification screenshot
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: amazon-verification-page
+          path: ${{ runner.temp }}/green-amazon-challenge.png
+          retention-days: 3
+          if-no-files-found: ignore
       - name: Close SSH tunnel
         if: always()
         run: |
