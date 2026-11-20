@@ -119,11 +119,40 @@ def capture_amazon_challenge(page):
             form = page.locator("form[action*='validateCaptcha']").first
             if not form.is_visible() and not re.fullmatch(r"robot check[!. ]*", page.title().strip(), re.I):
                 return
-            fields = page.locator("input:not([type='submit']):not([type='button']), textarea")
-            page.screenshot(path=str(path), full_page=True, mask=[fields], timeout=5000)
-            print("Saved one full-page Amazon verification screenshot.")
+            save_amazon_screenshot(page, path)
         except (PlaywrightError, ValueError, OSError) as exc:
             print(f"Could not save the Amazon verification screenshot: {type(exc).__name__}")
+
+
+def save_amazon_screenshot(page, path):
+    fields = page.locator("input:not([type='submit']):not([type='button']), textarea")
+    page.screenshot(path=str(path), full_page=True, mask=[fields], timeout=5000)
+    print(f"Saved full-page Amazon screenshot: {path.name}.")
+
+
+def continue_screenshot_capture():
+    # Keep both frames from the same click when product workers run concurrently.
+    owns_pair = False
+
+    def capture(page, stage):
+        nonlocal owns_pair
+        if not CHALLENGE_CAPTURE_PATH:
+            return
+        base = Path(CHALLENGE_CAPTURE_PATH)
+        path = base.with_name(f"{base.stem}-{stage}{base.suffix}")
+        with CHALLENGE_CAPTURE_LOCK:
+            if (stage == "before" and path.exists()) or (stage == "after" and not owns_pair):
+                return
+            try:
+                if urlparse(page.url).hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}:
+                    return
+                save_amazon_screenshot(page, path)
+                if stage == "before":
+                    owns_pair = True
+            except (PlaywrightError, ValueError, OSError) as exc:
+                print(f"Could not save the {stage} Continue Shopping screenshot: {type(exc).__name__}.")
+
+    return capture
 
 
 def skip_detail_resource(request):
@@ -1431,7 +1460,7 @@ def read_product_attempt(page, url, asin, price, attempt):
     wait_for_amazon_slot()
     try:
         offers = read_detail_offers(
-            page, target, asin, price, before_continue=capture_amazon_challenge if attempt == 1 else None,
+            page, target, asin, price, capture_continue=continue_screenshot_capture() if attempt == 1 else None,
         )
         return offers, None, 0
     except (PlaywrightError, RuntimeError, ValueError) as exc:

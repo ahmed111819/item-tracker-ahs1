@@ -153,7 +153,7 @@ def wait_for_detail_snapshot(page, asin):
         raise ProductPageUnavailable("انتهت مهلة ظهور بيانات المنتج بعد فتح الرابط") from exc
 
 
-def click_continue_shopping(page):
+def click_continue_shopping(page, asin, capture):
     form = page.locator("form[action*='validateCaptcha']")
     if form.count() != 1:
         return None
@@ -173,12 +173,24 @@ def click_continue_shopping(page):
     }""")
     if not safe_form:
         return None
-    with page.expect_navigation(wait_until="domcontentloaded", timeout=8000) as navigation:
-        button.click(timeout=2500)
-    return navigation.value
+    capture(page, "before")
+    clicked = False
+    try:
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=8000) as navigation:
+            button.click(timeout=2500)
+            clicked = True
+        response = navigation.value
+        if not is_amazon_detail_origin(urlsplit(page.url)):
+            raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
+        if response is not None and not response.ok:
+            raise ProductPageUnavailable(f"أمازون ردّ بحالة HTTP {response.status}")
+        return wait_for_detail_snapshot(page, asin)
+    finally:
+        if clicked:
+            capture(page, "after")
 
 
-def read_detail_offers(page, product_url, asin, unit_price, *, before_continue=None):
+def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=None):
     url = amazon_product_url(product_url, asin)
     try:
         response = page.goto(url, wait_until="commit", timeout=12000)
@@ -193,17 +205,13 @@ def read_detail_offers(page, product_url, asin, unit_price, *, before_continue=N
     if not is_amazon_detail_origin(final):
         raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
 
-    continued = snapshot.get("error") == CONTINUE_SHOPPING and before_continue is not None
+    continued = snapshot.get("error") == CONTINUE_SHOPPING and capture_continue is not None
     if continued:
-        before_continue(page)
         print(f"Amazon showed Continue Shopping for {asin}; checking its result.")
         try:
-            continuation = click_continue_shopping(page)
-            if continuation is None:
+            snapshot = click_continue_shopping(page, asin, capture_continue)
+            if snapshot is None:
                 raise ProductPageUnavailable(CONTINUE_SHOPPING)
-            if not continuation.ok:
-                raise ProductPageUnavailable(f"أمازون ردّ بحالة HTTP {continuation.status}")
-            snapshot = wait_for_detail_snapshot(page, asin)
         except PlaywrightTimeout as exc:
             print(f"Continue Shopping timed out for {asin}.")
             raise ProductPageUnavailable(CONTINUE_SHOPPING) from exc
@@ -211,9 +219,6 @@ def read_detail_offers(page, product_url, asin, unit_price, *, before_continue=N
             print(f"Continue Shopping did not open {asin}: {exc}.")
             raise
         final = urlsplit(page.url)
-        if not is_amazon_detail_origin(final):
-            print(f"Continue Shopping redirected {asin} to another origin.")
-            raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
 
     asin_match = PRODUCT_PAGE.search(final.path)
     reason = snapshot.get("error")

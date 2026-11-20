@@ -56,7 +56,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: amazon-verification-page
-          path: ${{ runner.temp }}/green-amazon-challenge.png
+          path: ${{ runner.temp }}/green-amazon-challenge*.png
           retention-days: 3
           if-no-files-found: ignore
       - name: Close SSH tunnel
