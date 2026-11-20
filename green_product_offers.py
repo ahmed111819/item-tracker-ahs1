@@ -436,17 +436,44 @@ def format_offer_alert(base, price, green_title, green, offers, new_keys=(), *, 
 
     # Avoid repeating the same green offer when it is also visible on the product page.
     additional = without_green_duplicate(offers, green_title)
-    count, original, subtotal, mission, complete, attempted = offer_totals(price, green_title, green, additional)
-    basket = f" لـ{count} قطع" if count > 1 else ""
-    final = max(Decimal(0), subtotal - mission)
+    count, original, green_subtotal, mission, _, green_calculated = offer_totals(price, green_title, green, {})
+    five_offers = {}
+    for key, item in additional.items():
+        percentage = additional_percentage(item)
+        if percentage and percentage[1] == 5 and not duplicates_green_spend(item, green_title, green):
+            five_offers[key] = percentage
+    # A quantity-based or automatic 5% offer takes precedence over a competing 5% code.
+    baseline_five_key = max(
+        five_offers,
+        key=lambda key: (five_offers[key][0][0] != "code",
+                         five_offers[key][2] if five_offers[key][2] is not None else Decimal("Infinity")),
+        default=None,
+    )
+    baseline = {baseline_five_key: additional[baseline_five_key]} if baseline_five_key is not None else {}
+    merged = {
+        key: item for key, item in additional.items()
+        if key not in five_offers or key == baseline_five_key
+    }
+    _, _, baseline_subtotal, _, _, _ = offer_totals(price, green_title, green, baseline)
+    _, _, merged_subtotal, _, _, _ = offer_totals(price, green_title, green, merged)
+    baseline_price = max(Decimal(0), baseline_subtotal - mission)
+    merged_price = max(Decimal(0), merged_subtotal - mission)
+
     calculation = []
-    if attempted and count > 1:
-        saving = max(Decimal(0), original - subtotal)
-        calculation.append(f"🛒 {count} قطع: قبل العرض {original:.2f}، بعده تقديريًا {subtotal:.2f}، التوفير {saving:.2f} ريال")
-    elif attempted and subtotal != original:
-        label = "بعد العروض" if complete else "بعد العروض المحسوبة"
-        calculation.append(f"🎁 السعر التقديري {label}: {subtotal:.2f} ريال")
-    calculation.append(f"🎯 السعر التقديري بعد خصم المهام{basket}: {final:.2f} ريال")
+    if count > 1 and green_calculated:
+        saving = max(Decimal(0), original - green_subtotal)
+        calculation.append(
+            f"🛒 {count} قطع: قبل العرض {original:.2f}، بعد الأساسي {green_subtotal:.2f}، التوفير {saving:.2f} ريال"
+        )
+    components = []
+    if green_calculated:
+        components.append("الأساسي")
+    if baseline:
+        components.append("5%")
+    components.append("المهام")
+    calculation.append(f"🎯 بعد {' + '.join(components)}: {baseline_price:.2f} ريال")
+    if merged_price < baseline_price:
+        calculation.append(f"🤝 إذا اندمجت باقي العروض: {merged_price:.2f} ريال تقديريًا")
     footer = "\n".join(calculation)
     rows = []
     if green_title:
