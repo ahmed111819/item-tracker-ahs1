@@ -120,8 +120,8 @@ def capture_amazon_challenge(page):
             if not form.is_visible() and not re.fullmatch(r"robot check[!. ]*", page.title().strip(), re.I):
                 return
             fields = page.locator("input:not([type='submit']):not([type='button']), textarea")
-            page.screenshot(path=str(path), full_page=False, mask=[fields], timeout=5000)
-            print("Saved one Amazon verification screenshot, including page context.")
+            page.screenshot(path=str(path), full_page=True, mask=[fields], timeout=5000)
+            print("Saved one full-page Amazon verification screenshot.")
         except (PlaywrightError, ValueError, OSError) as exc:
             print(f"Could not save the Amazon verification screenshot: {type(exc).__name__}")
 
@@ -1430,7 +1430,10 @@ def read_product_attempt(page, url, asin, price, attempt):
     target = url if attempt == 1 else canonical_product_url(url, asin)
     wait_for_amazon_slot()
     try:
-        return read_detail_offers(page, target, asin, price), None, 0
+        offers = read_detail_offers(
+            page, target, asin, price, before_continue=capture_amazon_challenge if attempt == 1 else None,
+        )
+        return offers, None, 0
     except (PlaywrightError, RuntimeError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
         verification = reason in AMAZON_VERIFICATION_REASONS
