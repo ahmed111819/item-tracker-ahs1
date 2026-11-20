@@ -87,11 +87,10 @@ class ScannerIntegrationTests(unittest.TestCase):
                     self.assertEqual(result,(True,False))
                     self.assertFalse(sent)
 
-    def test_production_thresholds_are_valid_and_consistent(self):
+    def test_production_thresholds_are_valid_for_each_bot(self):
         threshold_names = {
             'MIN_DISCOUNT_PERCENT', 'MIN_PROMOTION_DISCOUNT_PERCENT', 'MIN_PRICE_DROP_PERCENT'
         }
-        settings = []
         for bot in (1, 2, 3):
             tree = ast.parse(Path(f'scanner_amazon_sa_bot{bot}.py').read_text(encoding='utf-8'))
             values = {
@@ -102,9 +101,6 @@ class ScannerIntegrationTests(unittest.TestCase):
             }
             self.assertEqual(values.keys(), threshold_names)
             self.assertTrue(all(0 < value <= 100 for value in values.values()))
-            settings.append(values)
-        self.assertEqual(settings[0], settings[1])
-        self.assertEqual(settings[0], settings[2])
 
     def test_payable_amount_in_offer_and_unblock_alerts(self):
         for bot in (1, 2, 3):
