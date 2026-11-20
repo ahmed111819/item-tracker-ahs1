@@ -135,7 +135,9 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS detail_green_terms text,
                 ADD COLUMN IF NOT EXISTS pending_price numeric,
                 ADD COLUMN IF NOT EXISTS detail_failure_count integer NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS detail_round_at timestamptz
+                ADD COLUMN IF NOT EXISTS detail_round_at timestamptz,
+                ADD COLUMN IF NOT EXISTS detail_attempt_round timestamptz,
+                ADD COLUMN IF NOT EXISTS detail_attempts integer NOT NULL DEFAULT 0
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS green_deal_detail_due_idx
@@ -1092,6 +1094,7 @@ def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize
                 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
                 WHERE p.active AND d.present AND d.price>0
                   AND d.detail_round_at IS DISTINCT FROM %s
+                  AND (d.detail_attempt_round IS DISTINCT FROM %s OR d.detail_due_at<=now())
                   AND (%s OR EXISTS (
                       SELECT 1 FROM green_deal_scan_cycle
                       WHERE singleton AND round_at=%s AND rest_until IS NULL
@@ -1107,12 +1110,14 @@ def claim_product_detail(conn, round_at, listings_done, pending_only, prioritize
             SET detail_lease_until=now()+interval '5 minutes'
             FROM next_product candidate
             WHERE d.page_id=candidate.page_id AND d.asin=candidate.asin
-            RETURNING d.page_id,d.asin,d.product_url,d.price,d.detail_lease_until
-        """, (round_at, pending_only, round_at, listings_done, round_at, pending_only, prioritize_alerts)).fetchone()
+            RETURNING d.page_id,d.asin,d.product_url,d.price,d.detail_lease_until,
+                      CASE WHEN d.detail_attempt_round=%s THEN d.detail_attempts ELSE 0 END
+        """, (round_at, round_at, pending_only, round_at, listings_done, round_at,
+              pending_only, prioritize_alerts, round_at)).fetchone()
 
 
 def record_product_detail(conn, claim, snapshot):
-    page_id, asin, product_url, price, lease = claim
+    page_id, asin, product_url, price, lease, _ = claim
     with conn.transaction():
         row = conn.execute("""
             SELECT d.title,d.price,d.product_url,d.image_url,d.pending_alert,d.pending_url,
@@ -1172,11 +1177,11 @@ def record_product_detail(conn, claim, snapshot):
 
 
 def finish_product_detail(conn, claim, revision, round_at, delivered):
-    page_id, asin, _, _, lease = claim
+    page_id, asin, _, _, lease, _ = claim
     with conn.transaction():
         conn.execute("""
             UPDATE green_deal_products
-            SET detail_lease_until=NULL,
+            SET detail_lease_until=NULL,detail_attempt_round=NULL,detail_attempts=0,
                 detail_round_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN NULL ELSE %s END,
                 detail_due_at=now(),
                 pending_alert=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_alert END,
@@ -1188,32 +1193,36 @@ def finish_product_detail(conn, claim, revision, round_at, delivered):
         """, (revision, round_at, *((revision, delivered) * 5), page_id, asin, lease))
 
 
-def read_product_snapshot(stop, page, url, asin, price):
-    reasons = []
-    for attempt in range(1, 5):
-        target = url if attempt == 1 else canonical_product_url(url, asin)
-        if stop.is_set():
-            return None
-        wait_for_amazon_slot()
-        try:
-            return read_detail_offers(page, target, asin, price)
-        except (PlaywrightError, RuntimeError, ValueError) as exc:
-            reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
-            reasons.append(reason)
-            rejected = isinstance(exc, ProductPageUnavailable) and any(
-                label in reason for label in ("HTTP 429", "HTTP 503", "صفحة اعتذار أو تحقق")
-            )
-            if rejected:
-                defer_amazon_requests()
-            delay = (5 if rejected else 1) * 2 ** (attempt - 1)
-            if attempt == 4 or page.is_closed() or stop.wait(delay):
-                print(f"Product offers unavailable for {asin} after {attempt}/4 attempts: "
-                      + " | ".join(dict.fromkeys(reasons)))
-                return None
+def defer_product_retry(conn, claim, round_at, attempt, delay):
+    page_id, asin, _, _, lease, _ = claim
+    with conn.transaction():
+        conn.execute("""
+            UPDATE green_deal_products
+            SET detail_lease_until=NULL,detail_attempt_round=%s,detail_attempts=%s,
+                detail_due_at=now()+make_interval(secs=>%s)
+            WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
+        """, (round_at, attempt, delay, page_id, asin, lease))
+
+
+def read_product_attempt(page, url, asin, price, attempt):
+    target = url if attempt == 1 else canonical_product_url(url, asin)
+    wait_for_amazon_slot()
+    try:
+        return read_detail_offers(page, target, asin, price), None, 0
+    except (PlaywrightError, RuntimeError, ValueError) as exc:
+        reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
+        site_rejection = any(label in reason for label in ("HTTP 429", "HTTP 503", "صفحة تحقق من أمازون"))
+        if site_rejection:
+            defer_amazon_requests()
+        # Keep product-level apology pages from pausing requests for every other product.
+        apology = reason == "صفحة اعتذار من أمازون"
+        delay = (15 if site_rejection or apology else 5) * 2 ** (attempt - 1)
+        return None, reason, delay
 
 
 def detail_worker_loop(stop, page, detail_round, pending_only):
     sequence = 0
+    finished = 0
     succeeded = 0
     with db() as conn:
         while not stop.is_set():
@@ -1223,19 +1232,34 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
             listing_finished = detail_round.listings_done.is_set()
             claim = claim_product_detail(conn, round_at, listing_finished, pending_only, sequence % 4 != 3)
             if not claim:
-                stop.wait(3)
+                stop.wait(2)
                 continue
             sequence += 1
-            _, asin, url, price, _ = claim
-            snapshot = read_product_snapshot(stop, page, url, asin, price)
-            if snapshot is not None:
+            _, asin, url, price, _, previous_attempts = claim
+            if stop.is_set():
+                defer_product_retry(conn, claim, round_at, previous_attempts, 0)
+                return
+            attempt = previous_attempts + 1
+            snapshot, reason, delay = read_product_attempt(page, url, asin, price, attempt)
+            if snapshot is None and attempt < 4:
+                defer_product_retry(conn, claim, round_at, attempt, delay)
+                if page.is_closed():
+                    return
+                continue
+
+            finished += 1
+            if snapshot is None:
+                print(f"Product offers unavailable for {asin} after 4/4 attempts: {reason}")
+            else:
                 succeeded += 1
                 if succeeded == 1:
                     print(f"First product detail scan succeeded: {asin}, {len(snapshot)} offer(s).")
-            if sequence % 25 == 0:
-                print(f"Product detail progress: {succeeded}/{sequence} pages read successfully.")
+            if finished % 25 == 0:
+                print(f"Product detail progress: {succeeded}/{finished} pages read successfully.")
             result = record_product_detail(conn, claim, snapshot)
             if result is None:
+                if page.is_closed():
+                    return
                 continue
             revision, alert = result
             delivered = False
@@ -1247,8 +1271,6 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                     print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
             finish_product_detail(conn, claim, revision, round_at, delivered)
             if page.is_closed():
-                return
-            if stop.is_set():
                 return
 
 
@@ -1274,20 +1296,25 @@ def product_detail_worker(stop, browser_channel, detail_round, pending_only):
 
 def wait_for_product_round(stop, round_at, pending_only):
     deadline = time.monotonic() + 60 if pending_only else None
+    next_report = time.monotonic() + 60
     with db() as conn:
         while not stop.is_set() and (deadline is None or time.monotonic() < deadline):
             with conn.transaction():
-                unfinished = conn.execute("""
-                    SELECT EXISTS(
-                        SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
-                        WHERE p.active AND d.present AND d.price>0
-                          AND d.detail_round_at IS DISTINCT FROM %s
-                          AND (NOT %s OR d.pending_alert IS NOT NULL)
+                unfinished, waiting = conn.execute("""
+                    SELECT count(*),count(*) FILTER (
+                        WHERE d.detail_attempt_round=%s AND d.detail_due_at>now()
                     )
-                """, (round_at, pending_only)).fetchone()[0]
+                    FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                    WHERE p.active AND d.present AND d.price>0
+                      AND d.detail_round_at IS DISTINCT FROM %s
+                      AND (NOT %s OR d.pending_alert IS NOT NULL)
+                """, (round_at, round_at, pending_only)).fetchone()
             if not unfinished:
                 return
-            stop.wait(2)
+            if time.monotonic() >= next_report:
+                print(f"Product round remaining: {unfinished}, including {waiting} waiting for a retry.")
+                next_report = time.monotonic() + 60
+            stop.wait(5)
 
 
 def scan_promotion_pages(browser_channel):

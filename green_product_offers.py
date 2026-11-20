@@ -92,9 +92,11 @@ PRODUCT_DETAIL_SNAPSHOT = r"""
     });
     const headerText = (document.querySelector('h1')?.innerText || '').trim();
     if (document.querySelector('form[action*="validateCaptcha"], #captchacharacters')
-        || /^(نعتذر|sorry[! .]*|robot check)$/i.test(headerText)
-        || /^(نعتذر|robot check)$/i.test(document.title.trim())) {
-        return {error: 'صفحة اعتذار أو تحقق من أمازون'};
+        || /^robot check[! .]*$/i.test(headerText) || /^robot check[! .]*$/i.test(document.title.trim())) {
+        return {error: 'صفحة تحقق من أمازون'};
+    }
+    if (/^(نعتذر|sorry)[! .]*$/i.test(headerText) || /^(نعتذر|sorry)[! .]*$/i.test(document.title.trim())) {
+        return {error: 'صفحة اعتذار من أمازون'};
     }
     const title = (heading?.textContent || headerText
         || document.querySelector('meta[property="og:title"]')?.content || '').trim();
