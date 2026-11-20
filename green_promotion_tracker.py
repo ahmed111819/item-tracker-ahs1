@@ -26,6 +26,12 @@ import requests
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
+from psycopg.types.json import Jsonb
+
+from green_product_offers import (
+    BANK_TERMS, amazon_product_url, format_offer_alert, green_offer_key, is_quiet_offer,
+    new_notifiable_offers, read_detail_offers, without_green_duplicate,
+)
 
 TOKEN = os.getenv("GREEN_DEALS_TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("GREEN_DEALS_TELEGRAM_CHAT_ID", "")
@@ -33,6 +39,8 @@ THREAD_ID = int(os.getenv("GREEN_DEALS_TELEGRAM_MESSAGE_THREAD_ID", "0"))
 DB_URL = os.getenv("GREEN_DEALS_DATABASE_URL", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 WAIT_SECONDS = int(os.getenv("GREEN_DEALS_SCAN_INTERVAL_SECONDS", "300"))
+DETAIL_REFRESH_SECONDS = 900
+DETAIL_WORKERS = 2
 HTTP = requests.Session()
 SCAN_REQUESTED = Event()
 RETURN_ALERT = "↩️ عاد المنتج للظهور"
@@ -69,6 +77,22 @@ def init_db():
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_alert text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_url text")
         conn.execute("ALTER TABLE green_deal_products ADD COLUMN IF NOT EXISTS pending_image_url text")
+        conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS offer_terms text NOT NULL DEFAULT ''")
+        conn.execute("""
+            ALTER TABLE green_deal_products
+                ADD COLUMN IF NOT EXISTS image_url text NOT NULL DEFAULT '',
+                ADD COLUMN IF NOT EXISTS detail_offers jsonb,
+                ADD COLUMN IF NOT EXISTS detail_due_at timestamptz NOT NULL DEFAULT now(),
+                ADD COLUMN IF NOT EXISTS detail_lease_until timestamptz,
+                ADD COLUMN IF NOT EXISTS pending_revision bigint NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS pending_new_offers jsonb,
+                ADD COLUMN IF NOT EXISTS detail_green_terms text,
+                ADD COLUMN IF NOT EXISTS pending_price numeric
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS green_deal_detail_due_idx
+            ON green_deal_products (detail_due_at, page_id, asin) WHERE present
+        """)
 
 
 def tg(method, payload):
@@ -142,9 +166,11 @@ def send_product_alert(caption, product_url, image_url, asin, price):
         return
     markup = product_keyboard(asin, price, following, muted, blocked)
     link = f'<a href="{escape(product_url, quote=True)}">رابط المنتج</a>'
-    message_text = f"{escape(caption[:1000].rstrip())}\n\n{link}"
+    message_text = f"{escape(caption.rstrip())}\n\n{link}"
 
-    if image_url:
+    # Keep long offer lists and their calculation together in a single text message.
+    if image_url and len(caption.encode("utf-16-le")) // 2 <= 1000:
+        session = getattr(TELEGRAM, "session", HTTP)
         try:
             host = (urlparse(image_url).hostname or "").lower()
             allowed_image_host = any(
@@ -154,7 +180,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             if not allowed_image_host:
                 raise RuntimeError("Product image host is not an Amazon image domain.")
 
-            image_response = HTTP.get(image_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            image_response = session.get(image_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
             image_response.raise_for_status()
             image_bytes = image_response.content
             if not image_bytes or len(image_bytes) > 8 * 1024 * 1024:
@@ -168,7 +194,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             }
             if THREAD_ID:
                 data["message_thread_id"] = str(THREAD_ID)
-            response = HTTP.post(
+            response = session.post(
                 f"{API}/sendPhoto",
                 data=data,
                 files={"photo": ("product.jpg", BytesIO(image_bytes), "image/jpeg")},
@@ -179,7 +205,7 @@ def send_product_alert(caption, product_url, image_url, asin, price):
                 raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
             return
         except Exception as exc:
-            print(f"Product photo upload failed: {type(exc).__name__}: {exc}")
+            print(f"Product photo upload failed: {type(exc).__name__}")
             raise RuntimeError("تعذر رفع صورة المنتج إلى تيليجرام") from exc
 
     send(message_text, markup, parse_mode="HTML", disable_preview=True)
@@ -846,34 +872,6 @@ def promotion_details(title):
     }
 
 
-def promotion_price_lines(promotion, price):
-    quantity = promotion.get("buy_quantity")
-    if "bundle_total" in promotion or "paid_quantity" in promotion:
-        unit_price = Decimal(str(price))
-        original_total = unit_price * quantity
-        offer_total = promotion["bundle_total"] if "bundle_total" in promotion else unit_price * promotion["paid_quantity"]
-        savings = max(Decimal(0), original_total - offer_total)
-        return [
-            f"🛒 إجمالي {quantity} قبل العرض: {original_total:.2f} ريال",
-            f"🎁 إجمالي {quantity} بالعرض: {offer_total:.2f} ريال",
-            f"💰 التوفير: {savings:.2f} ريال",
-        ]
-
-    percent = promotion["percent"]
-    discounted_quantity = promotion.get("discounted_quantity")
-    discounted_unit = round(price * (1 - percent / 100), 2)
-    if not quantity or not discounted_quantity:
-        return [f"🎁 السعر بعد خصم {percent:g}%: {discounted_unit:.2f} ريال"]
-
-    bundle_total = round(price * (quantity - discounted_quantity * percent / 100), 2)
-    average_unit = round(bundle_total / quantity, 2)
-    return [
-        f"🎁 سعر القطعة المخفّضة ({percent:g}%): {discounted_unit:.2f} ريال",
-        f"🛍️ إجمالي {quantity} قطع: {bundle_total:.2f} ريال",
-        f"📊 متوسط القطعة: {average_unit:.2f} ريال",
-    ]
-
-
 class ScanStopped(Exception):
     """The page was paused or removed during a scan."""
 
@@ -914,8 +912,8 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         with conn.transaction():
             conn.execute(
                 "UPDATE green_deal_pages SET title=CASE WHEN title='' THEN %s ELSE title END,"
-                "expires_on=COALESCE(%s,expires_on) WHERE id=%s",
-                (promotion_title, expiry, page_id),
+                "offer_terms=%s,expires_on=COALESCE(%s,expires_on) WHERE id=%s",
+                (promotion_title, promotion_title, expiry, page_id),
             )
 
     def save_product(asin, title, price, product_url, image_url):
@@ -958,44 +956,32 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
             pending_alert = old[2] if old else None
             if pending_alert and pending_alert.startswith(RETURN_ALERT) and not following:
                 conn.execute(
-                    "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL "
+                    "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL, "
+                    "pending_new_offers=NULL,pending_price=NULL,pending_revision=pending_revision+1 "
                     "WHERE page_id=%s AND asin=%s", (page_id, asin),
                 )
                 pending_alert = None
-            was_pending = bool(pending_alert and not is_muted and resume_price is None)
-            alert_url = (old[3] or product_url) if was_pending else product_url
-            alert_image = (old[4] or image_url) if was_pending else image_url
-            if was_pending:
-                event = pending_alert
             conn.execute("""
-              INSERT INTO green_deal_products(page_id,asin,title,price,product_url,present,last_seen_at)
-              VALUES (%s,%s,%s,%s,%s,true,now())
+              INSERT INTO green_deal_products(page_id,asin,title,price,product_url,image_url,present,last_seen_at)
+              VALUES (%s,%s,%s,%s,%s,%s,true,now())
               ON CONFLICT(page_id,asin) DO UPDATE SET title=excluded.title,price=excluded.price,
-                product_url=excluded.product_url,present=true,last_seen_at=now()
-            """, (page_id, asin, title, price, product_url))
+                product_url=excluded.product_url, image_url=COALESCE(NULLIF(excluded.image_url,''),green_deal_products.image_url),
+                detail_due_at=CASE WHEN NOT green_deal_products.present
+                                  THEN now() ELSE green_deal_products.detail_due_at END,
+                present=true,last_seen_at=now()
+            """, (page_id, asin, title, price, product_url, image_url))
             if event and not is_muted:
-                if promotion and not was_pending:
-                    event += "\n" + "\n".join(promotion_price_lines(promotion, price))
-                if promotion_title and "\n📌 شرط العرض:" not in event:
-                    event += f"\n📌 شرط العرض: {promotion_title}"
-                conn.execute(
-                    "UPDATE green_deal_products SET pending_alert=%s,pending_url=%s,pending_image_url=%s "
-                    "WHERE page_id=%s AND asin=%s",
-                    (event, product_url, image_url, page_id, asin),
-                )
-        if event and not is_muted:
-            send_product_alert(event, alert_url, alert_image, asin, price)
-            with conn.transaction():
-                conn.execute(
-                    "UPDATE green_deal_products SET pending_alert=NULL,pending_url=NULL,pending_image_url=NULL "
-                    "WHERE page_id=%s AND asin=%s",
-                    (page_id, asin),
-                )
+                conn.execute("""
+                    UPDATE green_deal_products
+                    SET pending_alert=%s,pending_url=%s,pending_image_url=%s,
+                        pending_revision=pending_revision + 1,pending_new_offers=NULL,pending_price=%s,detail_due_at=now()
+                    WHERE page_id=%s AND asin=%s
+                """, (event, product_url, image_url, price, page_id, asin))
 
     def save_batch(products):
         incoming = [
-            {"asin": asin, "title": title, "price": price, "product_url": url}
-            for asin, (title, price, url, _) in products.items()
+            {"asin": asin, "title": title, "price": price, "product_url": url, "image_url": image}
+            for asin, (title, price, url, image) in products.items()
         ]
         with conn.transaction():
             page_active = conn.execute(
@@ -1005,11 +991,12 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 raise ScanStopped()
             rows = conn.execute("""
                 UPDATE green_deal_products AS saved
-                SET title=incoming.title, product_url=incoming.product_url, last_seen_at=now()
+                SET title=incoming.title, product_url=incoming.product_url, last_seen_at=now(),
+                    image_url=COALESCE(NULLIF(incoming.image_url,''),saved.image_url)
                 FROM jsonb_to_recordset(%s::jsonb)
-                    AS incoming(asin text, title text, price numeric, product_url text)
+                    AS incoming(asin text, title text, price numeric, product_url text, image_url text)
                 WHERE saved.page_id=%s AND saved.asin=incoming.asin
-                  AND saved.present AND saved.price=incoming.price AND saved.pending_alert IS NULL
+                  AND saved.present AND saved.price=incoming.price
                   AND NOT EXISTS (
                       SELECT 1 FROM green_deal_product_blocks AS block
                       WHERE block.asin=saved.asin AND block.resume_price >= incoming.price
@@ -1031,6 +1018,175 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
     with conn.transaction():
         conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s)", (page_id, list(found)))
         conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL WHERE id=%s", (page_id,))
+
+
+def claim_product_detail(conn, pending_only, prioritize_alerts):
+    with conn.transaction():
+        return conn.execute("""
+            WITH next_product AS (
+                SELECT d.page_id,d.asin
+                FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                WHERE p.active AND d.present AND d.price>0
+                  AND d.detail_due_at<=now()
+                  AND (d.detail_lease_until IS NULL OR d.detail_lease_until<=now())
+                  AND (NOT %s OR d.pending_alert IS NOT NULL)
+                ORDER BY (%s AND d.pending_alert IS NOT NULL) DESC,
+                         d.detail_due_at,d.page_id,d.asin
+                LIMIT 1 FOR UPDATE OF d SKIP LOCKED
+            )
+            UPDATE green_deal_products d
+            SET detail_lease_until=now()+interval '3 minutes'
+            FROM next_product candidate
+            WHERE d.page_id=candidate.page_id AND d.asin=candidate.asin
+            RETURNING d.page_id,d.asin,d.product_url,d.price,d.detail_lease_until
+        """, (pending_only, prioritize_alerts)).fetchone()
+
+
+def record_product_detail(conn, claim, snapshot):
+    page_id, asin, product_url, price, lease = claim
+    with conn.transaction():
+        row = conn.execute("""
+            SELECT d.title,d.price,d.product_url,d.image_url,d.pending_alert,d.pending_url,
+                   d.pending_image_url,d.pending_revision,d.pending_new_offers,d.detail_offers,
+                   COALESCE(NULLIF(p.offer_terms,''),p.title),d.detail_green_terms,d.pending_price,
+                   (p.active AND d.present)
+            FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+            WHERE d.page_id=%s AND d.asin=%s AND d.detail_lease_until=%s
+            FOR UPDATE OF d
+        """, (page_id, asin, lease)).fetchone()
+        if not row:
+            return None
+        (title, current_price, current_url, image, pending, pending_url, pending_image, revision,
+         pending_keys, previous, green_title, previous_green, pending_price, active) = row
+        if not active or (current_url, current_price) != (product_url, price):
+            conn.execute("""
+                UPDATE green_deal_products SET detail_lease_until=NULL,detail_due_at=now()
+                WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
+            """, (page_id, asin, lease))
+            return None
+
+        green = promotion_details(green_title) if not BANK_TERMS.search(green_title) else None
+        green_key = green_offer_key(green_title) if green_title else ""
+        next_seconds = DETAIL_REFRESH_SECONDS if snapshot is not None else 180
+        if snapshot is not None:
+            snapshot = without_green_duplicate(snapshot, green_title)
+            new = new_notifiable_offers(previous, snapshot)
+            if previous_green is not None and green_key and green_key != previous_green:
+                if not is_quiet_offer(green_title):
+                    new.add("__green__")
+            pending_keys = sorted(set(pending_keys or ()) | new)
+            if new and not pending:
+                pending = f"🆕 خصم جديد\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
+                pending_url, pending_image, pending_price = product_url, image, price
+                revision += 1
+            conn.execute("""
+                UPDATE green_deal_products
+                SET detail_offers=%s,detail_green_terms=%s,pending_alert=%s,pending_url=%s,
+                    pending_image_url=%s,pending_revision=%s,pending_new_offers=%s,pending_price=%s
+                WHERE page_id=%s AND asin=%s
+            """, (Jsonb(snapshot), green_key, pending, pending_url, pending_image, revision,
+                  Jsonb(pending_keys) if pending_keys else None, pending_price, page_id, asin))
+    if not pending:
+        return revision, next_seconds, None
+    alert_price = pending_price if pending_price is not None else price
+    body = format_offer_alert(
+        pending, alert_price, green_title, green, snapshot if snapshot is not None else previous or {},
+        pending_keys or (), cached=snapshot is None,
+    )
+    url = amazon_product_url(pending_url or product_url, asin)
+    return revision, next_seconds, (body, url, pending_image or image, asin, alert_price)
+
+
+def finish_product_detail(conn, claim, revision, next_seconds, delivered):
+    page_id, asin, _, _, lease = claim
+    with conn.transaction():
+        conn.execute("""
+            UPDATE green_deal_products
+            SET detail_lease_until=NULL,
+                detail_due_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN now()
+                                   ELSE now()+make_interval(secs=>%s) END,
+                pending_alert=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_alert END,
+                pending_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_url END,
+                pending_image_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_image_url END,
+                pending_new_offers=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_new_offers END,
+                pending_price=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_price END
+            WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
+        """, (revision, next_seconds, *((revision, delivered) * 5), page_id, asin, lease))
+
+
+def read_product_snapshot(stop, page, url, asin, price):
+    for attempt in range(1, 5):
+        try:
+            return read_detail_offers(page, url, asin, price)
+        except (PlaywrightError, RuntimeError, ValueError) as exc:
+            print(f"Product offers unavailable for {asin}, attempt {attempt}/4: {type(exc).__name__}")
+            if attempt == 4 or page.is_closed() or stop.wait(2 ** (attempt - 1)):
+                return None
+
+
+def detail_worker_loop(stop, page, pending_only):
+    sequence = 0
+    with db() as conn:
+        while not stop.is_set():
+            claim = claim_product_detail(conn, pending_only, sequence % 4 != 3)
+            if not claim:
+                stop.wait(3)
+                continue
+            sequence += 1
+            _, asin, url, price, _ = claim
+            snapshot = read_product_snapshot(stop, page, url, asin, price)
+            result = record_product_detail(conn, claim, snapshot)
+            if result is None:
+                continue
+            revision, next_seconds, alert = result
+            delivered = False
+            if alert:
+                try:
+                    send_product_alert(*alert)
+                    delivered = True
+                except Exception as exc:
+                    print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
+                    next_seconds = 45
+            finish_product_detail(conn, claim, revision, next_seconds, delivered)
+            if page.is_closed():
+                return
+            stop.wait(1)
+
+
+def product_detail_worker(stop, browser_channel, pending_only):
+    with requests.Session() as session:
+        TELEGRAM.session = session
+        while not stop.is_set():
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True, channel=browser_channel)
+                    context = browser.new_context(locale="en-US", timezone_id="Asia/Riyadh", service_workers="block")
+                    context.route("**/*", lambda route: (
+                        route.abort() if route.request.resource_type in {"image", "font", "media"} else route.continue_()
+                    ))
+                    page = context.new_page()
+                    print("Amazon product offer worker started.")
+                    detail_worker_loop(stop, page, pending_only)
+            except Exception as exc:
+                # Do not log request URLs, as exceptions can contain credentials.
+                print(f"Amazon product offer worker restarting: {type(exc).__name__}")
+                stop.wait(5)
+
+
+def wait_for_pending_alerts(stop):
+    deadline = time.monotonic() + 60
+    with db() as conn:
+        while not stop.is_set() and time.monotonic() < deadline:
+            with conn.transaction():
+                ready = conn.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                        WHERE p.active AND d.present AND d.pending_alert IS NOT NULL AND d.detail_due_at<=now()
+                    )
+                """).fetchone()[0]
+            if not ready:
+                return
+            stop.wait(2)
 
 
 def scan_loop(continuous, browser_channel=None):
@@ -1101,13 +1257,25 @@ def run(continuous, prepare=False):
         raise RuntimeError("Missing required green tracker database or Telegram settings.")
     init_db()
     stop = Event()
+    detail_threads = []
     worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
     worker.start()
     try:
         browser_channel = prepare_browser() if prepare else None
+        for index in range(DETAIL_WORKERS):
+            detail = Thread(
+                target=product_detail_worker, args=(stop, browser_channel, not continuous),
+                name=f"product-offers-{index + 1}", daemon=True,
+            )
+            detail.start()
+            detail_threads.append(detail)
         scan_loop(continuous, browser_channel)
+        if not continuous:
+            wait_for_pending_alerts(stop)
     finally:
         stop.set()
+        for detail in detail_threads:
+            detail.join(timeout=1)
 
 
 if __name__ == "__main__":
