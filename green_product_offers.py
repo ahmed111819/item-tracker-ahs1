@@ -26,10 +26,10 @@ AMOUNT = r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)"
 CURRENCY = r"(?:SAR|SR|ريال(?: سعودي)?|ر\.?\s*س\.?|﷼)"
 MONEY = rf"(?:{CURRENCY}\s*{AMOUNT}|{AMOUNT}\s*{CURRENCY})"
 SPEND_LIMIT = re.compile(
-    rf"(?:when you (?:spend|buy)|when spending|minimum (?:order|spend)(?: of)?"
+    rf"(?:when you (?:spend|buy)|when spending|minimum (?:order|spend)(?: of)?|(?:off\s+)?(?:on\s+)?orders?(?:\s+of)?"
     rf"|(?:عند|مع)\s+(?:شراء|الشراء|إنفاق|انفاق)\s*(?:ب(?:ـ|قيمة|مبلغ)?)?"
     rf"|(?:على\s+)?(?:الطلبات|طلب)\s+بقيمة|(?:ب)?حد\s+أدنى(?:\s+للشراء)?)"
-    rf"\s*[:：]?\s*{MONEY}(?:\s*(?:or more|and above|أو أكثر|او اكثر|فأكثر))?"
+    rf"\s*[:：]?\s*{MONEY}(?:\s*(?:\+|or more|and above|أو أكثر|او اكثر|فأكثر))?"
     rf"(?:\s+(?:of|on)\s+(?:select|selected|eligible)\s+(?:items|products))?",
     re.I,
 )
@@ -222,14 +222,29 @@ def parse_detail_offers(snippets, price):
     return offers
 
 
+def free_bundle_signature(title):
+    text = normalize_text(title or "").casefold().strip(" .")
+    same_cost = re.fullmatch(r"(?:get\s+)?(\d+)\s+for\s+the\s+price\s+of\s+(\d+)", text)
+    if same_cost:
+        total, paid = map(int, same_cost.groups())
+        return (total, paid) if 0 < paid < total else None
+    free_units = re.fullmatch(r"buy\s+(\d+)\s*(?:,\s*)?(?:and\s+)?get\s+(\d+)\s+free", text)
+    if free_units:
+        paid, free = map(int, free_units.groups())
+        return (paid + free, paid) if paid and free else None
+    return None
+
+
 def without_green_duplicate(offers, green_title):
     title = normalize_text(green_title or "").casefold().strip(" .")
     green_code = CODE.search(title)
+    green_bundle = free_bundle_signature(title)
     return {
         key: offer for key, offer in offers.items()
         if not BANK_TERMS.search(offer["label"])
         and not (title and normalize_text(offer["label"]).casefold().strip(" .") == title)
         and not (green_code and offer["code"] == green_code[1].upper())
+        and not (green_bundle and not offer["code"] and free_bundle_signature(offer["label"]) == green_bundle)
     }
 
 
@@ -323,6 +338,13 @@ def offer_totals(price, green_title, green, additional):
     categories = {}
     for offer in additional.values():
         category = offer["category"]
+        if spend_only and category == "checkout" and offer["rate"] is not None:
+            other_minimum, other_cap, _ = pricing_terms(offer["label"])
+            if (other_minimum == minimum and other_cap == cap
+                    and Decimal(str(offer["rate"])) == Decimal(str(green["percent"]))):
+                # The detail view may publish the same basket promotion with its code.
+                # Keep it visible, but do not assume two identical basket tiers stack.
+                continue
         conditional = conditional_percentage_offer(offer) if not offer["stackable_estimate"] else None
         cap = None
         rate = offer["rate"]
