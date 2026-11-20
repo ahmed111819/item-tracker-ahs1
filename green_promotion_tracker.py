@@ -1220,6 +1220,13 @@ def read_product_attempt(page, url, asin, price, attempt):
         return None, reason, delay
 
 
+def should_restart_detail_browser(reason):
+    return bool(reason) and (
+        reason.startswith("انتهت مهلة")
+        or reason in {"TimeoutError", "TargetClosedError", "BrowserClosedError"}
+    )
+
+
 def detail_worker_loop(stop, page, detail_round, pending_only):
     sequence = 0
     finished = 0
@@ -1241,9 +1248,11 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                 return
             attempt = previous_attempts + 1
             snapshot, reason, delay = read_product_attempt(page, url, asin, price, attempt)
+            restart_browser = page.is_closed() or should_restart_detail_browser(reason)
             if snapshot is None and attempt < 4:
                 defer_product_retry(conn, claim, round_at, attempt, delay)
-                if page.is_closed():
+                if restart_browser:
+                    print("Reopening product browser after a load or browser failure.")
                     return
                 continue
 
@@ -1270,7 +1279,8 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                 except Exception as exc:
                     print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
             finish_product_detail(conn, claim, revision, round_at, delivered)
-            if page.is_closed():
+            if restart_browser or page.is_closed():
+                print("Reopening product browser after a load or browser failure.")
                 return
 
 
@@ -1285,9 +1295,12 @@ def product_detail_worker(stop, browser_channel, detail_round, pending_only):
                     context.route("**/*", lambda route: (
                         route.abort() if route.request.resource_type in {"image", "font", "media"} else route.continue_()
                     ))
-                    page = context.new_page()
-                    print("Amazon product offer worker started.")
-                    detail_worker_loop(stop, page, detail_round, pending_only)
+                    try:
+                        page = context.new_page()
+                        print("Amazon product offer worker started.")
+                        detail_worker_loop(stop, page, detail_round, pending_only)
+                    finally:
+                        browser.close()
             except Exception as exc:
                 # Do not log request URLs, as exceptions can contain credentials.
                 print(f"Amazon product offer worker restarting: {type(exc).__name__}")
