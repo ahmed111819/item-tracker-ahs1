@@ -903,6 +903,46 @@ def show_more_button(page):
     return None
 
 
+NEXT_PROMOTION_BATCH = r"""
+previous => {
+    const seen = new Set(previous);
+    return [...document.querySelectorAll('[data-asin]')].some(card => {
+        const asin = (card.getAttribute('data-asin') || '').trim();
+        return /^[A-Z0-9]{10}$/.test(asin) && !seen.has(asin);
+    });
+}
+"""
+SHOW_MORE_ATTEMPTS = 6
+
+
+def load_next_promotion_batch(page, previous):
+    more = show_more_button(page)
+    if more is None or not more.is_enabled(timeout=1500):
+        return False
+
+    for attempt in range(1, SHOW_MORE_ATTEMPTS + 1):
+        try:
+            if not page.evaluate(NEXT_PROMOTION_BATCH, previous):
+                # Amazon can redraw the button or finish a previous request between attempts.
+                more = show_more_button(page)
+                if more is not None and more.is_enabled(timeout=1500):
+                    wait_for_amazon_slot()
+                    if not page.evaluate(NEXT_PROMOTION_BATCH, previous):
+                        more.click(timeout=2500)
+                handle = page.wait_for_function(
+                    NEXT_PROMOTION_BATCH, arg=previous,
+                    timeout=12000 if attempt == SHOW_MORE_ATTEMPTS else 4000,
+                )
+                handle.dispose()
+        except PlaywrightTimeout:
+            if attempt == SHOW_MORE_ATTEMPTS:
+                raise
+            print(f"No new products after Show More attempt {attempt}/{SHOW_MORE_ATTEMPTS}; retrying on the same page.")
+            continue
+        page.wait_for_timeout(700)
+        return True
+
+
 class PromotionPageUnavailable(RuntimeError):
     """Amazon did not provide a usable promotion listing."""
 
@@ -986,25 +1026,10 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
                 print(f"Promotion batch {batch + 1} processed in {time.monotonic() - batch_start:.2f}s")
 
                 try:
-                    more = show_more_button(page)
-                    if more is None or not more.is_enabled():
+                    previous = list({card["asin"] for card in snapshots})
+                    if not load_next_promotion_batch(page, previous):
                         print("No enabled 'show more' control; reached the end of the offer.")
                         break
-                    previous = list({card["asin"] for card in snapshots})
-                    wait_for_amazon_slot()
-                    more.click(timeout=5000)
-                    page.wait_for_function(
-                        """previous => {
-                            const seen = new Set(previous);
-                            return [...document.querySelectorAll('[data-asin]')].some(card => {
-                                const asin = (card.getAttribute('data-asin') || '').trim();
-                                return /^[A-Z0-9]{10}$/.test(asin) && !seen.has(asin);
-                            });
-                        }""",
-                        arg=previous,
-                        timeout=12000,
-                    )
-                    page.wait_for_timeout(700)
                 except PlaywrightError as exc:
                     raise RuntimeError(
                         f"Could not load next batch after {len(products)} products: {str(exc).splitlines()[0]}"
