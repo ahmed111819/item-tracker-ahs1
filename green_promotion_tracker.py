@@ -34,7 +34,7 @@ from green_product_offers import (
     AMAZON_VERIFICATION_REASONS, BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
     duplicates_green_spend, format_offer_alert, free_bundle_signature, green_offer_key,
     has_notifiable_combination, is_quiet_offer,
-    new_notifiable_offers, read_detail_offers, without_green_duplicate,
+    new_notifiable_offers, parse_detail_offers, read_detail_snippets, without_green_duplicate,
 )
 
 TOKEN = os.getenv("GREEN_DEALS_TELEGRAM_BOT_TOKEN", "")
@@ -64,17 +64,35 @@ class DetailRound:
         self.detail_at = None
         self.outcome_lock = Lock()
         self.rejections = 0
+        self.snippets = {}
+        self.detail_locks = {}
 
     def start(self, round_at, detail_at, listings_done=False):
         with self.outcome_lock:
             self.started_at = round_at
             self.detail_at = detail_at
             self.rejections = 0
+            self.snippets.clear()
+            self.detail_locks.clear()
         if listings_done:
             self.listings_done.set()
         else:
             self.listings_done.clear()
         self.ready.set()
+
+    def read_product(self, detail_at, key, read):
+        with self.outcome_lock:
+            lock = self.detail_locks.setdefault(key, Lock())
+        with lock:
+            with self.outcome_lock:
+                if detail_at == self.detail_at and key in self.snippets:
+                    return (self.snippets[key], None, 0), True
+            result = read()
+            if result[0] is not None:
+                with self.outcome_lock:
+                    if detail_at == self.detail_at:
+                        self.snippets[key] = result[0]
+            return result, False
 
     def note_outcome(self, listings_round, rejected):
         with self.outcome_lock:
@@ -240,11 +258,20 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS detail_failure_count integer NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS detail_round_at timestamptz,
                 ADD COLUMN IF NOT EXISTS detail_attempt_round timestamptz,
-                ADD COLUMN IF NOT EXISTS detail_attempts integer NOT NULL DEFAULT 0
+                ADD COLUMN IF NOT EXISTS detail_attempts integer NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS delivery_payload jsonb,
+                ADD COLUMN IF NOT EXISTS delivery_revision bigint,
+                ADD COLUMN IF NOT EXISTS delivery_due_at timestamptz NOT NULL DEFAULT now(),
+                ADD COLUMN IF NOT EXISTS delivery_lease_until timestamptz,
+                ADD COLUMN IF NOT EXISTS delivery_attempts integer NOT NULL DEFAULT 0
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS green_deal_detail_due_idx
             ON green_deal_products (detail_due_at, page_id, asin) WHERE present
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS green_deal_delivery_due_idx
+            ON green_deal_products (delivery_due_at, page_id, asin) WHERE delivery_payload IS NOT NULL
         """)
 
 
@@ -338,7 +365,9 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             image_bytes = image_response.content
             if not image_bytes or len(image_bytes) > 8 * 1024 * 1024:
                 raise RuntimeError("Product image is empty or exceeds 8 MiB.")
-
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            print(f"Could not download product image for {asin}; sending text: {type(exc).__name__}")
+        else:
             data = {
                 "chat_id": CHAT_ID,
                 "caption": message_text,
@@ -357,9 +386,6 @@ def send_product_alert(caption, product_url, image_url, asin, price):
             if not response.ok or not result.get("ok"):
                 raise RuntimeError(result.get("description", "Telegram sendPhoto failed"))
             return True
-        except Exception as exc:
-            print(f"Product photo upload failed: {type(exc).__name__}")
-            raise RuntimeError("تعذر رفع صورة المنتج إلى تيليجرام") from exc
 
     send(message_text, markup, parse_mode="HTML", disable_preview=True)
     return True
@@ -445,7 +471,7 @@ def show_help(message=None):
         "<b>إدارة الصفحات</b>\n"
         "/add رابط | اسم العرض — إضافة صفحة\n"
         "/pages — الصفحات المتابعة\n"
-        "/status — حالة الفحص",
+        "/status أو /check — حالة الفحص",
         "<b>إدارة المنتجات</b>\n"
         "/following — المنتجات المتابَعة\n"
         "/blocked — المنتجات المحجوبة\n"
@@ -493,6 +519,39 @@ def show_product_menu(view, page=0, message=None):
     menu_message(lines, buttons + menu_navigation(view, page, len(rows) > MENU_SIZE), message)
 
 
+def scan_status_summary(conn):
+    row = conn.execute("""
+        SELECT cycle.listings_done, cycle.rest_until,
+               count(d.asin) FILTER (
+                   WHERE d.price>0 AND d.detail_round_at IS DISTINCT FROM
+                         COALESCE(cycle.detail_cycle_at, cycle.round_at)
+                     AND d.delivery_revision IS DISTINCT FROM d.pending_revision
+               ),
+               (SELECT count(*) FROM green_deal_pages
+                WHERE active AND scan_retry_after>now()),
+               count(d.asin) FILTER (
+                   WHERE d.delivery_payload IS NOT NULL AND d.delivery_revision=d.pending_revision
+               )
+        FROM green_deal_scan_cycle cycle
+        LEFT JOIN green_deal_pages p ON p.active
+        LEFT JOIN green_deal_products d ON d.page_id=p.id AND d.present
+        WHERE cycle.singleton
+        GROUP BY cycle.listings_done,cycle.rest_until
+    """).fetchone()
+    if row is None:
+        return "بانتظار أول جولة."
+    listings_done, rest_until, remaining, retrying, queued = row
+    if rest_until:
+        next_scan = rest_until.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%I:%M %p")
+        phase = (f"☕ راحة · الجولة القادمة {next_scan}" if rest_until > datetime.now(timezone.utc)
+                 else "⏳ حان موعد الجولة القادمة")
+    elif listings_done:
+        phase = f"🔎 فحص تفاصيل المنتجات · المتبقي {remaining}"
+    else:
+        phase = f"📋 فحص صفحات العروض · {remaining} منتج متبقّي حاليًا"
+    return f"{phase}\n↻ صفحات بانتظار المحاولة: {retrying}\n📬 تنبيهات بانتظار الإرسال: {queued}"
+
+
 def show_pages(view="pages", page=0, message=None):
     query = """
         SELECT p.id, p.url, p.active, p.title, p.expires_on, p.last_checked_at,
@@ -510,8 +569,12 @@ def show_pages(view="pages", page=0, message=None):
             page = 0
             rows = conn.execute(query, (MENU_SIZE + 1, 0)).fetchall()
 
+        summary = scan_status_summary(conn) if view == "status" else None
+
     status_view = view == "status"
     lines = ["<b>🔎 حالة الفحص</b>" if status_view else "<b>📋 الصفحات المتابعة</b>"]
+    if summary:
+        lines.append(summary)
     buttons = []
     if not rows:
         lines.append("ما فيه صفحات عروض مضافة حاليًا.\nأضف صفحة بأمر /add.")
@@ -569,8 +632,7 @@ def command(update):
     if not words:
         return
     name = words[0].split("@", 1)[0]
-    if name == "/favorites":
-        name = "/following"
+    name = {"/favorites": "/following", "/check": "/status"}.get(name, name)
     argument = words[1].strip() if len(words) > 1 else ""
     if name == "/add":
         if argument:
@@ -1266,6 +1328,8 @@ def claim_product_detail(conn, detail_at, listings_round, listings_done, pending
                   AND (%s OR d.last_seen_at>=%s)
                   AND (d.detail_lease_until IS NULL OR d.detail_lease_until<=now())
                   AND (NOT %s OR d.pending_alert IS NOT NULL)
+                  AND d.delivery_revision IS DISTINCT FROM d.pending_revision
+                  AND (d.delivery_lease_until IS NULL OR d.delivery_lease_until<=now())
                 ORDER BY (%s AND d.pending_alert IS NOT NULL) DESC,
                          d.detail_failure_count,d.detail_due_at,d.page_id,d.asin
                 LIMIT 1 FOR UPDATE OF d SKIP LOCKED
@@ -1442,31 +1506,121 @@ def record_product_detail(conn, claim, snapshot):
     return revision, (body, url, pending_image or image, asin, alert_price)
 
 
-def finish_product_detail(conn, claim, revision, round_at, handled, sent):
+def finish_product_detail(conn, claim, revision, round_at, alert):
     page_id, asin, _, _, lease, _ = claim
     with conn.transaction():
         updated = conn.execute("""
             UPDATE green_deal_products
             SET detail_lease_until=NULL,detail_attempt_round=NULL,detail_attempts=0,
                 detail_round_at=CASE WHEN pending_revision<>%s AND pending_alert IS NOT NULL THEN NULL ELSE %s END,
-                detail_due_at=now(),
-                pending_alert=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_alert END,
-                pending_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_url END,
-                pending_image_url=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_image_url END,
-                pending_new_offers=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_new_offers END,
-                pending_price=CASE WHEN pending_revision=%s AND %s THEN NULL ELSE pending_price END
+                detail_due_at=now()
             WHERE page_id=%s AND asin=%s AND detail_lease_until=%s
-        """, (revision, round_at, *((revision, handled) * 5), page_id, asin, lease))
-        if sent:
+        """, (revision, round_at, page_id, asin, lease))
+        if updated.rowcount and alert:
+            body, url, image, _, price = alert
+            conn.execute("""
+                UPDATE green_deal_products SET delivery_payload=%s,delivery_revision=%s,
+                    delivery_due_at=now(),delivery_lease_until=NULL,delivery_attempts=0
+                WHERE page_id=%s AND asin=%s AND pending_revision=%s AND pending_alert IS NOT NULL
+                  AND delivery_revision IS DISTINCT FROM pending_revision
+            """, (Jsonb([body, url, image, str(price)]), revision, page_id, asin, revision))
+
+
+def claim_alert_delivery(conn):
+    with conn.transaction():
+        return conn.execute("""
+            WITH next_delivery AS (
+                SELECT d.page_id,d.asin FROM green_deal_products d
+                JOIN green_deal_pages p ON p.id=d.page_id
+                WHERE p.active AND d.present AND d.delivery_payload IS NOT NULL
+                  AND d.pending_alert IS NOT NULL AND d.delivery_revision=d.pending_revision
+                  AND d.delivery_due_at<=now()
+                  AND (d.delivery_lease_until IS NULL OR d.delivery_lease_until<=now())
+                ORDER BY d.delivery_due_at,d.page_id,d.asin
+                LIMIT 1 FOR UPDATE OF d SKIP LOCKED
+            )
+            UPDATE green_deal_products d
+            SET delivery_lease_until=now()+interval '2 minutes'
+            FROM next_delivery candidate
+            WHERE d.page_id=candidate.page_id AND d.asin=candidate.asin
+            RETURNING d.page_id,d.asin,d.delivery_revision,d.delivery_lease_until,
+                      d.delivery_payload,d.delivery_attempts
+        """).fetchone()
+
+
+def finish_alert_delivery(conn, claim, *, sent=False, retry=False):
+    page_id, asin, revision, lease, _, attempts = claim
+    with conn.transaction():
+        if retry:
+            delay = min(300, 15 * 2 ** min(attempts, 5))
+            conn.execute("""
+                UPDATE green_deal_products SET delivery_lease_until=NULL,
+                    delivery_attempts=delivery_attempts+1,delivery_due_at=now()+make_interval(secs=>%s)
+                WHERE page_id=%s AND asin=%s AND delivery_revision=%s AND delivery_lease_until=%s
+            """, (delay, page_id, asin, revision, lease))
+            return
+
+        updated = conn.execute("""
+            UPDATE green_deal_products SET delivery_payload=NULL,delivery_revision=NULL,
+                delivery_lease_until=NULL,delivery_attempts=0,
+                pending_alert=CASE WHEN pending_revision=%s THEN NULL ELSE pending_alert END,
+                pending_url=CASE WHEN pending_revision=%s THEN NULL ELSE pending_url END,
+                pending_image_url=CASE WHEN pending_revision=%s THEN NULL ELSE pending_image_url END,
+                pending_new_offers=CASE WHEN pending_revision=%s THEN NULL ELSE pending_new_offers END,
+                pending_price=CASE WHEN pending_revision=%s THEN NULL ELSE pending_price END
+            WHERE page_id=%s AND asin=%s AND delivery_revision=%s AND delivery_lease_until=%s
+        """, ((revision,) * 5 + (page_id, asin, revision, lease)))
+        if updated.rowcount and sent:
             conn.execute("""
                 UPDATE green_deal_offer_deliveries SET sent_at=now()
                 WHERE asin=%s AND page_id=%s AND pending_revision=%s AND sent_at IS NULL
             """, (asin, page_id, revision))
-        if updated.rowcount and sent:
             conn.execute("""
                 UPDATE green_deal_combination_alerts SET sent_at=now()
                 WHERE asin=%s AND page_id=%s AND pending_revision=%s AND sent_at IS NULL
             """, (asin, page_id, revision))
+
+
+def alert_delivery_worker(stop):
+    with requests.Session() as session:
+        TELEGRAM.session = session
+        print("Telegram alert delivery worker started.")
+        while not stop.is_set():
+            try:
+                with db() as conn:
+                    while not stop.is_set():
+                        claim = claim_alert_delivery(conn)
+                        if claim is None:
+                            stop.wait(1)
+                            continue
+                        _, asin, _, _, (body, url, image, price), _ = claim
+                        try:
+                            sent = send_product_alert(body, url, image, asin, Decimal(price))
+                        except Exception as exc:
+                            print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
+                            finish_alert_delivery(conn, claim, retry=True)
+                        else:
+                            finish_alert_delivery(conn, claim, sent=sent)
+            except Exception as exc:
+                print(f"Telegram alert delivery worker restarting: {type(exc).__name__}")
+                stop.wait(5)
+
+
+def wait_for_ready_deliveries(stop):
+    deadline = time.monotonic() + 70
+    with db() as conn:
+        while not stop.is_set() and time.monotonic() < deadline:
+            with conn.transaction():
+                ready, = conn.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                        WHERE p.active AND d.present AND d.pending_alert IS NOT NULL
+                          AND d.delivery_revision=d.pending_revision AND d.delivery_due_at<=now()
+                    )
+                """).fetchone()
+            if not ready:
+                return
+            stop.wait(1)
 
 
 def defer_product_retry(conn, claim, round_at, attempt, delay):
@@ -1480,14 +1634,14 @@ def defer_product_retry(conn, claim, round_at, attempt, delay):
         """, (round_at, attempt, delay, page_id, asin, lease))
 
 
-def read_product_attempt(page, url, asin, price, attempt):
+def read_product_attempt(page, url, asin, attempt):
     target = url if attempt == 1 else canonical_product_url(url, asin)
     wait_for_amazon_slot()
     try:
-        offers = read_detail_offers(
-            page, target, asin, price, capture_continue=continue_screenshot_capture() if attempt == 1 else None,
+        snippets = read_detail_snippets(
+            page, target, asin, capture_continue=continue_screenshot_capture() if attempt == 1 else None,
         )
-        return offers, None, 0
+        return snippets, None, 0
     except (PlaywrightError, RuntimeError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, ProductPageUnavailable) else type(exc).__name__
         verification = reason in AMAZON_VERIFICATION_REASONS
@@ -1529,11 +1683,18 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                 continue
             attempt = previous_attempts + 1
             print(f"Checking product {asin}, attempt {attempt}/4.")
-            snapshot, reason, delay = read_product_attempt(page, url, asin, price, attempt)
+            (snippets, reason, delay), reused = detail_round.read_product(
+                round_at, canonical_product_url(url, asin),
+                lambda: read_product_attempt(page, url, asin, attempt),
+            )
+            snapshot = parse_detail_offers(snippets, price) if snippets is not None else None
+            if reused:
+                print(f"Reused this round's Amazon offer data for {asin}.")
             rejected = reason in AMAZON_VERIFICATION_REASONS or bool(reason and any(
                 label in reason for label in ("HTTP 429", "HTTP 503", "صفحة اعتذار من أمازون")
             ))
-            detail_round.note_outcome(listing_round, rejected)
+            if not reused:
+                detail_round.note_outcome(listing_round, rejected)
             if snapshot is None and attempt < 4:
                 print(f"Product {asin} deferred after attempt {attempt}/4: {reason}.")
             restart_browser = page.is_closed() or should_restart_detail_browser(reason)
@@ -1558,14 +1719,7 @@ def detail_worker_loop(stop, page, detail_round, pending_only):
                     return
                 continue
             revision, alert = result
-            handled = sent = False
-            if alert and not stop.is_set():
-                try:
-                    sent = send_product_alert(*alert)
-                    handled = True
-                except Exception as exc:
-                    print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
-            finish_product_detail(conn, claim, revision, round_at, handled, sent)
+            finish_product_detail(conn, claim, revision, round_at, alert)
             if restart_browser or page.is_closed():
                 print("Reopening product browser after a load or browser failure.")
                 return
@@ -1608,6 +1762,7 @@ def wait_for_product_round(stop, round_at, pending_only):
                     WHERE p.active AND d.present AND d.price>0
                       AND d.detail_round_at IS DISTINCT FROM %s
                       AND (NOT %s OR d.pending_alert IS NOT NULL)
+                      AND d.delivery_revision IS DISTINCT FROM d.pending_revision
                 """, (round_at, round_at, pending_only)).fetchone()
             if not unfinished:
                 return True
@@ -1750,6 +1905,8 @@ def run(continuous, prepare=False):
     detail_round = DetailRound()
     worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
     worker.start()
+    delivery = Thread(target=alert_delivery_worker, args=(stop,), name="telegram-alerts", daemon=True)
+    delivery.start()
     try:
         browser_channel = prepare_browser() if prepare else None
         for index in range(DETAIL_WORKERS):
@@ -1760,8 +1917,11 @@ def run(continuous, prepare=False):
             detail.start()
             detail_threads.append(detail)
         scan_loop(stop, detail_round, continuous, browser_channel)
+        if not continuous:
+            wait_for_ready_deliveries(stop)
     finally:
         stop.set()
+        delivery.join(timeout=1)
         for detail in detail_threads:
             detail.join(timeout=1)
 

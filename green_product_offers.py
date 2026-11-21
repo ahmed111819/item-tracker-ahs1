@@ -209,7 +209,7 @@ def open_detail_snapshot(page, url, asin):
     return snapshot
 
 
-def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=None):
+def read_detail_snippets(page, product_url, asin, *, capture_continue=None):
     url = amazon_product_url(product_url, asin)
     snapshot = open_detail_snapshot(page, url, asin)
     continued = snapshot.get("error") == CONTINUE_SHOPPING and capture_continue is not None
@@ -245,7 +245,12 @@ def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=
         print(f"Reopened the requested product {asin} after Continue Shopping.")
     elif continued:
         print(f"Continue Shopping opened the requested product {asin}.")
-    return parse_detail_offers(snapshot["snippets"], unit_price)
+    return snapshot["snippets"]
+
+
+def read_detail_offers(page, product_url, asin, unit_price, *, capture_continue=None):
+    snippets = read_detail_snippets(page, product_url, asin, capture_continue=capture_continue)
+    return parse_detail_offers(snippets, unit_price)
 
 
 def is_amazon_detail_origin(parts):
