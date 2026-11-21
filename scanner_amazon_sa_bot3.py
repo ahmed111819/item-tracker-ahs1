@@ -479,9 +479,17 @@ RUN_PRICE_DROP_SIGNATURES = {}
 
 
 def save_tracking(force=False):
-    """Persist locally at each checkpoint and sync the configured backend every 10 minutes."""
+    """Save due checkpoints and always flush a forced checkpoint."""
     global _last_tracking_sync, _tracking_dirty
     tracking_data["last_updated"] = datetime.now().isoformat()
+    _tracking_dirty = True
+
+    now = time.monotonic()
+    sync_due = force or now - _last_tracking_sync >= TRACKING_SYNC_INTERVAL_SECONDS
+    # PostgreSQL is the restart source. Avoid serializing its full local copy
+    # for every page batch between durable checkpoints.
+    if STORAGE_BACKEND == "postgres" and not sync_due:
+        return
 
     # Avoid temp-file rename on the mounted Google Drive filesystem,
     # which can create another Drive item with the same filename.
@@ -493,10 +501,7 @@ def save_tracking(force=False):
             separators=(",", ":"),
         )
         f.flush()
-    _tracking_dirty = True
-
-    now = time.monotonic()
-    if not force and now - _last_tracking_sync < TRACKING_SYNC_INTERVAL_SECONDS:
+    if not sync_due:
         return
 
     # Record the attempt even when Drive rejects it, so a persistent 403
