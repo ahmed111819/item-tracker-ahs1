@@ -1,4 +1,4 @@
-"""Poll and apply Telegram inline-button callbacks for the three coupon scanners.
+"""Handle Telegram commands and inline buttons for the three coupon scanners.
 
 GitHub Actions runs exactly one listener alongside the scanners, so the shared
 Telegram bot token never has competing getUpdates consumers.
@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import time
+from functools import lru_cache
 from typing import Any
 
 import requests
@@ -36,6 +37,19 @@ ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 STOP = False
 ACKED_CALLBACKS: set[str] = set()
 HTTP = requests.Session()
+HELP_TEXT = (
+    "🛍 <b>دليل بوت عروض أمازون</b>\n\n"
+    "⌨️ <b>الأوامر</b>\n"
+    "/start — فتح الدليل\n"
+    "/help — عرض الأوامر والأزرار\n\n"
+    "🔘 <b>أزرار المنتج</b>\n"
+    "⏳ حجب مؤقت — يكتم التنبيهات لين ينخفض السعر 5٪ من سعر الحجب\n"
+    "⚙️ تعديل ← ✅ فك الحجب — يرجّع التنبيهات\n"
+    "↩️ رجوع — يرجّعك لأزرار المنتج\n\n"
+    "🔔 <b>التنبيهات</b>\n"
+    "انخفاض سعر، كوبون، عرض، وفك حجب تلقائي\n"
+    "📋 ملخص روابط العروض بعد الفحص"
+)
 
 
 def stop_listener(_signum: int, _frame: Any) -> None:
@@ -64,6 +78,27 @@ def answer(callback_id: str, text: str, show_alert: bool = False) -> None:
         )
     except Exception as exc:
         print(exc)
+
+
+@lru_cache(maxsize=1)
+def bot_username() -> str:
+    return str(telegram_call("getMe", {})["result"]["username"]).casefold()
+
+
+def handle_message(message: dict[str, Any]) -> None:
+    chat = message.get("chat") or {}
+    if str(chat.get("id", "")) != CHAT_ID:
+        return
+    fields = str(message.get("text") or "").split(maxsplit=1)
+    if not fields:
+        return
+    command, _, target = fields[0].partition("@")
+    if command not in {"/help", "/start"} or (target and target.casefold() != bot_username()):
+        return
+    payload = {"chat_id": chat["id"], "text": HELP_TEXT, "parse_mode": "HTML"}
+    if message.get("is_topic_message") and message.get("message_thread_id") is not None:
+        payload["message_thread_id"] = message["message_thread_id"]
+    telegram_call("sendMessage", payload)
 
 
 def price_from_message(message: dict[str, Any]) -> float | None:
@@ -220,7 +255,7 @@ def main() -> None:
                 {
                     "offset": offset,
                     "timeout": 20,
-                    "allowed_updates": ["callback_query"],
+                    "allowed_updates": ["callback_query", "message"],
                 },
                 timeout=30,
             )
@@ -229,10 +264,13 @@ def main() -> None:
                     break
                 try:
                     callback = update.get("callback_query")
+                    message = update.get("message")
                     if isinstance(callback, dict):
                         handle_callback(callback)
+                    elif isinstance(message, dict):
+                        handle_message(message)
                     next_offset = max(offset, int(update.get("update_id", offset)) + 1)
-                    # Commit the offset only after the callback action succeeds.
+                    # Commit the offset only after handling the update.
                     # If PostgreSQL is temporarily unavailable, Telegram will
                     # redeliver this update and the idempotent DB action retries.
                     save_telegram_update_offset(next_offset)
