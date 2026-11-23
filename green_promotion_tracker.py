@@ -206,6 +206,10 @@ def init_db():
           round_at timestamptz NOT NULL, listings_done boolean NOT NULL DEFAULT false,
           rest_until timestamptz
         );
+        CREATE TABLE IF NOT EXISTS green_deal_scan_stats (
+          singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+          last_round jsonb, last_alert_at timestamptz
+        );
         CREATE TABLE IF NOT EXISTS green_deal_product_blocks (asin text PRIMARY KEY, blocked_price numeric NOT NULL, resume_price numeric NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS green_deal_product_preferences (asin text PRIMARY KEY, favorite boolean NOT NULL DEFAULT false, following boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS green_deal_products (
@@ -246,7 +250,8 @@ def init_db():
         conn.execute("""
             ALTER TABLE green_deal_pages
                 ADD COLUMN IF NOT EXISTS scan_failures integer NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS scan_retry_after timestamptz
+                ADD COLUMN IF NOT EXISTS scan_retry_after timestamptz,
+                ADD COLUMN IF NOT EXISTS scan_failed_at timestamptz
         """)
         conn.execute("""
             ALTER TABLE green_deal_products
@@ -535,16 +540,18 @@ def scan_status_summary(conn):
                 WHERE active AND scan_retry_after>now()),
                count(d.asin) FILTER (
                    WHERE d.delivery_payload IS NOT NULL AND d.delivery_revision=d.pending_revision
-               )
+               ),
+               stats.last_round, stats.last_alert_at
         FROM green_deal_scan_cycle cycle
+        LEFT JOIN green_deal_scan_stats stats ON stats.singleton
         LEFT JOIN green_deal_pages p ON p.active
         LEFT JOIN green_deal_products d ON d.page_id=p.id AND d.present
         WHERE cycle.singleton
-        GROUP BY cycle.listings_done,cycle.rest_until
+        GROUP BY cycle.listings_done,cycle.rest_until,stats.last_round,stats.last_alert_at
     """).fetchone()
     if row is None:
         return "بانتظار أول جولة."
-    listings_done, rest_until, remaining, retrying, queued = row
+    listings_done, rest_until, remaining, retrying, queued, last_round, last_alert_at = row
     if rest_until:
         next_scan = rest_until.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%I:%M %p")
         phase = (f"☕ راحة · الجولة القادمة {next_scan}" if rest_until > datetime.now(timezone.utc)
@@ -553,7 +560,15 @@ def scan_status_summary(conn):
         phase = f"🔎 فحص تفاصيل المنتجات · المتبقي {remaining}"
     else:
         phase = f"📋 فحص صفحات العروض · {remaining} منتج متبقّي حاليًا"
-    return f"{phase}\n↻ صفحات بانتظار المحاولة: {retrying}\n📬 تنبيهات بانتظار الإرسال: {queued}"
+    summary = f"{phase}\n↻ صفحات بانتظار المحاولة: {retrying}\n📬 تنبيهات بانتظار الإرسال: {queued}"
+    if last_round:
+        minutes, seconds = divmod(last_round["seconds"], 60)
+        summary += (f"\n\n📊 آخر جولة · {minutes} د {seconds:02d} ث"
+                    f"\nمنتجات انقرأت {last_round['products']} · صفحات تعثرت {last_round['pages_failed']}")
+    if last_alert_at:
+        sent_time = last_alert_at.astimezone(ZoneInfo("Asia/Riyadh")).strftime("%d-%m %I:%M %p")
+        summary += f"\n🔔 آخر تنبيه مؤكّد {sent_time}"
+    return summary
 
 
 def show_pages(view="pages", page=0, message=None):
@@ -1699,6 +1714,10 @@ def finish_alert_delivery(conn, claim, *, sent=False, retry=False):
         """, ((revision,) * 5 + (page_id, asin, revision, lease)))
         if updated.rowcount and sent:
             conn.execute("""
+                INSERT INTO green_deal_scan_stats(singleton,last_alert_at) VALUES (true,now())
+                ON CONFLICT (singleton) DO UPDATE SET last_alert_at=excluded.last_alert_at
+            """)
+            conn.execute("""
                 UPDATE green_deal_offer_deliveries SET sent_at=now()
                 WHERE asin=%s AND page_id=%s AND pending_revision=%s AND sent_at IS NULL
             """, (asin, page_id, revision))
@@ -1951,7 +1970,7 @@ def scan_promotion_pages(stop, browser_channel):
                         UPDATE green_deal_pages
                         SET last_error=%s,scan_started_at=NULL,
                             scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
-                            scan_failures=scan_failures+1
+                            scan_failures=scan_failures+1,scan_failed_at=now()
                         WHERE id=%s AND active RETURNING LEAST(30,5*scan_failures)
                     """, (detail, page_id)).fetchone()
                 if row:
@@ -1977,6 +1996,27 @@ def begin_continuous_round(stop):
         if rest_seconds > 0:
             stop.wait(float(rest_seconds))
     return None
+
+
+def complete_scan_round(conn, round_at, detail_at):
+    updated = conn.execute("""
+        UPDATE green_deal_scan_cycle
+        SET rest_until=now()+make_interval(secs=>%s), detail_cycle_at=NULL
+        WHERE singleton AND round_at=%s AND rest_until IS NULL
+    """, (WAIT_SECONDS, round_at))
+    if not updated.rowcount:
+        return
+    conn.execute("""
+        INSERT INTO green_deal_scan_stats(singleton,last_round)
+        SELECT true,jsonb_build_object(
+            'seconds',GREATEST(0,floor(EXTRACT(EPOCH FROM now()-%s::timestamptz)))::integer,
+            'products',(SELECT count(DISTINCT asin) FROM green_deal_products
+                        WHERE detail_round_at=%s AND detail_failure_count=0),
+            'pages_failed',(SELECT count(*) FROM green_deal_pages
+                            WHERE scan_failed_at>=%s AND scan_failed_at<=now())
+        )
+        ON CONFLICT (singleton) DO UPDATE SET last_round=excluded.last_round
+    """, (round_at, detail_at, round_at))
 
 
 def scan_loop(stop, detail_round, continuous, browser_channel=None):
@@ -2007,11 +2047,7 @@ def scan_loop(stop, detail_round, continuous, browser_channel=None):
         if not continuous or not completed or stop.is_set():
             return
         with db() as conn:
-            conn.execute("""
-                UPDATE green_deal_scan_cycle
-                SET rest_until=now()+make_interval(secs=>%s), detail_cycle_at=NULL
-                WHERE singleton AND round_at=%s
-            """, (WAIT_SECONDS, round_at))
+            complete_scan_round(conn, round_at, detail_at)
         print(f"Product scan completed. Resting for {WAIT_SECONDS}s.")
 
 

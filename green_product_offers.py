@@ -77,7 +77,7 @@ def canonical_product_url(value, asin):
 
 
 PRODUCT_DETAIL_SNAPSHOT = r"""
-({regions, expected}) => {
+({regions, expected, waitForOffers}) => {
     if (document.readyState === 'loading') return false;
     const heading = document.querySelector(
         '#productTitle, #title_feature_div h1, #title_feature_div #title, '
@@ -136,24 +136,32 @@ PRODUCT_DETAIL_SNAPSHOT = r"""
     const blocks = [...document.querySelectorAll(regions)];
     const visible = blocks.filter(node => node.getClientRects().length
         && getComputedStyle(node).visibility !== 'hidden');
-    return {asin: asin || null, snippets: visible.filter(node =>
+    const snippets = visible.filter(node =>
         !visible.some(other => other !== node && other.contains(node))
-    ).map(node => node.innerText.trim()).filter(Boolean)};
+    ).map(node => node.innerText.trim()).filter(Boolean);
+    const loading = '[aria-busy="true"], [data-loading="true"], .a-spinner';
+    const offersLoading = visible.some(node => node.matches(loading)
+        || [...node.querySelectorAll(loading)].some(indicator => indicator.getClientRects().length));
+    if (waitForOffers && (!snippets.length || offersLoading)) return false;
+    return {asin: asin || null, snippets, offersLoading, ready: document.readyState === 'complete'};
 }
 """
 
 
-def wait_for_detail_snapshot(page, asin):
+def wait_for_detail_snapshot(page, asin, *, wait_for_offers=False):
     try:
         handle = page.wait_for_function(
-            PRODUCT_DETAIL_SNAPSHOT, arg={"regions": DETAIL_REGIONS, "expected": asin},
-            polling=200, timeout=7500,
+            PRODUCT_DETAIL_SNAPSHOT,
+            arg={"regions": DETAIL_REGIONS, "expected": asin, "waitForOffers": wait_for_offers},
+            polling=200, timeout=1400 if wait_for_offers else 7500,
         )
         try:
             return handle.json_value()
         finally:
             handle.dispose()
     except PlaywrightTimeout as exc:
+        if wait_for_offers:
+            return page.evaluate(PRODUCT_DETAIL_SNAPSHOT, {"regions": DETAIL_REGIONS, "expected": asin}) or {}
         raise ProductPageUnavailable("انتهت مهلة ظهور بيانات المنتج بعد فتح الرابط") from exc
 
 
@@ -230,7 +238,18 @@ def read_detail_snippets(page, product_url, asin, *, capture_continue=None):
         except ProductPageUnavailable as exc:
             print(f"Continue Shopping did not open {asin}: {exc}.")
             raise
-    asin_match = PRODUCT_PAGE.search(urlsplit(page.url).path)
+    if "snippets" in snapshot and (not snapshot["snippets"] or snapshot["offersLoading"]):
+        snapshot = wait_for_detail_snapshot(page, asin, wait_for_offers=True)
+        incomplete = "snippets" in snapshot and (
+            snapshot["offersLoading"] or not snapshot["snippets"] and not snapshot["ready"]
+        )
+        if not snapshot or incomplete:
+            raise ProductPageUnavailable("قسم عروض المنتج ما اكتمل تحميله")
+
+    final = urlsplit(page.url)
+    if not is_amazon_detail_origin(final):
+        raise ProductPageUnavailable("أمازون حوّل الرابط إلى نطاق آخر")
+    asin_match = PRODUCT_PAGE.search(final.path)
     reason = snapshot.get("error")
     if snapshot.get("home"):
         reason = "أمازون فتح الصفحة الرئيسية بدل المنتج"
