@@ -15,6 +15,7 @@ LABELS = {
     "AMAZON_NEXT_DISABLED": "اكتمل", "CONFIRMED_EMPTY_END_PAGE": "اكتمل",
     "MAX_PAGES_SAFETY_CAP": "بلغ حد الصفحات",
     "REPEATED_RESULT_PAGES": "توقّف بسبب تكرار النتائج",
+    "RECOVERED_PAGE_TAIL_UNSCANNED": "استعيدت الصفحة وبقية الرابط غير مكتملة",
 }
 
 

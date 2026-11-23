@@ -34,7 +34,7 @@ from telegram_product_buttons import edit_product_keyboard, product_keyboard
 from deal_offer_rules import (
     offer_payable_details, record_unrecognized, reviewed_promotion_details, select_qualifying_offer,
 )
-from scan_pagination import RepeatedPages, next_page_url
+from scan_pagination import RepeatedPages, next_page_url, prioritized_searches, retry_failed_page
 from promotion_digest import record_promotion_links
 from scan_link_report import classify_card_for_report, new_page_metrics, record_event
 from deal_parser_v2 import classify_deals, extract_reference_price as parse_reference_price, parse_price as parse_deal_price
@@ -1368,7 +1368,7 @@ async def process_card(snapshot, search_url, page_number, index, search_index, m
 # SCAN ONE PAGE
 # ------------------------------------------------------------
 
-async def _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override=None):
+async def _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override=None, attempt_limit=None):
     """Scan one page. A disabled Next button is strong end-of-results evidence.
 
     A 503, CAPTCHA, error page, or unconfirmed empty page is never treated as
@@ -1394,10 +1394,12 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
     try:
         cards = page.locator('[data-component-type="s-search-result"]')
 
-        for attempt in range(1, MAX_ATTEMPTS_PER_PAGE + 1):
+        attempts = MAX_ATTEMPTS_PER_PAGE if attempt_limit is None else attempt_limit
+        last_failure = "unconfirmed page"
+        for attempt in range(1, attempts + 1):
             print(
                 f"\nSearch {search_index}, page {page_number}, "
-                f"attempt {attempt}/{MAX_ATTEMPTS_PER_PAGE}"
+                f"attempt {attempt}/{attempts}"
             )
             print("URL:", page_url)
 
@@ -1474,6 +1476,13 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
                     or status in {403, 408, 425, 429, 503}
                     or (status is not None and status >= 500)
                 )
+
+                if status != 200:
+                    last_failure = f"HTTP {status}"
+                elif is_amazon_error or likely_error_title:
+                    last_failure = "Amazon error page"
+                else:
+                    last_failure = "HTTP 200 without confirmed product results"
 
                 if status == 200 and count > 0 and not is_amazon_error:
                     total_pages = await extract_total_page_count(page) if page_number == 1 else None
@@ -1577,9 +1586,10 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
                         print(body_text[:500])
 
             except Exception as e:
+                last_failure = type(e).__name__
                 print(f"Page load/extraction error: {type(e).__name__}: {e}")
 
-            if attempt < MAX_ATTEMPTS_PER_PAGE:
+            if attempt < attempts:
                 delay = RETRY_DELAYS_SECONDS[
                     min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)
                 ]
@@ -1588,9 +1598,9 @@ async def _scan_one_page(context, search_url, page_number, search_index, metrics
 
         print(
             f"❌ Page {page_number} could not be confirmed after "
-            f"{MAX_ATTEMPTS_PER_PAGE} attempts. Keeping it resumable."
+            f"{attempts} attempts ({last_failure})."
         )
-        return empty_result(success=False, empty=False, end_confirmed=False)
+        return {**empty_result(success=False), "failure_reason": last_failure}
 
     finally:
         try:
@@ -1605,14 +1615,14 @@ PAGE_SEMAPHORE = None
 PRODUCT_SEMAPHORE = None
 
 
-async def scan_one_page(context, search_url, page_number, search_index, page_url_override=None):
+async def scan_one_page(context, search_url, page_number, search_index, page_url_override=None, attempt_limit=None):
     metrics = new_page_metrics()
     try:
         if PAGE_SEMAPHORE is None:
-            result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override)
+            result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override, attempt_limit)
         else:
             async with PAGE_SEMAPHORE:
-                result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override)
+                result = await _scan_one_page(context, search_url, page_number, search_index, metrics, page_url_override, attempt_limit)
     except Exception:
         report_page(search_index, search_url, page_number, {}, metrics)
         raise
@@ -1683,33 +1693,20 @@ async def scan_one_search(context, search_url, search_index):
                     result = error
                 listing_asins = result.get("listing_asins", result.get("asins", set())) if isinstance(result, dict) else set()
 
-            if isinstance(result, Exception):
+            if isinstance(result, Exception) or not result.get("success"):
+                reason = (type(result).__name__ if isinstance(result, Exception)
+                          else result.get("failure_reason", "unconfirmed page"))
                 tracking_data["scan_state"][search_url] = {
                     "next_page": number,
                     "total_pages": reported_total_pages,
                     "completed": False,
+                    "end_reason": "failed",
+                    "failure_reason": reason,
+                    "deferred_next_url": previous_next_url,
                     "last_error_at": datetime.now().isoformat(),
                 }
                 save_tracking()
-                print(
-                    f"Search {search_index}: page {number} raised "
-                    f"{type(result).__name__}; saved it as the resume point."
-                )
-                stop_search = True
-                break
-
-            if not result.get("success"):
-                tracking_data["scan_state"][search_url] = {
-                    "next_page": number,
-                    "total_pages": reported_total_pages,
-                    "completed": False,
-                    "last_error_at": datetime.now().isoformat(),
-                }
-                save_tracking()
-                print(
-                    f"Search {search_index}: page {number} was not confirmed. "
-                    "Saved resume position; it will retry next run."
-                )
+                print(f"Search {search_index}: deferring page {number} ({reason}) to the end of the scan.")
                 stop_search = True
                 break
 
@@ -1882,8 +1879,12 @@ async def scan_all_searches():
             search_results = [None] * len(SEARCH_URLS)
             search_queue = asyncio.Queue()
 
-            for queue_index, queue_url in enumerate(SEARCH_URLS):
-                search_queue.put_nowait((queue_index, queue_url))
+            scan_states = tracking_data["scan_state"]
+            previous_durations = tracking_data.get("search_duration_seconds", {})
+            durations = {url: previous_durations[url] for url in SEARCH_URLS if url in previous_durations}
+            tracking_data["search_duration_seconds"] = durations
+            for job in prioritized_searches(SEARCH_URLS, durations, scan_states):
+                search_queue.put_nowait(job)
 
             worker_count = min(MAX_CONCURRENT_PAGES, len(SEARCH_URLS))
             for _ in range(worker_count):
@@ -1899,12 +1900,16 @@ async def scan_all_searches():
                         queue_index, queue_url = job
                         search_index = queue_index + 1
 
+                        started = time.monotonic()
                         try:
                             search_results[queue_index] = await scan_one_search(
                                 context,
                                 queue_url,
                                 search_index,
                             )
+                            elapsed = time.monotonic() - started
+                            prior = durations.get(queue_url)
+                            durations[queue_url] = (prior + elapsed) / 2 if isinstance(prior, (int, float)) and prior > 0 else elapsed
                         except Exception as e:
                             search_results[queue_index] = e
                             record_event(BOT_ID, search_index, queue_url, kind="finish", status="failed")
@@ -1927,6 +1932,17 @@ async def scan_all_searches():
                     continue
 
                 pages, products, alerts = result
+                search_url = SEARCH_URLS[search_index - 1]
+                recovered = await retry_failed_page(
+                    scan_one_page, context, search_url, search_index, scan_states.get(search_url, {})
+                )
+                if recovered is not None:
+                    status, extra_pages, extra_products, extra_alerts = recovered
+                    record_event(BOT_ID, search_index, search_url, kind="finish", status=status)
+                    save_tracking()
+                    pages += extra_pages
+                    products += extra_products
+                    alerts += extra_alerts
                 total_pages += pages
                 total_products += products
                 total_alerts += alerts

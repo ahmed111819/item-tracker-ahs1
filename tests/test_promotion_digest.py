@@ -74,8 +74,21 @@ class PromotionDigestTests(unittest.TestCase):
         arabic_rate, _ = saving_for("احصل على 3 بسعر 2 العرض", None)
         self.assertEqual(arabic_rate.quantize(Decimal("0.01")), Decimal("33.33"))
 
-    def test_no_eligible_overlap_still_sends_a_clear_result(self):
+    def test_no_eligible_overlap_sends_only_the_promotion_list(self):
         url = "https://www.amazon.sa/promotion/psp/A1WSIDJI0UEOX0"
         messages = build_messages({"A1WSIDJI0UEOX0": Promotion(url, "Get Extra 20% off")}, "123")
-        self.assertIn("منتجات عليها أكثر من عرض (0)", messages[1])
-        self.assertIn("تعذر استكمال قراءة منتجات 1", messages[1])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("تعذر استكمال قراءة منتجات 1", messages[0])
+
+    def test_overlap_diagnostics_distinguish_low_discounts_and_unknown_terms(self):
+        a = "B000000001"
+        b = "B000000002"
+        products = {a: ("First", 50), b: ("Second", 50)}
+        offers = {
+            "first": Promotion("https://www.amazon.sa/promotion/psp/TESTFIRST", "Save 20%", products),
+            "second": Promotion("https://www.amazon.sa/promotion/psp/TESTSECOND", "Save 5%", {a: products[a]}),
+            "third": Promotion("https://www.amazon.sa/promotion/psp/TESTTHIRD", "Promotion details", {b: products[b]}),
+        }
+        counts = {}
+        self.assertEqual(overlap_blocks(offers, counts), [])
+        self.assertEqual(counts, {"observed": 2, "below_threshold": 1, "unreadable": 1})

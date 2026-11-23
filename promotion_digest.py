@@ -249,16 +249,30 @@ def saving_for(title, price):
     return rate, False
 
 
-def overlap_blocks(promotions):
+def overlap_blocks(promotions, diagnostics=None):
     by_asin = defaultdict(list)
     for offer in promotions.values():
         for asin, (title, price) in offer.products.items():
-            saving = saving_for(offer.title, price)
-            if saving and saving[0] >= MIN_RATE:
-                by_asin[asin].append((offer, title, number(price), *saving))
+            by_asin[asin].append((offer, title, price))
     blocks = []
-    for asin, offers in sorted(by_asin.items()):
+    observed = below_threshold = unreadable = 0
+    for asin, appearances in sorted(by_asin.items()):
+        if len(appearances) < 2:
+            continue
+        observed += 1
+        offers = []
+        unknown = 0
+        for offer, title, price in appearances:
+            saving = saving_for(offer.title, price)
+            if saving is None:
+                unknown += 1
+            elif saving[0] >= MIN_RATE:
+                offers.append((offer, title, number(price), *saving))
         if len(offers) < 2:
+            if len(offers) + unknown >= 2:
+                unreadable += 1
+            else:
+                below_threshold += 1
             continue
         title = html.escape(" ".join(offers[0][1].split())[:120] or asin)
         lines = [f'<b><a href="https://www.amazon.sa/dp/{asin}">{title}</a></b>']
@@ -272,6 +286,8 @@ def overlap_blocks(promotions):
             estimate = (1 - remaining) * 100
             lines.append(f"💰 توفير تقديري إذا قبلت أمازون الدمج: {estimate:.2f}٪")
         blocks.append("\n".join(lines))
+    if diagnostics is not None:
+        diagnostics.update(observed=observed, below_threshold=below_threshold, unreadable=unreadable)
     return blocks
 
 
@@ -306,16 +322,16 @@ def build_messages(promotions, run_number, partial_run=False):
     offers = [f"{index}. {offer_anchor(offer)}" for index, offer in enumerate(promotions.values(), 1)]
     messages = paginate(f"📋 صفحات العروض ({len(offers)}){run_label}",
                         notes + (offers or ["لم تظهر روابط عروض في هذا التشغيل."]))
-    overlaps = overlap_blocks(promotions)
-    if promotions:
-        overlap_notes = ["الدمج مرهون بشروط أمازون."] if overlaps else [
-            "لم يظهر منتج في عرضين مختلفين بتوفير 10٪ أو أكثر لكل عرض ضمن النتائج المقروءة."
-        ]
+    diagnostics = {}
+    overlaps = overlap_blocks(promotions, diagnostics)
+    if overlaps:
         messages.extend(paginate(f"🎁 منتجات عليها أكثر من عرض ({len(overlaps)}){run_label}",
-                                 notes + overlap_notes + overlaps))
+                                 notes + ["الدمج مرهون بشروط أمازون."] + overlaps))
     print(f"Promotion digest: {len(promotions)} pages, {coverage} incomplete, "
           f"{sum(len(offer.products) for offer in promotions.values())} product-page matches, "
           f"{len(overlaps)} eligible overlapping products.")
+    print(f"Promotion overlap details: {diagnostics['observed']} before filtering, "
+          f"{diagnostics['below_threshold']} below threshold, {diagnostics['unreadable']} unreadable terms.")
     return messages
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from scan_pagination import RepeatedPages, next_page_url
+from scan_pagination import RepeatedPages, next_page_url, prioritized_searches, retry_failed_page
 
 
 def run(coroutine):
@@ -56,6 +56,29 @@ def page(number, asins, end=False):
 
 
 class PaginationTests(unittest.TestCase):
+    def test_long_searches_start_first_and_keep_their_report_indexes(self):
+        urls = ["short", "long", "unknown", "fallback"]
+        durations = {"short": 30, "long": 800}
+        states = {"fallback": {"total_pages": 40}}
+        self.assertEqual(prioritized_searches(urls, durations, states),
+                         [(1, "long"), (3, "fallback"), (0, "short"), (2, "unknown")])
+
+    def test_deferred_retry_only_requests_one_attempt_and_preserves_incomplete_tail(self):
+        url = "https://www.amazon.sa/s?i=toys"
+        actual_url = "https://www.amazon.sa/s?i=toys&page=15"
+        state = dict(end_reason="failed", next_page=15, deferred_next_url=actual_url)
+        calls = []
+
+        async def scan(context, search_url, number, index, **kwargs):
+            calls.append((search_url, number, index, kwargs))
+            return page(number, {"A"})
+
+        self.assertEqual(run(retry_failed_page(scan, None, url, 4, state)),
+                         ("RECOVERED_PAGE_TAIL_UNSCANNED", 1, 0, 0))
+        self.assertEqual(calls, [(url, 15, 4, {"page_url_override": actual_url, "attempt_limit": 1})])
+        self.assertEqual(state["next_page"], 16)
+        self.assertFalse(state["completed"])
+
     def test_next_link_requires_the_expected_page_and_amazon_host(self):
         self.assertEqual(next_page_url("https://www.amazon.sa/b?node=1", "/s?page=2", 2),
                          "https://www.amazon.sa/s?page=2")
