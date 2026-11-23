@@ -475,20 +475,27 @@ def compact_text(value, limit):
 
 def show_help(message=None):
     menu_message([
-        "<b>👀 مراقبة صفحات العروض</b>",
-        "<b>إدارة الصفحات</b>\n"
-        "/add رابط | اسم العرض — إضافة صفحة\n"
-        "/pages — الصفحات المتابعة\n"
-        "/status أو /check — حالة الفحص\n"
-        "/check رابط المنتج أو ASIN — فحص عروض منتج",
-        "<b>إدارة المنتجات</b>\n"
-        "/following — المنتجات المتابَعة\n"
-        "/blocked — المنتجات المحجوبة\n"
-        "/muted — التنبيهات الموقوفة",
+        "<b>👀 دليل بوت العروض الخضراء</b>",
+        "<b>📋 صفحات العروض</b>\n"
+        "➕ /add — إضافة صفحة للمتابعة\n"
+        "<code>/add رابط_العرض | اسم العرض</code>\n"
+        "🏷️ اسم العرض اختياري\n"
+        "📄 /pages — عرض الصفحات وإدارتها",
+        "<b>🔎 الفحص والحالة</b>\n"
+        "📊 /status أو /check — حالة الفحص وملخّص آخر جولة\n"
+        "🔍 /check مع الرابط أو ASIN — فحص عروض منتج واحد\n"
+        "<code>/check B07P154269</code>\n"
+        "<code>/check https://www.amazon.sa/dp/B07P154269</code>",
+        "<b>🔔 متابعة المنتجات والتنبيهات</b>\n"
+        "👀 /following أو /favorites — المنتجات المتابَعة\n"
+        "🚫 /blocked — المنتجات المحجوبة وفك الحجب\n"
+        "🔕 /muted — التنبيهات الموقوفة واستئنافها",
+        "ℹ️ /help أو /start — فتح دليل الأوامر",
     ], [
-        [menu_button("📋 الصفحات", "menu:pages:0"), menu_button("🔎 حالة الفحص", "menu:status:0")],
+        [menu_button("➕ إضافة صفحة", "menu:add:0"), menu_button("📋 الصفحات", "menu:pages:0")],
+        [menu_button("📊 حالة الفحص", "menu:status:0"), menu_button("🔍 فحص منتج", "menu:check:0")],
         [menu_button("👀 المنتجات المتابَعة", "menu:following:0"), menu_button("🚫 المحجوبات", "menu:blocked:0")],
-        [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0"), menu_button("🔍 فحص منتج", "menu:check:0")],
+        [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0")],
     ], message)
 
 
@@ -704,6 +711,10 @@ def menu_callback(query, message, data):
         answer_callback(answer)
         if view == "help":
             show_help(message)
+        elif view == "add":
+            menu_message(["<b>➕ إضافة صفحة عروض</b>", "أرسل /add ثم رابط صفحة العرض على أمازون السعودية.",
+                          "<code>/add رابط_العرض | اسم العرض</code>\n🏷️ اسم العرض اختياري."],
+                         [[menu_button("⬅️ الأوامر", "menu:help:0")]], message)
         elif view == "check":
             menu_message(["<b>🔍 فحص عروض منتج</b>", "أرسل /check ثم رابط المنتج من أمازون السعودية أو رقم المنتج.",
                           "<code>/check https://www.amazon.sa/dp/B07P154269</code>",
