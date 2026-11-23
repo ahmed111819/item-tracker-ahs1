@@ -33,7 +33,8 @@ from playwright.sync_api import sync_playwright
 from psycopg.types.json import Jsonb
 
 from green_product_offers import (
-    AMAZON_VERIFICATION_REASONS, BANK_TERMS, ProductPageUnavailable, amazon_product_url, canonical_product_url,
+    AMAZON_VERIFICATION_REASONS, BANK_TERMS, PRODUCT_PAGE, ProductPageUnavailable,
+    amazon_product_url, canonical_product_url,
     duplicates_green_spend, format_offer_alert, free_bundle_signature, green_offer_key,
     has_notifiable_combination, is_quiet_offer,
     new_notifiable_offers, parse_detail_offers, read_detail_snippets, without_green_duplicate,
@@ -474,7 +475,7 @@ def show_help(message=None):
         "/add رابط | اسم العرض — إضافة صفحة\n"
         "/pages — الصفحات المتابعة\n"
         "/status أو /check — حالة الفحص\n"
-        "/check ASIN — فحص عروض منتج",
+        "/check رابط المنتج أو ASIN — فحص عروض منتج",
         "<b>إدارة المنتجات</b>\n"
         "/following — المنتجات المتابَعة\n"
         "/blocked — المنتجات المحجوبة\n"
@@ -625,6 +626,23 @@ def show_page_details(page_id, page, message, confirm=False):
     menu_message(lines, buttons + [back], message)
 
 
+def parse_product_check(argument):
+    asin = argument.upper()
+    if re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return asin, None
+    try:
+        parts = urlparse(argument)
+        if (parts.scheme != "https" or parts.hostname not in {"amazon.sa", "www.amazon.sa", "m.amazon.sa"}
+                or parts.netloc.lower() != parts.hostname):
+            return None
+        match = PRODUCT_PAGE.search(parts.path)
+        if match:
+            return match[1].upper(), parts._replace(fragment="").geturl()
+    except ValueError:
+        return None
+    return None
+
+
 def command(update, product_checks):
     message = update.get("message", {})
     if str((message.get("chat") or {}).get("id", "")) != CHAT_ID:
@@ -637,12 +655,12 @@ def command(update, product_checks):
     name = words[0].split("@", 1)[0]
     argument = words[1].strip() if len(words) > 1 else ""
     if name == "/check" and argument:
-        asin = argument.upper()
-        if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-            send("أرسل رقم المنتج من 10 خانات. مثال /check B07P154269")
+        target = parse_product_check(argument)
+        if target is None:
+            send("أرسل رابط المنتج المباشر من أمازون السعودية أو رقم المنتج من 10 خانات. مثال /check B07P154269")
             return
         try:
-            product_checks.put_nowait(asin)
+            product_checks.put_nowait(target)
         except Full:
             send("فيه طلبات فحص بانتظار دورها. جرّب بعد شوي.")
         return
@@ -672,7 +690,8 @@ def menu_callback(query, message, data):
         if view == "help":
             show_help(message)
         elif view == "check":
-            menu_message(["<b>🔍 فحص عروض منتج</b>", "أرسل /check ثم رقم المنتج من أمازون.",
+            menu_message(["<b>🔍 فحص عروض منتج</b>", "أرسل /check ثم رابط المنتج من أمازون السعودية أو رقم المنتج.",
+                          "<code>/check https://www.amazon.sa/dp/B07P154269</code>",
                           "<code>/check B07P154269</code>"],
                          [[menu_button("⬅️ الأوامر", "menu:help:0")]], message)
         elif view in {"pages", "status"}:
@@ -858,9 +877,9 @@ def telegram_worker(stop, product_checks):
                 offset = item["update_id"] + 1
 
 
-def checked_product_summary(page, asin, saved):
+def checked_product_summary(page, asin, saved, product_url=None):
     saved_url, saved_title, saved_price, green_title = saved or ("", "", None, "")
-    url = amazon_product_url(saved_url or f"/dp/{asin}", asin)
+    url = amazon_product_url(product_url or saved_url or f"/dp/{asin}", asin)
     wait_for_amazon_slot()
     snippets = read_detail_snippets(page, url, asin, capture_continue=continue_screenshot_capture())
     title, price_text = page.evaluate("""() => {
@@ -915,22 +934,27 @@ def product_check_worker(stop, product_checks, browser_channel):
         TELEGRAM.session = session
         while not stop.is_set():
             try:
-                asin = product_checks.get(timeout=1)
+                asin, product_url = product_checks.get(timeout=1)
             except Empty:
                 continue
             try:
                 with db() as conn:
-                    saved = conn.execute("""
+                    tracked = conn.execute("""
                         SELECT d.product_url,d.title,d.price,COALESCE(NULLIF(p.offer_terms,''),p.title)
                         FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
                         WHERE d.asin=%s AND d.present AND p.active
-                        ORDER BY d.last_seen_at DESC,d.page_id LIMIT 1
-                    """, (asin,)).fetchone()
+                        ORDER BY d.last_seen_at DESC,d.page_id
+                    """, (asin,)).fetchall()
+                if product_url:
+                    target = canonical_product_url(product_url, asin)
+                    saved = next((row for row in tracked if canonical_product_url(row[0], asin) == target), None)
+                else:
+                    saved = tracked[0] if tracked else None
                 with sync_playwright() as playwright:
                     browser = playwright.chromium.launch(headless=True, channel=browser_channel)
                     try:
                         page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
-                        summary = checked_product_summary(page, asin, saved)
+                        summary = checked_product_summary(page, asin, saved, product_url)
                     finally:
                         browser.close()
             except ProductPageUnavailable as exc:
