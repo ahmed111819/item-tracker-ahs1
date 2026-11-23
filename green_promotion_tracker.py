@@ -6,6 +6,7 @@ an independent Telegram bot token. It stores observed items in PostgreSQL.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from hashlib import sha256
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread, local
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -471,7 +473,8 @@ def show_help(message=None):
         "<b>إدارة الصفحات</b>\n"
         "/add رابط | اسم العرض — إضافة صفحة\n"
         "/pages — الصفحات المتابعة\n"
-        "/status أو /check — حالة الفحص",
+        "/status أو /check — حالة الفحص\n"
+        "/check ASIN — فحص عروض منتج",
         "<b>إدارة المنتجات</b>\n"
         "/following — المنتجات المتابَعة\n"
         "/blocked — المنتجات المحجوبة\n"
@@ -479,7 +482,7 @@ def show_help(message=None):
     ], [
         [menu_button("📋 الصفحات", "menu:pages:0"), menu_button("🔎 حالة الفحص", "menu:status:0")],
         [menu_button("👀 المنتجات المتابَعة", "menu:following:0"), menu_button("🚫 المحجوبات", "menu:blocked:0")],
-        [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0")],
+        [menu_button("🔕 التنبيهات الموقوفة", "menu:muted:0"), menu_button("🔍 فحص منتج", "menu:check:0")],
     ], message)
 
 
@@ -622,7 +625,7 @@ def show_page_details(page_id, page, message, confirm=False):
     menu_message(lines, buttons + [back], message)
 
 
-def command(update):
+def command(update, product_checks):
     message = update.get("message", {})
     if str((message.get("chat") or {}).get("id", "")) != CHAT_ID:
         return
@@ -632,8 +635,18 @@ def command(update):
     if not words:
         return
     name = words[0].split("@", 1)[0]
-    name = {"/favorites": "/following", "/check": "/status"}.get(name, name)
     argument = words[1].strip() if len(words) > 1 else ""
+    if name == "/check" and argument:
+        asin = argument.upper()
+        if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+            send("أرسل رقم المنتج من 10 خانات. مثال /check B07P154269")
+            return
+        try:
+            product_checks.put_nowait(asin)
+        except Full:
+            send("فيه طلبات فحص بانتظار دورها. جرّب بعد شوي.")
+        return
+    name = {"/favorites": "/following", "/check": "/status"}.get(name, name)
     if name == "/add":
         if argument:
             add_page(argument)
@@ -658,6 +671,10 @@ def menu_callback(query, message, data):
         answer_callback(answer)
         if view == "help":
             show_help(message)
+        elif view == "check":
+            menu_message(["<b>🔍 فحص عروض منتج</b>", "أرسل /check ثم رقم المنتج من أمازون.",
+                          "<code>/check B07P154269</code>"],
+                         [[menu_button("⬅️ الأوامر", "menu:help:0")]], message)
         elif view in {"pages", "status"}:
             show_pages(view, page, message)
         elif view == "favorites":
@@ -807,7 +824,7 @@ def callback(update):
     show_pages()
 
 
-def telegram_worker(stop):
+def telegram_worker(stop, product_checks):
     offset = 0
     print("Telegram command worker started.")
     with requests.Session() as session:
@@ -830,7 +847,7 @@ def telegram_worker(stop):
                     return
                 try:
                     if "message" in item:
-                        command(item)
+                        command(item, product_checks)
                     elif "callback_query" in item:
                         callback(item)
                 except Exception as exc:
@@ -839,6 +856,92 @@ def telegram_worker(stop):
                     # Avoid logging exception URLs, which may contain the bot token.
                     print(f"Telegram update {item['update_id']} failed: {type(exc).__name__} (HTTP {status}).")
                 offset = item["update_id"] + 1
+
+
+def checked_product_summary(page, asin, saved):
+    saved_url, saved_title, saved_price, green_title = saved or ("", "", None, "")
+    url = amazon_product_url(saved_url or f"/dp/{asin}", asin)
+    wait_for_amazon_slot()
+    snippets = read_detail_snippets(page, url, asin, capture_continue=continue_screenshot_capture())
+    title, price_text = page.evaluate("""() => {
+        const title = document.querySelector('#productTitle, #product-title, #titleSection h1');
+        const selectors = [
+            '#corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen',
+            '#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) .a-offscreen',
+            '#apex_desktop .priceToPay .a-offscreen',
+            '#price_inside_buybox',
+            '#priceblock_ourprice',
+            '#priceblock_dealprice',
+        ];
+        const price = selectors.map(selector => document.querySelector(selector)?.textContent?.trim())
+            .find(text => text);
+        return [title?.textContent?.trim() || '', price || ''];
+    }""")
+
+    base = f"🔍 فحص المنتج {asin}\n🏷️ {compact_text(title or saved_title, 170) or asin}"
+    price = parse_amazon_price(price_text)
+    if price and price > 0:
+        base += f"\n💰 السعر الظاهر {price:.2f} ريال"
+    elif saved_price and saved_price > 0:
+        price = saved_price
+        base += f"\n💰 آخر سعر مسجّل {price:.2f} ريال · ما ظهر سعر مباشر"
+    if green_title and BANK_TERMS.search(green_title):
+        green_title = ""
+    nonbank = [snippet for snippet in snippets if not BANK_TERMS.search(snippet)]
+    excluded = len(snippets) - len(nonbank)
+    if excluded:
+        base += f"\n🏦 استُبعدت {excluded} إشارة لعروض بنكية"
+
+    if price and price > 0:
+        offers = parse_detail_offers(nonbank, price)
+        unrecognized = sum(not parse_detail_offers([snippet], price) for snippet in nonbank)
+        if unrecognized:
+            base += f"\nℹ️ {unrecognized} نص ما تطابق مع صيغة عرض معروفة"
+        if not offers:
+            base += "\nلم يرصد البوت عرضًا إضافيًا في صفحة المنتج."
+        if green_title:
+            base += "\n📋 الحسبة تشمل العرض الأساسي من آخر صفحة متابعة للمنتج."
+        body = format_offer_alert(base, price, green_title, promotion_details(green_title), offers)
+    else:
+        labels = [compact_text(snippet, 170) for snippet in nonbank[:6]]
+        body = base + "\nما ظهر سعر أقدر أحسب عليه الخصم."
+        if labels:
+            body += "\n\nنصوص من قسم العروض\n" + "\n".join(f"• {label}" for label in labels)
+    return f"{body}\n\n🔗 {canonical_product_url(url, asin)}"
+
+
+def product_check_worker(stop, product_checks, browser_channel):
+    with requests.Session() as session:
+        TELEGRAM.session = session
+        while not stop.is_set():
+            try:
+                asin = product_checks.get(timeout=1)
+            except Empty:
+                continue
+            try:
+                with db() as conn:
+                    saved = conn.execute("""
+                        SELECT d.product_url,d.title,d.price,COALESCE(NULLIF(p.offer_terms,''),p.title)
+                        FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+                        WHERE d.asin=%s AND d.present AND p.active
+                        ORDER BY d.last_seen_at DESC,d.page_id LIMIT 1
+                    """, (asin,)).fetchone()
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True, channel=browser_channel)
+                    try:
+                        page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
+                        summary = checked_product_summary(page, asin, saved)
+                    finally:
+                        browser.close()
+            except ProductPageUnavailable as exc:
+                summary = f"⚠️ تعذّر فحص {asin}. {exc}"
+            except Exception as exc:
+                print(f"On-demand product check failed for {asin}: {type(exc).__name__}")
+                summary = f"⚠️ تعذّر إكمال فحص {asin}. جرّب بعد شوي."
+            try:
+                send(summary, disable_preview=True)
+            except Exception as exc:
+                print(f"Could not send the on-demand result for {asin}: {type(exc).__name__}")
 
 
 def parse_expiry_date(text):
@@ -1773,7 +1876,7 @@ def wait_for_product_round(stop, round_at, pending_only):
     return False
 
 
-def scan_promotion_pages(browser_channel):
+def scan_promotion_pages(stop, browser_channel):
     today = datetime.now(ZoneInfo("Asia/Riyadh")).date()
     with db() as conn:
         conn.execute("UPDATE green_deal_pages SET active=false WHERE active=true AND expires_on < %s", (today,))
@@ -1782,40 +1885,51 @@ def scan_promotion_pages(browser_channel):
               AND (scan_retry_after IS NULL OR scan_retry_after<=now())
             ORDER BY scan_failures,id
         """).fetchall()
-    for page_id, url in pages:
-        for attempt in range(1, 5):
-            try:
-                with db() as conn:
-                    updated = conn.execute(
-                        "UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL WHERE id=%s AND active",
-                        (page_id,),
-                    )
-                    if not updated.rowcount:
-                        break
-                print(f"Starting page {page_id}, attempt {attempt}/4")
-                scan_page(page_id, url, browser_channel)
-                break
-            except ScanStopped:
-                with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET scan_started_at=NULL WHERE id=%s", (page_id,))
-                break
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {str(exc).replace(TOKEN, '[redacted]')[:300]}"
-                print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
-                with db() as conn:
-                    conn.execute("UPDATE green_deal_pages SET last_error=%s WHERE id=%s", (detail, page_id))
-                if attempt < 4:
-                    time.sleep((10, 20, 40)[attempt - 1])
-        else:
+    next_attempts = [(0, order, 1, page_id, url) for order, (page_id, url) in enumerate(pages)]
+    heapq.heapify(next_attempts)
+    retry_delays = (10, 20, 40)
+
+    while next_attempts and not stop.is_set():
+        due, order, attempt, page_id, url = heapq.heappop(next_attempts)
+        if stop.wait(max(0, due - time.monotonic())):
+            return
+        with db() as conn:
+            updated = conn.execute("""
+                UPDATE green_deal_pages SET scan_started_at=now(),last_error=NULL
+                WHERE id=%s AND active
+            """, (page_id,))
+        if not updated.rowcount:
+            continue
+        print(f"Starting page {page_id}, attempt {attempt}/4")
+        try:
+            scan_page(page_id, url, browser_channel)
+        except ScanStopped:
             with db() as conn:
-                row = conn.execute("""
-                    UPDATE green_deal_pages
-                    SET last_checked_at=now(),scan_started_at=NULL,
-                        scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
-                        scan_failures=scan_failures+1
-                    WHERE id=%s AND active
-                    RETURNING LEAST(30,5*scan_failures)
-                """, (page_id,)).fetchone()
+                conn.execute("UPDATE green_deal_pages SET scan_started_at=NULL WHERE id=%s", (page_id,))
+        except Exception as exc:
+            message = str(exc).replace(TOKEN, "[redacted]") if TOKEN else str(exc)
+            detail = f"{type(exc).__name__}: {message[:300]}"
+            print(f"Page {page_id}, attempt {attempt}/4 failed: {detail}")
+            if attempt <= len(retry_delays):
+                delay = retry_delays[attempt - 1]
+                with db() as conn:
+                    row = conn.execute("""
+                        UPDATE green_deal_pages SET last_error=%s,scan_started_at=NULL,
+                            scan_retry_after=now()+make_interval(secs=>%s)
+                        WHERE id=%s AND active RETURNING id
+                    """, (detail, delay, page_id)).fetchone()
+                if row:
+                    heapq.heappush(next_attempts, (time.monotonic() + delay, order, attempt + 1, page_id, url))
+                    print(f"Page {page_id} deferred for at least {delay}s; scanning other pages first.")
+            else:
+                with db() as conn:
+                    row = conn.execute("""
+                        UPDATE green_deal_pages
+                        SET last_error=%s,scan_started_at=NULL,
+                            scan_retry_after=now()+make_interval(mins=>LEAST(30, 5*(scan_failures+1))),
+                            scan_failures=scan_failures+1
+                        WHERE id=%s AND active RETURNING LEAST(30,5*scan_failures)
+                    """, (detail, page_id)).fetchone()
                 if row:
                     print(f"Page {page_id} will retry in {row[0]} minutes; saved availability was preserved.")
 
@@ -1853,7 +1967,9 @@ def scan_loop(stop, detail_round, continuous, browser_channel=None):
         round_at, detail_at, listings_done = cycle
         detail_round.start(round_at, detail_at, listings_done)
         if not listings_done:
-            scan_promotion_pages(browser_channel)
+            scan_promotion_pages(stop, browser_channel)
+            if stop.is_set():
+                return
             if continuous:
                 with db() as conn:
                     conn.execute("""
@@ -1903,12 +2019,16 @@ def run(continuous, prepare=False):
     stop = Event()
     detail_threads = []
     detail_round = DetailRound()
-    worker = Thread(target=telegram_worker, args=(stop,), name="telegram-commands", daemon=True)
+    product_checks = Queue(maxsize=5)
+    worker = Thread(target=telegram_worker, args=(stop, product_checks), name="telegram-commands", daemon=True)
     worker.start()
     delivery = Thread(target=alert_delivery_worker, args=(stop,), name="telegram-alerts", daemon=True)
     delivery.start()
     try:
         browser_channel = prepare_browser() if prepare else None
+        diagnostics = Thread(target=product_check_worker, args=(stop, product_checks, browser_channel),
+                             name="product-checks", daemon=True)
+        diagnostics.start()
         for index in range(DETAIL_WORKERS):
             detail = Thread(
                 target=product_detail_worker, args=(stop, browser_channel, detail_round, not continuous),
