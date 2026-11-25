@@ -56,6 +56,8 @@ CHALLENGE_CAPTURE_PATH = os.getenv("GREEN_DEALS_CHALLENGE_PATH", "")
 CHALLENGE_CAPTURE_LOCK = Lock()
 NEXT_AMAZON_REQUEST = 0.0
 RETURN_ALERT = "↩️ عاد المنتج للظهور"
+PRICE_DROP_ALERT = "📉 انخفاض سعر المنتج"
+NEW_OFFER_ALERT = "🆕 خصم جديد"
 TELEGRAM = local()
 
 
@@ -245,6 +247,7 @@ def init_db():
                 PRIMARY KEY (asin, offer_key)
             )
         """)
+        conn.execute("ALTER TABLE green_deal_offer_deliveries ADD COLUMN IF NOT EXISTS uncertain_at timestamptz")
         conn.execute("ALTER TABLE green_deal_scan_cycle ADD COLUMN IF NOT EXISTS detail_cycle_at timestamptz")
         conn.execute("ALTER TABLE green_deal_pages ADD COLUMN IF NOT EXISTS offer_terms text NOT NULL DEFAULT ''")
         conn.execute("""
@@ -1396,7 +1399,7 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
                 if following:
                     event = f"{RETURN_ALERT}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
             elif is_notifiable_price_drop(old[0], price):
-                event = f"📉 انخفاض سعر المنتج\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
+                event = f"{PRICE_DROP_ALERT}\n\n🏷️ {title}\n\n📉 السعر السابق: {float(old[0]):.2f} ريال\n💵 السعر الحالي: {price:.2f} ريال"
 
             pending_alert = old[2] if old else None
             if pending_alert and pending_alert.startswith(RETURN_ALERT) and not following:
@@ -1541,7 +1544,7 @@ def available_offer_deliveries(conn, asin, page_id, revision, identities):
         SELECT saved.offer_key
         FROM green_deal_offer_deliveries saved
         WHERE saved.asin=%s AND saved.offer_key=ANY(%s::text[]) AND (
-            saved.sent_at IS NOT NULL OR (
+            saved.sent_at IS NOT NULL OR saved.uncertain_at IS NOT NULL OR (
                 (saved.page_id,saved.pending_revision)<>(%s,%s) AND EXISTS (
                     SELECT 1 FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
                     WHERE d.asin=saved.asin AND d.page_id=saved.page_id
@@ -1560,7 +1563,7 @@ def reserve_offer_deliveries(conn, asin, page_id, revision, identities):
         SELECT %s,key,%s,%s FROM unnest(%s::text[]) AS keys(key)
         ON CONFLICT (asin,offer_key) DO UPDATE
         SET page_id=excluded.page_id,pending_revision=excluded.pending_revision
-        WHERE saved.sent_at IS NULL
+        WHERE saved.sent_at IS NULL AND saved.uncertain_at IS NULL
     """, (asin, page_id, revision, sorted(identities)))
 
 
@@ -1600,28 +1603,34 @@ def record_product_detail(conn, claim, snapshot):
                 new.add("__green__")
         new = (new | set(pending_keys or ())) & keys.keys()
         new_product = bool(pending and pending.startswith("🆕 منتج جديد"))
-        offer_alert = bool(pending and pending.startswith(("🆕 خصم جديد", "🎁 أكثر من عرض على المنتج")))
+        offer_alert = bool(pending and pending.startswith((NEW_OFFER_ALERT, "🎁 أكثر من عرض على المنتج")))
         combination = snapshot is not None and has_notifiable_combination(offers, green_key, green_title, green)
         first_combination = combination and previous is None
         if can_announce and (pending or new or first_combination):
             target_revision = revision if pending else revision + 1
-            product_key = keys.get("__green__", "__product__")
             identities = set(keys.values())
             if pending:
                 identities.add("__product__")
             available = available_offer_deliveries(conn, asin, page_id, target_revision, identities)
             new = {key for key in new if keys[key] in available}
+            if new_product and "__product__" not in available:
+                if keys.get("__green__") in available:
+                    new.add("__green__")
+                if new:
+                    _, _, product_body = pending.partition("\n")
+                    pending = f"{NEW_OFFER_ALERT}\n{product_body}"
+                    new_product, offer_alert = False, True
             additional_available = any(key != "__green__" and identity in available for key, identity in keys.items())
 
             if not pending and (new or (first_combination and additional_available and reserve_combination_alert(
                 conn, asin, page_id, target_revision
             ))):
-                title_line = "🆕 خصم جديد" if new else "🎁 أكثر من عرض على المنتج"
+                title_line = NEW_OFFER_ALERT if new else "🎁 أكثر من عرض على المنتج"
                 pending = f"{title_line}\n\n🏷️ {title}\n\n💰 السعر الحالي: {price:.2f} ريال"
                 pending_url, pending_image, pending_price = product_url, image, price
                 revision = target_revision
             elif new_product or offer_alert:
-                should_send = new or (new_product and product_key in available)
+                should_send = new or (new_product and "__product__" in available)
                 should_send = should_send or (
                     pending.startswith("🎁") and additional_available
                 )
@@ -1701,7 +1710,32 @@ def claim_alert_delivery(conn):
         """).fetchone()
 
 
-def finish_alert_delivery(conn, claim, *, sent=False, retry=False):
+def prepare_alert_delivery(conn, claim):
+    page_id, asin, revision, lease, (body, url, image, amount), _ = claim
+    price = Decimal(amount)
+    identity = f"price:{price:.2f}"
+    with conn.transaction():
+        row = conn.execute("""
+            SELECT d.pending_new_offers
+            FROM green_deal_products d JOIN green_deal_pages p ON p.id=d.page_id
+            WHERE d.page_id=%s AND d.asin=%s AND d.pending_revision=%s
+              AND d.delivery_lease_until=%s AND d.present AND p.active
+            FOR UPDATE OF d
+        """, (page_id, asin, revision, lease)).fetchone()
+        if row is None:
+            return None
+        available = available_offer_deliveries(conn, asin, page_id, revision, {identity})
+        if body.startswith(PRICE_DROP_ALERT) and identity not in available:
+            if not row[0]:
+                print(f"Skipped already announced price for {asin}: {price:.2f}.")
+                return None
+            body = body.replace(PRICE_DROP_ALERT, NEW_OFFER_ALERT, 1)
+        if available:
+            reserve_offer_deliveries(conn, asin, page_id, revision, available)
+    return body, url, image, asin, price
+
+
+def finish_alert_delivery(conn, claim, *, sent=False, retry=False, uncertain=False):
     page_id, asin, revision, lease, _, attempts = claim
     with conn.transaction():
         if retry:
@@ -1723,6 +1757,12 @@ def finish_alert_delivery(conn, claim, *, sent=False, retry=False):
                 pending_price=CASE WHEN pending_revision=%s THEN NULL ELSE pending_price END
             WHERE page_id=%s AND asin=%s AND delivery_revision=%s AND delivery_lease_until=%s
         """, ((revision,) * 5 + (page_id, asin, revision, lease)))
+        if updated.rowcount and uncertain:
+            conn.execute("""
+                UPDATE green_deal_offer_deliveries SET uncertain_at=now()
+                WHERE asin=%s AND page_id=%s AND pending_revision=%s
+                  AND sent_at IS NULL AND uncertain_at IS NULL
+            """, (asin, page_id, revision))
         if updated.rowcount and sent:
             conn.execute("""
                 INSERT INTO green_deal_scan_stats(singleton,last_alert_at) VALUES (true,now())
@@ -1750,9 +1790,16 @@ def alert_delivery_worker(stop):
                         if claim is None:
                             stop.wait(1)
                             continue
-                        _, asin, _, _, (body, url, image, price), _ = claim
+                        _, asin, _, _, _, _ = claim
+                        alert = prepare_alert_delivery(conn, claim)
+                        if alert is None:
+                            finish_alert_delivery(conn, claim)
+                            continue
                         try:
-                            sent = send_product_alert(body, url, image, asin, Decimal(price))
+                            sent = send_product_alert(*alert)
+                        except requests.ReadTimeout:
+                            print(f"Telegram delivery result unknown for {asin}; no automatic resend.")
+                            finish_alert_delivery(conn, claim, uncertain=True)
                         except Exception as exc:
                             print(f"Product alert remains queued for {asin}: {type(exc).__name__}")
                             finish_alert_delivery(conn, claim, retry=True)
