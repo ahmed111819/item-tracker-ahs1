@@ -34,6 +34,21 @@ QUANTITY_FOR_PRICE = re.compile(
     re.I,
 )
 MIN_RATE = Decimal(10)
+CACHE_KEY = "promotion-digest"
+CACHE_SECONDS = 3 * 60 * 60
+PAGE_READ_SECONDS = 90
+PROMOTION_RESULTS = "promotion-page-results"
+FIVE_PERCENT = r"(?:5(?:\.0+)?\s*%|%\s*5(?:\.0+)?)"
+FIVE_PERCENT_TERMS = re.compile(
+    rf"(?:(?:buy\s+\d+(?:\s+(?:items?|or more))?\s+(?:and\s+)?)?"
+    rf"(?:save|get\s+extra)\s+{FIVE_PERCENT}(?:\s+off)?"
+    rf"(?:\s+(?:at checkout|on (?:any )?\d+(?: or more)?))?"
+    rf"|(?:اشتر(?:ي)?\s+\d+(?:\s+(?:أو أكثر|او اكثر))?\s+و?)?"
+    rf"(?:خصم(?:\s+إضافي)?|وفر)\s+{FIVE_PERCENT}"
+    rf"(?:\s+(?:عند الدفع|على (?:أي من )?\d+(?: أو أكثر)?))?)"
+    r"(?:\s*(?:خصم من أمازون|الشروط)\s*)*\.?",
+    re.I,
+)
 
 
 @dataclass
@@ -64,20 +79,29 @@ def record_promotion_links(bot_id, snapshots):
     if not folder:
         return
     rows = []
+    asins = set()
     for card in snapshots:
         asin = card.get("asin") or ""
         if not re.fullmatch(r"[A-Z0-9]{10}", asin):
             continue
+        asins.add(asin)
         for item in card.get("promotion_links", []):
-            link = promotion_link(item)
+            url, label = (item.get("url"), item.get("label")) if isinstance(item, dict) else (item, None)
+            link = promotion_link(url)
             if link:
-                rows.append((link[1], asin, str(card.get("title") or asin)[:300], card.get("price_text")))
-    if rows:
+                label = clean_offer_title(label)
+                confirmed_five = label if FIVE_PERCENT_TERMS.fullmatch(label) else ""
+                rows.append((link[1], asin, str(card.get("title") or asin)[:300],
+                             card.get("price_text"), confirmed_five))
+    if asins:
         try:
             root = Path(folder)
             root.mkdir(parents=True, exist_ok=True)
-            with (root / f"promotions-{bot_id}.jsonl").open("a", encoding="utf-8") as stream:
-                stream.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+            with (root / f"observed-{bot_id}.txt").open("a", encoding="ascii") as stream:
+                stream.writelines(asin + "\n" for asin in sorted(asins))
+            if rows:
+                with (root / f"promotions-{bot_id}.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
         except OSError as error:
             print(f"Could not save promotion links ({type(error).__name__}).")
 
@@ -104,13 +128,49 @@ def load_discoveries(folder):
 
     promotions = {}
     for path in sorted(folder.glob("promotions-bot*.jsonl")):
-        for url, asin, title, price in json_rows(path):
+        for url, asin, title, price, *labels in json_rows(path):
             offer = register(promotions, url)
             if offer:
+                if labels and labels[0] and not offer.title:
+                    offer.title = labels[0]
                 current = offer.products.get(asin)
                 if current is None or current[1] is None:
                     offer.products[asin] = (title, parse_price(price))
     return promotions
+
+
+def load_observed_asins(folder):
+    return {
+        asin
+        for path in folder.glob("observed-bot*.txt")
+        for asin in path.read_text(encoding="ascii").splitlines()
+    }
+
+
+def refresh_discoveries(discoveries, cache, now, results=None):
+    """Reuse verified campaign membership until its cache expires."""
+    recent = {
+        code: saved for code, saved in cache.items()
+        if now - saved["checked_at"] < CACHE_SECONDS
+    }
+    for code, offer in discoveries.items():
+        if code in recent:
+            saved = recent[code]
+            offer.title = offer.title or saved["title"]
+            for asin, product in saved["products"].items():
+                if asin not in offer.products or offer.products[asin][1] is None:
+                    offer.products[asin] = product
+            offer.complete = True
+    complete_discoveries(discoveries, results)
+    for code, offer in discoveries.items():
+        if offer.complete:
+            recent[code] = {
+                "checked_at": recent.get(code, {}).get("checked_at", now),
+                "url": offer.url,
+                "title": offer.title,
+                "products": offer.products,
+            }
+    return recent
 
 
 def include_tracked_pages(promotions):
@@ -141,7 +201,7 @@ def include_tracked_pages(promotions):
     for url, title, asin, product_title, price, completed in rows:
         offer = register(promotions, url)
         if offer:
-            if title:
+            if title and not offer.title:
                 offer.title = title
             if asin:
                 if asin not in offer.products or offer.products[asin][1] is None:
@@ -177,35 +237,79 @@ def scan_page(url, output):
             write({"complete": True})
 
 
-def complete_discoveries(promotions):
+def read_promotion_page(code, url, output, timeout):
+    try:
+        subprocess.run(
+            [sys.executable, __file__, "--read-page", url, str(output)],
+            check=False, timeout=timeout, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Time limit reached while reading promotion {code}.")
+
+
+def apply_promotion_page(offer, output):
+    """Apply any available batches and return whether the page has expired."""
+    if not output.exists():
+        return False
+    for row in json_rows(output):
+        if row.get("expired"):
+            return True
+        if row.get("title"):
+            offer.title = row["title"]
+        offer.products.update(row.get("products", {}))
+        offer.complete |= row.get("complete", False)
+    return False
+
+
+def cached_promotions():
+    from psycopg import Error as StorageError
+    from postgres_storage import load_state
+
+    try:
+        return load_state(CACHE_KEY, allow_missing=True).get("promotions", {})
+    except (StorageError, RuntimeError) as error:
+        print(f"Could not load promotion cache ({type(error).__name__}).")
+        return None
+
+
+def watch_discoveries(folder):
+    """Read one promotion at a time while the product scanners publish links."""
+    results = folder / PROMOTION_RESULTS
+    results.mkdir(parents=True, exist_ok=True)
+    cache = cached_promotions() or {}
+    attempted = set()
+    while not (results / "stop").exists():
+        for code, offer in load_discoveries(folder).items():
+            if (results / "stop").exists():
+                return
+            saved = cache.get(code)
+            if (code in attempted or (saved and time.time() - saved["checked_at"] < CACHE_SECONDS)
+                    or FIVE_PERCENT_TERMS.fullmatch(clean_offer_title(offer.title))):
+                continue
+            attempted.add(code)
+            print(f"Reading discovered promotion during scanner run: {code}")
+            read_promotion_page(code, offer.url, results / f"{code}.jsonl", PAGE_READ_SECONDS)
+        time.sleep(2)
+
+
+def complete_discoveries(promotions, results=None):
     deadline = time.monotonic() + 240
 
     def fetch(entry):
         code, offer = entry
-        if offer.complete:
+        if offer.complete or FIVE_PERCENT_TERMS.fullmatch(clean_offer_title(offer.title)):
             return None
+        prefetched = results / f"{code}.jsonl" if results is not None else None
+        if prefetched is not None and prefetched.exists():
+            return code if apply_promotion_page(offer, prefetched) else None
         remaining = deadline - time.monotonic()
         if remaining < 3:
             return None
         with TemporaryDirectory() as directory:
             output = Path(directory) / "page.jsonl"
-            try:
-                subprocess.run(
-                    [sys.executable, __file__, "--read-page", offer.url, str(output)],
-                    check=False, timeout=min(40, remaining), stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except subprocess.TimeoutExpired:
-                print(f"Time limit reached while reading promotion {code}.")
-            if output.exists():
-                for row in json_rows(output):
-                    if row.get("expired"):
-                        return code
-                    if row.get("title"):
-                        offer.title = row["title"]
-                    offer.products.update(row.get("products", {}))
-                    offer.complete |= row.get("complete", False)
-        return None
+            read_promotion_page(code, offer.url, output, min(PAGE_READ_SECONDS, remaining))
+            return code if apply_promotion_page(offer, output) else None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         expired = list(pool.map(fetch, promotions.items()))
@@ -249,11 +353,12 @@ def saving_for(title, price):
     return rate, False
 
 
-def overlap_blocks(promotions, diagnostics=None):
+def overlap_blocks(promotions, diagnostics=None, observed_asins=None):
     by_asin = defaultdict(list)
     for offer in promotions.values():
         for asin, (title, price) in offer.products.items():
-            by_asin[asin].append((offer, title, price))
+            if observed_asins is None or asin in observed_asins:
+                by_asin[asin].append((offer, title, price))
     blocks = []
     observed = below_threshold = unreadable = 0
     for asin, appearances in sorted(by_asin.items()):
@@ -313,23 +418,31 @@ def paginate(title, blocks):
     return [f"<b>{title} · {index}/{len(pages)}</b>\n\n{page.rstrip()}" for index, page in enumerate(pages, 1)]
 
 
-def build_messages(promotions, run_number, partial_run=False):
-    coverage = sum(not offer.complete for offer in promotions.values())
+def build_messages(promotions, run_number, partial_run=False, *,
+                   discovered_codes=None, observed_asins=None):
+    discoveries = [
+        offer for code, offer in promotions.items()
+        if (discovered_codes is None or code in discovered_codes)
+        and not FIVE_PERCENT_TERMS.fullmatch(clean_offer_title(offer.title))
+    ]
+    coverage = sum(not offer.complete for offer in discoveries)
     run_label = f" · التشغيل {html.escape(run_number)}" if run_number else ""
     notes = [f"تعذر استكمال قراءة منتجات {coverage} من صفحات العروض."] if coverage else []
     if partial_run:
         notes.append("هذا الملخص مبني على الجزء الذي اكتمل من الفحص.")
-    offers = [f"{index}. {offer_anchor(offer)}" for index, offer in enumerate(promotions.values(), 1)]
-    messages = paginate(f"📋 صفحات العروض ({len(offers)}){run_label}",
-                        notes + (offers or ["لم تظهر روابط عروض في هذا التشغيل."]))
+    offers = [f"{index}. {offer_anchor(offer)}" for index, offer in enumerate(discoveries, 1)]
+    messages = paginate(f"📋 صفحات العروض ({len(offers)}){run_label}", notes + offers) if offers else []
     diagnostics = {}
-    overlaps = overlap_blocks(promotions, diagnostics)
+    overlaps = overlap_blocks(promotions, diagnostics, observed_asins)
     if overlaps:
         messages.extend(paginate(f"🎁 منتجات عليها أكثر من عرض ({len(overlaps)}){run_label}",
                                  notes + ["الدمج مرهون بشروط أمازون."] + overlaps))
     print(f"Promotion digest: {len(promotions)} pages, {coverage} incomplete, "
           f"{sum(len(offer.products) for offer in promotions.values())} product-page matches, "
           f"{len(overlaps)} eligible overlapping products.")
+    if discovered_codes is not None:
+        print(f"Promotion links: {len(discovered_codes)} discovered, {len(offers)} listed, "
+              f"{len(promotions.keys() - discovered_codes)} from background sources only.")
     print(f"Promotion overlap details: {diagnostics['observed']} before filtering, "
           f"{diagnostics['below_threshold']} below threshold, {diagnostics['unreadable']} unreadable terms.")
     return messages
@@ -365,10 +478,32 @@ def send_messages(messages):
 if __name__ == "__main__":
     if sys.argv[1] == "--read-page":
         scan_page(sys.argv[2], Path(sys.argv[3]))
+    elif sys.argv[1] == "--watch":
+        watch_discoveries(Path(sys.argv[2]))
     else:
-        offers = load_discoveries(Path(sys.argv[1]))
+        from psycopg import Error as StorageError
+        from postgres_storage import save_state
+
+        folder = Path(sys.argv[1])
+        offers = load_discoveries(folder)
+        observed_asins = load_observed_asins(folder)
+        previous = cached_promotions()
+        recent = refresh_discoveries(offers, previous or {}, time.time(), folder / PROMOTION_RESULTS)
+        if previous is not None and recent != previous:
+            try:
+                save_state(CACHE_KEY, {"promotions": recent})
+            except StorageError as error:
+                print(f"Could not save promotion cache ({type(error).__name__}).")
+        discovered_codes = set(offers)
+        for code, saved in recent.items():
+            if code not in offers and observed_asins.intersection(saved["products"]):
+                offers[code] = Promotion(saved["url"], saved["title"], saved["products"], complete=True)
         include_tracked_pages(offers)
-        complete_discoveries(offers)
-        send_messages(build_messages(offers, os.getenv("GITHUB_RUN_NUMBER", ""),
-                                     os.getenv("SCAN_OUTCOME") != "success"))
+        messages = build_messages(
+            offers, os.getenv("GITHUB_RUN_NUMBER", ""),
+            os.getenv("SCAN_OUTCOME") != "success",
+            discovered_codes=discovered_codes, observed_asins=observed_asins,
+        )
+        if messages:
+            send_messages(messages)
 

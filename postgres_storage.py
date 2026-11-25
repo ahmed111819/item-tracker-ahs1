@@ -55,7 +55,7 @@ def _connect():
             yield connection
 
 
-def load_state(bot_id: str) -> dict[str, Any]:
+def load_state(bot_id: str, *, allow_missing: bool = False) -> dict[str, Any]:
     """Load existing bot state; fail closed if it has not been imported."""
     with _connect() as conn:
         row = conn.execute(
@@ -64,6 +64,8 @@ def load_state(bot_id: str) -> dict[str, Any]:
         ).fetchone()
 
     if row is None:
+        if allow_missing:
+            return {}
         raise RuntimeError(
             f"No saved tracking state exists for {bot_id}. Import the existing "
             "tracking JSON before enabling scans; refusing to start with an empty history."
