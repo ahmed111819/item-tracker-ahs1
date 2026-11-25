@@ -36,6 +36,8 @@ QUANTITY_FOR_PRICE = re.compile(
 MIN_RATE = Decimal(10)
 CACHE_KEY = "promotion-digest"
 CACHE_SECONDS = 3 * 60 * 60
+PAGE_READ_SECONDS = 90
+PROMOTION_RESULTS = "promotion-page-results"
 FIVE_PERCENT = r"(?:5(?:\.0+)?\s*%|%\s*5(?:\.0+)?)"
 FIVE_PERCENT_TERMS = re.compile(
     rf"(?:(?:buy\s+\d+(?:\s+(?:items?|or more))?\s+(?:and\s+)?)?"
@@ -145,7 +147,7 @@ def load_observed_asins(folder):
     }
 
 
-def refresh_discoveries(discoveries, cache, now):
+def refresh_discoveries(discoveries, cache, now, results=None):
     """Reuse verified campaign membership until its cache expires."""
     recent = {
         code: saved for code, saved in cache.items()
@@ -159,7 +161,7 @@ def refresh_discoveries(discoveries, cache, now):
                 if asin not in offer.products or offer.products[asin][1] is None:
                     offer.products[asin] = product
             offer.complete = True
-    complete_discoveries(discoveries)
+    complete_discoveries(discoveries, results)
     for code, offer in discoveries.items():
         if offer.complete:
             recent[code] = {
@@ -235,35 +237,79 @@ def scan_page(url, output):
             write({"complete": True})
 
 
-def complete_discoveries(promotions):
+def read_promotion_page(code, url, output, timeout):
+    try:
+        subprocess.run(
+            [sys.executable, __file__, "--read-page", url, str(output)],
+            check=False, timeout=timeout, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Time limit reached while reading promotion {code}.")
+
+
+def apply_promotion_page(offer, output):
+    """Apply any available batches and return whether the page has expired."""
+    if not output.exists():
+        return False
+    for row in json_rows(output):
+        if row.get("expired"):
+            return True
+        if row.get("title"):
+            offer.title = row["title"]
+        offer.products.update(row.get("products", {}))
+        offer.complete |= row.get("complete", False)
+    return False
+
+
+def cached_promotions():
+    from psycopg import Error as StorageError
+    from postgres_storage import load_state
+
+    try:
+        return load_state(CACHE_KEY, allow_missing=True).get("promotions", {})
+    except (StorageError, RuntimeError) as error:
+        print(f"Could not load promotion cache ({type(error).__name__}).")
+        return None
+
+
+def watch_discoveries(folder):
+    """Read one promotion at a time while the product scanners publish links."""
+    results = folder / PROMOTION_RESULTS
+    results.mkdir(parents=True, exist_ok=True)
+    cache = cached_promotions() or {}
+    attempted = set()
+    while not (results / "stop").exists():
+        for code, offer in load_discoveries(folder).items():
+            if (results / "stop").exists():
+                return
+            saved = cache.get(code)
+            if (code in attempted or (saved and time.time() - saved["checked_at"] < CACHE_SECONDS)
+                    or FIVE_PERCENT_TERMS.fullmatch(clean_offer_title(offer.title))):
+                continue
+            attempted.add(code)
+            print(f"Reading discovered promotion during scanner run: {code}")
+            read_promotion_page(code, offer.url, results / f"{code}.jsonl", PAGE_READ_SECONDS)
+        time.sleep(2)
+
+
+def complete_discoveries(promotions, results=None):
     deadline = time.monotonic() + 240
 
     def fetch(entry):
         code, offer = entry
         if offer.complete or FIVE_PERCENT_TERMS.fullmatch(clean_offer_title(offer.title)):
             return None
+        prefetched = results / f"{code}.jsonl" if results is not None else None
+        if prefetched is not None and prefetched.exists():
+            return code if apply_promotion_page(offer, prefetched) else None
         remaining = deadline - time.monotonic()
         if remaining < 3:
             return None
         with TemporaryDirectory() as directory:
             output = Path(directory) / "page.jsonl"
-            try:
-                subprocess.run(
-                    [sys.executable, __file__, "--read-page", offer.url, str(output)],
-                    check=False, timeout=min(40, remaining), stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except subprocess.TimeoutExpired:
-                print(f"Time limit reached while reading promotion {code}.")
-            if output.exists():
-                for row in json_rows(output):
-                    if row.get("expired"):
-                        return code
-                    if row.get("title"):
-                        offer.title = row["title"]
-                    offer.products.update(row.get("products", {}))
-                    offer.complete |= row.get("complete", False)
-        return None
+            read_promotion_page(code, offer.url, output, min(PAGE_READ_SECONDS, remaining))
+            return code if apply_promotion_page(offer, output) else None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         expired = list(pool.map(fetch, promotions.items()))
@@ -432,19 +478,17 @@ def send_messages(messages):
 if __name__ == "__main__":
     if sys.argv[1] == "--read-page":
         scan_page(sys.argv[2], Path(sys.argv[3]))
+    elif sys.argv[1] == "--watch":
+        watch_discoveries(Path(sys.argv[2]))
     else:
         from psycopg import Error as StorageError
-        from postgres_storage import load_state, save_state
+        from postgres_storage import save_state
 
         folder = Path(sys.argv[1])
         offers = load_discoveries(folder)
         observed_asins = load_observed_asins(folder)
-        try:
-            previous = load_state(CACHE_KEY, allow_missing=True).get("promotions", {})
-        except (StorageError, RuntimeError) as error:
-            print(f"Could not load promotion cache ({type(error).__name__}).")
-            previous = None
-        recent = refresh_discoveries(offers, previous or {}, time.time())
+        previous = cached_promotions()
+        recent = refresh_discoveries(offers, previous or {}, time.time(), folder / PROMOTION_RESULTS)
         if previous is not None and recent != previous:
             try:
                 save_state(CACHE_KEY, {"promotions": recent})
