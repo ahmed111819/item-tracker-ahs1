@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from promotion_digest import (
     CACHE_SECONDS, Promotion, build_messages, load_discoveries, load_observed_asins,
-    overlap_blocks, promotion_link, record_promotion_links, refresh_discoveries, saving_for,
+    PROMOTION_RESULTS, overlap_blocks, promotion_link, record_promotion_links,
+    refresh_discoveries, saving_for, watch_discoveries,
 )
 from scan_link_report import summarize
 
@@ -121,7 +122,7 @@ class PromotionDigestTests(unittest.TestCase):
             self.assertEqual(set(updated["TESTCACHE"]["products"]), {"B000000001", "B000000002"})
             self.assertTrue(offers["TESTCACHE"].complete)
             self.assertEqual(set(offers["TESTCACHE"].products), {"B000000001", "B000000002"})
-            complete.assert_called_once_with(offers)
+            complete.assert_called_once_with(offers, None)
         with patch("promotion_digest.complete_discoveries"):
             next_run = {"TESTCACHE": Promotion(url)}
             self.assertEqual(refresh_discoveries(next_run, cache, 10 + CACHE_SECONDS), {})
@@ -152,3 +153,35 @@ class PromotionDigestTests(unittest.TestCase):
             refresh_discoveries(offers, {}, 10)
             fetch.assert_not_called()
         self.assertEqual(build_messages(offers, "123", discovered_codes=set(offers)), [])
+
+    def test_background_reader_reuses_results_without_reopening_the_offer(self):
+        url = "https://www.amazon.sa/promotion/psp/TESTWATCH"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"SCAN_REPORT_DIR": temp}):
+            folder = Path(temp)
+            snapshot = {"asin": "B000000001", "promotion_links": [url]}
+            record_promotion_links("bot1", [snapshot])
+            polls = 0
+
+            def next_poll(_seconds):
+                nonlocal polls
+                polls += 1
+                if polls == 1:
+                    record_promotion_links("bot2", [snapshot])
+                else:
+                    (folder / PROMOTION_RESULTS / "stop").touch()
+
+            def read(_code, _url, output, _timeout):
+                output.write_text('{"title":"Save 20%"}\n{"complete":true}\n', encoding="utf-8")
+
+            with (
+                patch("promotion_digest.cached_promotions", return_value={}),
+                patch("promotion_digest.time.sleep", side_effect=next_poll),
+                patch("promotion_digest.read_promotion_page", side_effect=read) as fetch,
+            ):
+                watch_discoveries(folder)
+                fetch.assert_called_once()
+                offers = load_discoveries(folder)
+                cache = refresh_discoveries(offers, {}, 10, folder / PROMOTION_RESULTS)
+                fetch.assert_called_once()
+                self.assertTrue(offers["TESTWATCH"].complete)
+                self.assertEqual(cache["TESTWATCH"]["title"], "Save 20%")
