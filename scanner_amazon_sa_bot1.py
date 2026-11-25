@@ -1038,7 +1038,7 @@ elements => elements.map(element => {
         price_text: priceElement ? priceElement.innerText : '',
         reference_price_text: referencePriceElement ? referencePriceElement.innerText : '',
         promotion_links: Array.from(element.querySelectorAll('a[href*="/promotion/psp/"]'),
-            link => link.href),
+            link => ({ url: link.href, label: link.innerText })),
         image_url: imageUrl
     };
 })

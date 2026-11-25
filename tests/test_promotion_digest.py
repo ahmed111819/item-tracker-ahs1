@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from promotion_digest import (
-    Promotion, build_messages, load_discoveries, overlap_blocks, promotion_link,
-    record_promotion_links, saving_for,
+    CACHE_SECONDS, Promotion, build_messages, load_discoveries, load_observed_asins,
+    overlap_blocks, promotion_link, record_promotion_links, refresh_discoveries, saving_for,
 )
 from scan_link_report import summarize
 
@@ -27,6 +27,7 @@ class PromotionDigestTests(unittest.TestCase):
                 }])
             self.assertEqual(list(summarize(Path(temp))), [])
             found = load_discoveries(Path(temp))
+            self.assertEqual(load_observed_asins(Path(temp)), {"B0DWT7PWHN"})
         self.assertEqual(list(found), ["A1WSIDJI0UEOX0"])
         self.assertEqual(found["A1WSIDJI0UEOX0"].products, {"B0DWT7PWHN": ("Comfort", 50)})
         self.assertIsNone(promotion_link(url.replace("amazon.sa", "example.test")))
@@ -92,3 +93,62 @@ class PromotionDigestTests(unittest.TestCase):
         counts = {}
         self.assertEqual(overlap_blocks(offers, counts), [])
         self.assertEqual(counts, {"observed": 2, "below_threshold": 1, "unreadable": 1})
+
+    def test_only_discovered_links_are_listed_and_confirmed_five_percent_is_excluded(self):
+        offers = {
+            "auto": Promotion("https://www.amazon.sa/promotion/psp/TESTAUTO", "Save 20%"),
+            "manual": Promotion("https://www.amazon.sa/promotion/psp/TESTMANUAL", "Save 15%"),
+            "five": Promotion("https://www.amazon.sa/promotion/psp/TESTFIVE", "Buy 2 or more and save 5%"),
+            "arabic": Promotion("https://www.amazon.sa/promotion/psp/TESTARABIC", "اشتر 2 أو أكثر ووفّر %5"),
+            "tiered": Promotion("https://www.amazon.sa/promotion/psp/TESTTIERED", "Save 5% or 20%"),
+        }
+        [message] = build_messages(offers, "123", discovered_codes={"auto", "five", "arabic", "tiered"})
+        self.assertIn("TESTAUTO", message)
+        self.assertIn("TESTTIERED", message)
+        self.assertNotIn("TESTMANUAL", message)
+        self.assertNotIn("TESTFIVE", message)
+        self.assertNotIn("TESTARABIC", message)
+        self.assertEqual(build_messages(offers, "123", discovered_codes={"five"}), [])
+
+    def test_cached_campaign_reuses_asins_only_until_expiry(self):
+        url = "https://www.amazon.sa/promotion/psp/TESTCACHE"
+        original = {"B000000001": ("First", 20)}
+        cache = {"TESTCACHE": {"checked_at": 10, "url": url, "title": "Save 20%", "products": original}}
+        offers = {"TESTCACHE": Promotion(url, products={"B000000002": ("Second", 25)})}
+        with patch("promotion_digest.complete_discoveries") as complete:
+            updated = refresh_discoveries(offers, cache, 11)
+            self.assertEqual(updated["TESTCACHE"]["checked_at"], 10)
+            self.assertEqual(set(updated["TESTCACHE"]["products"]), {"B000000001", "B000000002"})
+            self.assertTrue(offers["TESTCACHE"].complete)
+            self.assertEqual(set(offers["TESTCACHE"].products), {"B000000001", "B000000002"})
+            complete.assert_called_once_with(offers)
+        with patch("promotion_digest.complete_discoveries"):
+            next_run = {"TESTCACHE": Promotion(url)}
+            self.assertEqual(refresh_discoveries(next_run, cache, 10 + CACHE_SECONDS), {})
+            self.assertFalse(next_run["TESTCACHE"].complete)
+
+    def test_manual_pages_still_participate_in_overlap_for_observed_asins(self):
+        product = {"B000000001": ("First", 20)}
+        offers = {
+            "auto": Promotion("https://www.amazon.sa/promotion/psp/TESTAUTO", "Save 20%", product),
+            "manual": Promotion("https://www.amazon.sa/promotion/psp/TESTMANUAL", "Save 15%", product),
+        }
+        self.assertEqual(build_messages(offers, "123", discovered_codes=set(), observed_asins=set()), [])
+        [message] = build_messages(offers, "123", discovered_codes=set(), observed_asins=set(product))
+        self.assertIn("TESTMANUAL", message)
+        self.assertIn("TESTAUTO", message)
+        self.assertIn("B000000001", message)
+
+    def test_exact_offer_link_label_can_exclude_five_percent_before_a_page_request(self):
+        url = "https://www.amazon.sa/promotion/psp/TESTFIVE"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"SCAN_REPORT_DIR": temp}):
+            record_promotion_links("bot1", [{
+                "asin": "B000000001",
+                "promotion_links": [{"url": url, "label": "Buy 2 or more and save 5%"}],
+            }, {"asin": "B000000002"}])
+            offers = load_discoveries(Path(temp))
+            self.assertEqual(load_observed_asins(Path(temp)), {"B000000001", "B000000002"})
+        with patch("promotion_digest.subprocess.run") as fetch:
+            refresh_discoveries(offers, {}, 10)
+            fetch.assert_not_called()
+        self.assertEqual(build_messages(offers, "123", discovered_codes=set(offers)), [])
