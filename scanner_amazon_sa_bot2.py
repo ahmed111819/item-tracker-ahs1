@@ -72,6 +72,8 @@ SEARCH_URLS = [
     "https://www.amazon.sa/s?i=pets&rh=n%3A16637302031%2Cp_n_deal_type%3A26902957031%2Cp_98%3A16895730031%2Cp_6%3AA2XPWB6MYN7ZDK&s=price-asc-rank&dc&fs=true",
     # Link أجهزة الكمبيوتر المكتبية
     "https://www.amazon.sa/b?node=16966426031",
+    # Link عروض الأزياء
+    "https://www.amazon.sa/s?i=fashion&rh=n%3A16667011031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_36%3A-10500&s=price-asc-rank&dc&ds=v1%3AwaOOOCPP0jLocYCMakVTArnxT2OjzSY7l27op9sZ%2FRA&qid=1794215818&rnid=16641811031&ref=sr_nr_p_6_1",
 ]
 
 SEARCH_URLS = [url.strip() for url in SEARCH_URLS if url.strip()]

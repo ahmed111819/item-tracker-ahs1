@@ -60,8 +60,6 @@ SEARCH_URLS = [
     "https://www.amazon.sa/s?k=%D8%B9%D8%A7%D9%85&s=price-asc-rank&crid=KYEJZB6U9R34&qid=1791555435&sprefix=%252Caps%252C274&xpid=vA-56XcT-7YjF&ref=sr_st_price-asc-rank&ds=v1%253AOSs3cNcUkeJgw5Z%252FAYcLGD29XIr9o5n%252BvlZvtKnOMm8",
     # Link اجهزة امازون
     "https://www.amazon.sa/s?i=amazon-devices&rh=n%3A12794852031&s=price-asc-rank&fs=true&qid=1791558197&ref=sr_st_price-asc-rank&ds=v1%3A8lN2JnN7E16hrKP6G73vIzygLtQ7auCCc%2B9ljKWfUBQ",
-    # Link 7
-    "https://www.amazon.sa/s?i=fashion&rh=n%3A16667011031%2Cp_98%3A16895730031%2Cp_90%3A16641876031%2Cp_n_deal_type%3A26902957031%2Cp_36%3A-10500&s=price-asc-rank&dc&ds=v1%3AwaOOOCPP0jLocYCMakVTArnxT2OjzSY7l27op9sZ%2FRA&qid=1794215818&rnid=16641811031&ref=sr_nr_p_6_1",
     # Link التجميل
     "https://www.amazon.sa/s?i=beauty&rh=n%3A12462991031%2Cp_98%3A16895730031%2Cp_n_deal_type%3A26902957031&s=price-asc-rank&dc&fs=true&qid=1794215473&rnid=16641811031&ref=sr_nr_p_6_1&ds=v1%3AULawr2SSqh8hJX%2FW9QxwA4XqzREUlPihyVdD6tXZc7s",
     # Link 14
