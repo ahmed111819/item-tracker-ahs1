@@ -81,6 +81,17 @@ def stop_supervisor():
             pid_path.unlink(missing_ok=True)
 
 
+def control_is_ready(socket_path):
+    try:
+        check = subprocess.run(
+            ["ssh", "-S", str(socket_path), "-O", "check", TARGET],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return check.returncode == 0
+
+
 def start():
     socket_path, pid_path = tunnel_paths()
     if pid_path.exists():
@@ -96,16 +107,9 @@ def start():
         if process.poll() is not None:
             pid_path.unlink(missing_ok=True)
             raise RuntimeError("SSH tunnel supervisor exited during startup.")
-        try:
-            check = subprocess.run(
-                ["ssh", "-S", str(socket_path), "-O", "check", TARGET],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
-            )
-            if check.returncode == 0:
-                print("SSH tunnel supervisor is ready.", flush=True)
-                return
-        except subprocess.TimeoutExpired:
-            pass
+        if control_is_ready(socket_path):
+            print("SSH tunnel supervisor is ready.", flush=True)
+            return
         time.sleep(1)
     stop_supervisor()
     raise RuntimeError("SSH forwarding did not become ready within the startup deadline.")
@@ -117,7 +121,12 @@ if __name__ == "__main__":
         start()
     elif action == "stop":
         stop_supervisor()
+    elif action == "status":
+        socket_path, _ = tunnel_paths()
+        if not control_is_ready(socket_path):
+            raise SystemExit("SSH control socket is not responding.")
+        print("SSH control socket is responding; check forwarding and Oracle PostgreSQL.")
     elif action == "worker":
         worker()
     else:
-        raise SystemExit("Usage: python ssh_tunnel.py start|stop")
+        raise SystemExit("Usage: python ssh_tunnel.py start|stop|status")
