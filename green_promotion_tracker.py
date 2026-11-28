@@ -254,7 +254,9 @@ def init_db():
             ALTER TABLE green_deal_pages
                 ADD COLUMN IF NOT EXISTS scan_failures integer NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS scan_retry_after timestamptz,
-                ADD COLUMN IF NOT EXISTS scan_failed_at timestamptz
+                ADD COLUMN IF NOT EXISTS scan_failed_at timestamptz,
+                ADD COLUMN IF NOT EXISTS scan_missing_candidate text[],
+                ADD COLUMN IF NOT EXISTS scan_missing_candidate_at timestamptz
         """)
         conn.execute("""
             ALTER TABLE green_deal_products
@@ -1192,7 +1194,7 @@ def confirmed_empty_promotion(page, url):
         return False
 
 
-def collect_products(url, on_batch, on_offer_title, browser_channel=None):
+def collect_products(url, on_batch, on_offer_title, browser_channel=None, *, observed_asins=None):
     products = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, channel=browser_channel)
@@ -1225,6 +1227,8 @@ def collect_products(url, on_batch, on_offer_title, browser_channel=None):
             for batch in range(100):
                 batch_start = time.monotonic()
                 snapshots = cards.evaluate_all(READ_PRODUCT_CARDS)
+                if observed_asins is not None:
+                    observed_asins.update(card["asin"] for card in snapshots)
                 print(f"Promotion batch {batch + 1}: {len(snapshots)} product cards read "
                       f"in {time.monotonic() - batch_start:.2f}s")
                 changed = {}
@@ -1330,9 +1334,12 @@ def is_notifiable_price_drop(previous, current):
 
 
 def scan_page_with_connection(conn, page_id, url, browser_channel):
-    found = {}
+    observed_asins = set()
     with conn.transaction():
         page_row = conn.execute("SELECT title FROM green_deal_pages WHERE id=%s", (page_id,)).fetchone()
+        previous_present = {row[0] for row in conn.execute(
+            "SELECT asin FROM green_deal_products WHERE page_id=%s AND present", (page_id,)
+        ).fetchall()}
     promotion_title = page_row[0] if page_row else ""
     promotion = promotion_details(promotion_title)
 
@@ -1365,7 +1372,6 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
             )
 
     def save_product(asin, title, price, product_url, image_url):
-        found[asin] = (title, price, product_url)
         with conn.transaction():
             page_active = conn.execute(
                 "SELECT active FROM green_deal_pages WHERE id=%s FOR SHARE", (page_id,)
@@ -1456,16 +1462,50 @@ def scan_page_with_connection(conn, page_id, url, browser_channel):
         print(f"Updated {len(unchanged)} unchanged products in one query; "
               f"{len(products) - len(unchanged)} require individual processing.")
         for asin, product in products.items():
-            if asin in unchanged:
-                found[asin] = product[:3]
-            else:
+            if asin not in unchanged:
                 save_product(asin, *product)
 
-    collect_products(url, save_batch, save_offer_title, browser_channel)
-    # An empty result only reaches here after Amazon rendered its empty grid state.
+    collect_products(url, save_batch, save_offer_title, browser_channel, observed_asins=observed_asins)
+    confirm_promotion_availability(conn, page_id, previous_present, observed_asins)
+
+
+def confirm_promotion_availability(conn, page_id, previous_present, observed_asins):
+    missing = sorted(previous_present - observed_asins)
+    sudden_drop = len(previous_present) >= 10 and len(missing) * 2 >= len(previous_present)
     with conn.transaction():
-        conn.execute("UPDATE green_deal_products SET present=false WHERE page_id=%s AND asin <> ALL(%s::text[])", (page_id, list(found)))
-        conn.execute("UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL WHERE id=%s", (page_id,))
+        row = conn.execute("""
+            SELECT CASE WHEN scan_missing_candidate_at>=now()-interval '10 minutes'
+                        THEN scan_missing_candidate ELSE NULL END
+            FROM green_deal_pages WHERE id=%s AND active FOR UPDATE
+        """, (page_id,)).fetchone()
+        if row is None:
+            raise ScanStopped()
+
+        needs_confirmation = sudden_drop and row[0] != missing
+        if needs_confirmation:
+            conn.execute("""
+                UPDATE green_deal_pages
+                SET scan_missing_candidate=%s,scan_missing_candidate_at=now()
+                WHERE id=%s
+            """, (missing, page_id))
+        else:
+            if missing:
+                conn.execute("""
+                    UPDATE green_deal_products SET present=false
+                    WHERE page_id=%s AND asin=ANY(%s::text[])
+                """, (page_id, missing))
+            conn.execute("""
+                UPDATE green_deal_pages SET last_checked_at=now(),last_error=NULL,
+                    scan_started_at=NULL,scan_failures=0,scan_retry_after=NULL,
+                    scan_missing_candidate=NULL,scan_missing_candidate_at=NULL
+                WHERE id=%s
+            """, (page_id,))
+    if needs_confirmation:
+        raise PromotionPageUnavailable(
+            f"انخفضت المنتجات من {len(previous_present)} إلى {len(observed_asins)}؛ بانتظار فحص ثانٍ قبل تسجيل الاختفاء"
+        )
+    if sudden_drop:
+        print(f"Page {page_id}: a second scan confirmed {len(missing)} missing products.")
 
 
 def claim_product_detail(conn, detail_at, listings_round, listings_done, pending_only, prioritize_alerts):
