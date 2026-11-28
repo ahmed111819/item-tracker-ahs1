@@ -15,6 +15,7 @@ class ConnectionErrorForTest(Exception):
 class PostgresReconnectTests(unittest.TestCase):
     def setUp(self):
         driver = types.ModuleType("psycopg")
+        driver.Error = ConnectionErrorForTest
         driver.OperationalError = ConnectionErrorForTest
         driver.connect = MagicMock()
         rows = types.ModuleType("psycopg.rows")
@@ -74,3 +75,24 @@ class PostgresReconnectTests(unittest.TestCase):
                     connection.execute("UPDATE example SET value = value + 1")
             self.driver.connect.assert_called_once()
             self.connection.execute.assert_called_once()
+
+    def test_readiness_executes_a_query_after_retrying_a_connection(self):
+        self.driver.connect.side_effect = [ConnectionErrorForTest(), self.connection]
+        with patch.object(self.storage, "_database_url", return_value="private-url"), patch.object(
+            self.storage.time, "sleep"
+        ):
+            self.storage.check_database_ready()
+        self.assertEqual(self.driver.connect.call_count, 2)
+        self.assertEqual(self.driver.connect.call_args.kwargs["connect_timeout"], 5)
+        self.connection.execute.assert_any_call("SET LOCAL statement_timeout = '5s'")
+        self.connection.execute.assert_called_with("SELECT 1")
+
+    def test_readiness_failure_does_not_expose_driver_details(self):
+        self.driver.connect.side_effect = ConnectionErrorForTest("private-url")
+        with patch.object(self.storage, "_database_url", return_value="private-url"), patch.object(
+            self.storage.time, "sleep"
+        ), self.assertRaises(SystemExit) as failure:
+            self.storage.check_database_ready()
+        self.assertIn("Oracle PostgreSQL readiness check failed", str(failure.exception))
+        self.assertNotIn("private-url", str(failure.exception))
+        self.connection.execute.assert_not_called()

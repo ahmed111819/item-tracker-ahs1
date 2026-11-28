@@ -36,13 +36,13 @@ _CONNECT_RETRY_DELAYS = (2, 5, 10)
 
 
 @contextmanager
-def _connect():
+def _connect(*, connect_timeout: int = 15):
     """Bound connection concurrency and retry only before a transaction starts."""
     url = _database_url()
     with _CONNECTION_SLOTS:
         for attempt in range(len(_CONNECT_RETRY_DELAYS) + 1):
             try:
-                connection = psycopg.connect(url, connect_timeout=15, row_factory=dict_row)
+                connection = psycopg.connect(url, connect_timeout=connect_timeout, row_factory=dict_row)
                 break
             except psycopg.OperationalError as error:
                 sqlstate = getattr(error, "sqlstate", None) or ""
@@ -53,6 +53,18 @@ def _connect():
                 time.sleep(delay)
         with connection:
             yield connection
+
+
+def check_database_ready() -> None:
+    """Verify an authenticated query through the SSH forward before launching scans."""
+    try:
+        with _connect(connect_timeout=5) as conn:
+            conn.execute("SET LOCAL statement_timeout = '5s'")
+            conn.execute("SELECT 1").fetchone()
+    except psycopg.Error as error:
+        # Driver exception details can contain connection information.
+        raise SystemExit(f"Oracle PostgreSQL readiness check failed ({type(error).__name__}).") from None
+    print("Oracle PostgreSQL is ready (SELECT 1 succeeded).", flush=True)
 
 
 def load_state(bot_id: str, *, allow_missing: bool = False) -> dict[str, Any]:
