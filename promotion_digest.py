@@ -38,6 +38,21 @@ CACHE_KEY = "promotion-digest"
 CACHE_SECONDS = 3 * 60 * 60
 PAGE_READ_SECONDS = 90
 PROMOTION_RESULTS = "promotion-page-results"
+PRODUCT_LOOKUP_LIMIT = 12
+PRODUCT_LOOKUPS_PER_HINT = 2
+PRODUCT_LOOKUP_SECONDS = 20
+OFFER_HINT = re.compile(
+    r"^(?:"
+    r"(?:save|get\s+extra|وفر|خصم(?:\s+يصل\s+إلى)?)\s*(?:\d+(?:\.\d+)?\s*%|%\s*\d+)"
+    r"|(?:buy|get|اشتر(?:ي)?|احصل\s+على)\s+(?:any\s+)?\d+\b"
+    r")",
+    re.I,
+)
+PRODUCT_PROMOTION_LINKS = (
+    'a[id="emphasisLink"][href*="/promotion/psp/"], '
+    '#promotions_feature_div a[href*="/promotion/psp/"], '
+    '[id^="promoMessage"] a[href*="/promotion/psp/"]'
+)
 FIVE_PERCENT = r"(?:5(?:\.0+)?\s*%|%\s*5(?:\.0+)?)"
 FIVE_PERCENT_TERMS = re.compile(
     rf"(?:(?:buy\s+\d+(?:\s+(?:items?|or more))?\s+(?:and\s+)?)?"
@@ -74,25 +89,40 @@ def promotion_link(url):
     return code, f"https://www.amazon.sa{(locale or '').lower()}/promotion/psp/{code}"
 
 
+def promotion_hint(text):
+    """Find a badge worth inspecting without inferring a campaign from the wording."""
+    for line in (text or "").splitlines():
+        label = clean_offer_title(line)
+        if len(label) <= 180 and OFFER_HINT.match(label) and not FIVE_PERCENT_TERMS.fullmatch(label):
+            return label.casefold()
+    return ""
+
+
 def record_promotion_links(bot_id, snapshots):
     folder = os.getenv("SCAN_REPORT_DIR")
     if not folder:
         return
     rows = []
+    candidates = []
     asins = set()
     for card in snapshots:
         asin = card.get("asin") or ""
         if not re.fullmatch(r"[A-Z0-9]{10}", asin):
             continue
         asins.add(asin)
+        title = str(card.get("title") or asin)[:300]
+        price = card.get("price_text")
+        has_link = False
         for item in card.get("promotion_links", []):
             url, label = (item.get("url"), item.get("label")) if isinstance(item, dict) else (item, None)
             link = promotion_link(url)
             if link:
+                has_link = True
                 label = clean_offer_title(label)
                 confirmed_five = label if FIVE_PERCENT_TERMS.fullmatch(label) else ""
-                rows.append((link[1], asin, str(card.get("title") or asin)[:300],
-                             card.get("price_text"), confirmed_five))
+                rows.append((link[1], asin, title, price, confirmed_five))
+        if not has_link and (hint := promotion_hint(card.get("text"))):
+            candidates.append((asin, title, price, hint))
     if asins:
         try:
             root = Path(folder)
@@ -102,6 +132,9 @@ def record_promotion_links(bot_id, snapshots):
             if rows:
                 with (root / f"promotions-{bot_id}.jsonl").open("a", encoding="utf-8") as stream:
                     stream.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+            if candidates:
+                with (root / f"promotion-candidates-{bot_id}.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in candidates)
         except OSError as error:
             print(f"Could not save promotion links ({type(error).__name__}).")
 
@@ -273,14 +306,68 @@ def cached_promotions():
         return None
 
 
+def scan_product_links(asin):
+    """Read links attached to promotions on this ASIN's own product page."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
+
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(locale="en-US", timezone_id="Asia/Riyadh")
+            response = page.goto(f"https://www.amazon.sa/-/en/dp/{asin}",
+                                 wait_until="domcontentloaded", timeout=12000)
+            address = urlsplit(page.url)
+            if (not response or not response.ok or address.hostname not in {"www.amazon.sa", "amazon.sa"}
+                    or not re.search(rf"/dp/{asin}(?:/|$)", address.path)):
+                return []
+            links = page.locator(PRODUCT_PROMOTION_LINKS)
+            try:
+                links.first.wait_for(state="attached", timeout=3000)
+            except PlaywrightTimeout:
+                return []
+            return links.evaluate_all(
+                "links => links.map(link => ({url: link.href, label: link.innerText}))"
+            )
+        finally:
+            browser.close()
+
+
+def read_product_links(asin):
+    try:
+        result = subprocess.run(
+            [sys.executable, __file__, "--read-product-links", asin],
+            capture_output=True, text=True, encoding="utf-8",
+            timeout=PRODUCT_LOOKUP_SECONDS, check=True,
+        )
+        return json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as error:
+        print(f"Product promotion lookup incomplete for {asin} ({type(error).__name__}).")
+        return []
+
+
+def next_product_candidate(folder, known_asins, attempted, hint_counts):
+    for path in sorted(folder.glob("promotion-candidates-bot*.jsonl")):
+        for asin, title, price, hint in json_rows(path):
+            if (asin not in known_asins and asin not in attempted
+                    and hint_counts[hint] < PRODUCT_LOOKUPS_PER_HINT):
+                return asin, title, price, hint
+    return None
+
+
 def watch_discoveries(folder):
-    """Read one promotion at a time while the product scanners publish links."""
+    """Read campaign links and a bounded sample of product pages alongside scanning."""
     results = folder / PROMOTION_RESULTS
     results.mkdir(parents=True, exist_ok=True)
     cache = cached_promotions() or {}
     attempted = set()
+    attempted_products = set()
+    hint_counts = defaultdict(int)
+    product_discoveries = set()
     while not (results / "stop").exists():
-        for code, offer in load_discoveries(folder).items():
+        discoveries = load_discoveries(folder)
+        for code, offer in discoveries.items():
             if (results / "stop").exists():
                 return
             saved = cache.get(code)
@@ -290,6 +377,27 @@ def watch_discoveries(folder):
             attempted.add(code)
             print(f"Reading discovered promotion during scanner run: {code}")
             read_promotion_page(code, offer.url, results / f"{code}.jsonl", PAGE_READ_SECONDS)
+        if len(attempted_products) < PRODUCT_LOOKUP_LIMIT and not (results / "stop").exists():
+            known_asins = {
+                asin for offer in discoveries.values() for asin in offer.products
+            } | product_discoveries
+            for saved in cache.values():
+                if time.time() - saved["checked_at"] < CACHE_SECONDS:
+                    known_asins.update(saved["products"])
+            candidate = next_product_candidate(folder, known_asins, attempted_products, hint_counts)
+            if candidate is not None:
+                asin, title, price, hint = candidate
+                attempted_products.add(asin)
+                hint_counts[hint] += 1
+                links = [link for link in read_product_links(asin) if promotion_link(link.get("url"))]
+                print(f"Product promotion lookup {len(attempted_products)}/{PRODUCT_LOOKUP_LIMIT}: "
+                      f"{asin}, {len(links)} link(s).")
+                if links:
+                    product_discoveries.add(asin)
+                    record_promotion_links("bot-details", [{
+                        "asin": asin, "title": title, "price_text": price, "promotion_links": links,
+                    }])
+                continue
         time.sleep(2)
 
 
@@ -478,6 +586,8 @@ def send_messages(messages):
 if __name__ == "__main__":
     if sys.argv[1] == "--read-page":
         scan_page(sys.argv[2], Path(sys.argv[3]))
+    elif sys.argv[1] == "--read-product-links":
+        print(json.dumps(scan_product_links(sys.argv[2])))
     elif sys.argv[1] == "--watch":
         watch_discoveries(Path(sys.argv[2]))
     else:

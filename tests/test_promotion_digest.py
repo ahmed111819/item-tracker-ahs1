@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from promotion_digest import (
     CACHE_SECONDS, Promotion, build_messages, load_discoveries, load_observed_asins,
-    PROMOTION_RESULTS, overlap_blocks, promotion_link, record_promotion_links,
+    PROMOTION_RESULTS, overlap_blocks, promotion_hint, promotion_link, record_promotion_links,
     refresh_discoveries, saving_for, watch_discoveries,
 )
 from scan_link_report import summarize
@@ -185,3 +185,34 @@ class PromotionDigestTests(unittest.TestCase):
                 fetch.assert_called_once()
                 self.assertTrue(offers["TESTWATCH"].complete)
                 self.assertEqual(cache["TESTWATCH"]["title"], "Save 20%")
+
+    def test_background_worker_finds_product_offer_from_text_only_search_result(self):
+        url = "https://www.amazon.sa/promotion/psp/A31IJHE1QWX79"
+        asin = "B0BT22JP9X"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"SCAN_REPORT_DIR": temp}):
+            folder = Path(temp)
+            card = {"asin": asin, "text": "Product title\nوفر 15% عند شراء 250 ريال", "price_text": "SAR 90"}
+            for bot in ("bot1", "bot2"):
+                record_promotion_links(bot, [card])
+            self.assertEqual(load_discoveries(folder), {})
+            with (
+                patch("promotion_digest.cached_promotions", return_value={}),
+                patch("promotion_digest.read_product_links", return_value=[
+                    {"url": url + "?redirectAsin=B0BT22JP9X", "label": "تسوق السلع المستوفية للشروط"},
+                    {"url": "https://www.amazon.sa/b/?node=224615726031", "label": "تسوق السلع المستوفية للشروط"},
+                ]) as lookup,
+                patch("promotion_digest.read_promotion_page") as read,
+                patch("promotion_digest.time.sleep", side_effect=lambda _: (folder / PROMOTION_RESULTS / "stop").touch()),
+            ):
+                watch_discoveries(folder)
+            lookup.assert_called_once_with(asin)
+            self.assertEqual(read.call_args.args[0], "A31IJHE1QWX79")
+            offers = load_discoveries(folder)
+            self.assertEqual(list(offers), ["A31IJHE1QWX79"])
+            self.assertIn(asin, offers["A31IJHE1QWX79"].products)
+
+    def test_candidate_hint_skips_known_five_percent_and_product_titles(self):
+        self.assertEqual(promotion_hint("Cable with 15% recycled material"), "")
+        self.assertEqual(promotion_hint("Buy 2 or more and save 5%"), "")
+        self.assertEqual(promotion_hint("اشتر 2 أو أكثر ووفّر %5"), "")
+        self.assertEqual(promotion_hint("Product title\nSave 15%, Max.100SAR Min"), "save 15%, max.100sar min")
